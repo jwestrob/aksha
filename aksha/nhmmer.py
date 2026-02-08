@@ -13,16 +13,25 @@ from aksha.types import (
     MoleculeType,
     ThresholdOptions,
     SearchResult,
-    SequenceHit,
-    DomainHit,
 )
 from aksha.parsers import parse_hmms, iter_sequences, HMMInput, SequenceInput
 from aksha.thresholds import build_search_kwargs
-from aksha.results import ResultCollector
+from aksha.results import ResultCollector, hits_from_pyhmmer
 from aksha.search import _resolve_cpus
 from aksha.config import get_registry
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_nhmmer_hmms(source: Union[HMMInput, str]) -> list:
+    """Resolve HMM source for nhmmer (nucleotide models)."""
+    if isinstance(source, str) and not Path(source).exists():
+        registry = get_registry()
+        db_path = registry.get_path(source)
+        if db_path:
+            logger.info("Using installed database: %s at %s", source, db_path)
+            return parse_hmms(db_path)
+    return parse_hmms(source)
 
 
 def nhmmer(
@@ -38,15 +47,7 @@ def nhmmer(
     if thresholds is None:
         thresholds = ThresholdOptions()
 
-    if isinstance(hmms, str) and not Path(hmms).exists():
-        registry = get_registry()
-        db_path = registry.get_path(hmms)
-        if db_path:
-            hmm_list = parse_hmms(db_path)
-        else:
-            raise FileNotFoundError(f"HMM source not found: {hmms}")
-    else:
-        hmm_list = parse_hmms(hmms)
+    hmm_list = _resolve_nhmmer_hmms(hmms)
 
     # Use the HMM alphabet (barrnap models are RNA) to digitize sequences correctly
     alphabet = hmm_list[0].alphabet if hmm_list else None
@@ -68,34 +69,8 @@ def nhmmer(
     with ResultCollector(output_dir=output_path) as collector:
         for seq_path, sequences_block in sequence_iter:
             for hits in pyhmmer.nhmmer(hmm_list, sequences_block, cpus=cpus, **kwargs):
-                # TopHits.query holds the HMM used as query
                 hmm_name = hits.query.name.decode()
-
-                for hit in hits:
-                    if not hit.included:
-                        continue
-
-                    domains = tuple(
-                        DomainHit(
-                            c_evalue=d.c_evalue,
-                            i_evalue=d.i_evalue,
-                            bitscore=d.score,
-                            env_from=d.env_from,
-                            env_to=d.env_to,
-                            ali_from=d.alignment.target_from,
-                            ali_to=d.alignment.target_to,
-                        )
-                        for d in hit.domains.reported
-                    )
-
-                    collector.add(
-                        SequenceHit(
-                            sequence_id=hit.name.decode(),
-                            hmm_name=hmm_name,
-                            evalue=hit.evalue,
-                            bitscore=hit.score,
-                            domains=domains,
-                        )
-                    )
+                for hit in hits_from_pyhmmer(hits, hmm_name):
+                    collector.add(hit)
 
         return collector.finalize()

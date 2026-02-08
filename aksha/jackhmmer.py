@@ -7,19 +7,16 @@ from pathlib import Path
 from typing import Optional
 
 import pyhmmer
-from tqdm import tqdm
 
 from aksha.types import (
     PathLike,
     MoleculeType,
     ThresholdOptions,
     SearchResult,
-    SequenceHit,
-    DomainHit,
 )
-from aksha.parsers import parse_sequences, SequenceInput
+from aksha.parsers import iter_sequences, SequenceInput
 from aksha.thresholds import build_search_kwargs
-from aksha.results import ResultCollector
+from aksha.results import ResultCollector, hits_from_pyhmmer
 from aksha.search import _resolve_cpus
 
 logger = logging.getLogger(__name__)
@@ -43,11 +40,15 @@ def jackhmmer(
     if thresholds is None:
         thresholds = ThresholdOptions()
 
-    query_dict = parse_sequences(query, molecule_type=MoleculeType.PROTEIN, show_progress=False)
-    target_dict = parse_sequences(target, molecule_type=MoleculeType.PROTEIN, show_progress=False)
+    query_iter = iter_sequences(query, molecule_type=MoleculeType.PROTEIN, show_progress=False)
+    _, query_seqs = next(query_iter)
+    if next(query_iter, None) is not None:
+        raise ValueError("jackhmmer expects a single query file, got a directory with multiple files")
 
-    query_seqs = list(query_dict.values())[0]
-    target_seqs = list(target_dict.values())[0]
+    target_iter = iter_sequences(target, molecule_type=MoleculeType.PROTEIN, show_progress=False)
+    _, target_seqs = next(target_iter)
+    if next(target_iter, None) is not None:
+        raise ValueError("jackhmmer expects a single target file, got a directory with multiple files")
 
     kwargs = build_search_kwargs(thresholds)
     output_path = Path(output_dir) if output_dir else None
@@ -69,31 +70,9 @@ def jackhmmer(
         if final_results is None:
             return collector.finalize()
 
-        for hit in final_results.hits:
-            if not hit.included or hit.duplicate:
-                continue
-
-            domains = tuple(
-                DomainHit(
-                    c_evalue=d.c_evalue,
-                    i_evalue=d.i_evalue,
-                    bitscore=d.score,
-                    env_from=d.env_from,
-                    env_to=d.env_to,
-                    ali_from=d.alignment.target_from,
-                    ali_to=d.alignment.target_to,
-                )
-                for d in hit.domains.reported
-            )
-
-            collector.add(
-                SequenceHit(
-                    sequence_id=hit.name.decode(),
-                    hmm_name="jackhmmer_query",
-                    evalue=hit.evalue,
-                    bitscore=hit.score,
-                    domains=domains,
-                )
-            )
+        for hit in hits_from_pyhmmer(
+            final_results.hits, "jackhmmer_query", skip_duplicates=True
+        ):
+            collector.add(hit)
 
         return collector.finalize()

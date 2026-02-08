@@ -19,9 +19,9 @@ from aksha.types import (
     SearchResult,
     HMM,
 )
-from aksha.parsers import parse_hmms, iter_sequences, HMMInput, SequenceInput
+from aksha.parsers import iter_sequences, HMMInput, SequenceInput
 from aksha.thresholds import build_search_kwargs, group_hmms_by_cutoff
-from aksha.results import ResultCollector
+from aksha.results import ResultCollector, hits_from_pyhmmer
 from aksha.search import _resolve_hmms, _resolve_cpus
 
 logger = logging.getLogger(__name__)
@@ -88,34 +88,6 @@ def _run_hmmscan(
 
             # hmmscan takes (sequences, hmms); each TopHits corresponds to one query sequence
             for hits in pyhmmer.hmmscan(sequences, hmm_group, cpus=cpus, **kwargs):
-                # TopHits.query is the DigitalSequence for this query; use its name
                 seq_name = hits.query.name.decode()
-                for hit in hits:
-                    if not hit.included:
-                        continue
-
-                    from aksha.types import SequenceHit, DomainHit
-
-                    hmm_name = hit.name.decode()
-                    domains = tuple(
-                        DomainHit(
-                            c_evalue=d.c_evalue,
-                            i_evalue=d.i_evalue,
-                            bitscore=d.score,
-                            env_from=d.env_from,
-                            env_to=d.env_to,
-                            ali_from=d.alignment.target_from,
-                            ali_to=d.alignment.target_to,
-                        )
-                        for d in hit.domains.reported
-                    )
-
-                    collector.add(
-                        SequenceHit(
-                            sequence_id=seq_name,
-                            hmm_name=hmm_name,
-                            evalue=hit.evalue,
-                            bitscore=hit.score,
-                            domains=domains,
-                        )
-                    )
+                for hit in hits_from_pyhmmer(hits, hmm_name="", sequence_id=seq_name):
+                    collector.add(hit)

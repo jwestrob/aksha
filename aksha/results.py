@@ -116,18 +116,26 @@ class ResultCollector:
 def hits_from_pyhmmer(
     pyhmmer_hits,
     hmm_name: str,
+    *,
+    sequence_id: Optional[str] = None,
+    skip_duplicates: bool = False,
 ) -> Iterator[SequenceHit]:
     """Convert PyHMMER hits to SequenceHit objects.
 
     Args:
         pyhmmer_hits: TopHits object from PyHMMER
-        hmm_name: Name of the query HMM
+        hmm_name: Name of the query HMM (or query sequence for phmmer)
+        sequence_id: If set, use this as sequence_id and hit.name as hmm_name
+            (for hmmscan where query is a sequence and hits are HMMs)
+        skip_duplicates: Skip hits flagged as duplicates (for jackhmmer)
 
     Yields:
         SequenceHit objects for included hits
     """
     for hit in pyhmmer_hits:
         if not hit.included:
+            continue
+        if skip_duplicates and hit.duplicate:
             continue
 
         domains = tuple(
@@ -143,10 +151,20 @@ def hits_from_pyhmmer(
             for domain in hit.domains.reported
         )
 
-        yield SequenceHit(
-            sequence_id=hit.name.decode(),
-            hmm_name=hmm_name,
-            evalue=hit.evalue,
-            bitscore=hit.score,
-            domains=domains,
-        )
+        if sequence_id is not None:
+            # scan mode: query is a sequence, hit is an HMM
+            yield SequenceHit(
+                sequence_id=sequence_id,
+                hmm_name=hit.name.decode(),
+                evalue=hit.evalue,
+                bitscore=hit.score,
+                domains=domains,
+            )
+        else:
+            yield SequenceHit(
+                sequence_id=hit.name.decode(),
+                hmm_name=hmm_name,
+                evalue=hit.evalue,
+                bitscore=hit.score,
+                domains=domains,
+            )
