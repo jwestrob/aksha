@@ -91,6 +91,32 @@ def _threshold_opts_from_args(args: argparse.Namespace) -> ThresholdOptions:
     )
 
 
+def _resolve_output(output: str) -> tuple[Path, Optional[Path]]:
+    """Parse -o into (output_dir for ResultCollector, final_csv_path or None).
+
+    If output ends with a file extension (e.g. .tsv), output_dir is its parent
+    and the csv path is the file itself.  Otherwise output is treated as a
+    directory and csv path is deferred (caller picks the filename).
+    """
+    p = Path(output)
+    if p.suffix:
+        return p.parent, p
+    return p, None
+
+
+def _write_result(result, output_path: Path, csv_path: Optional[Path], default_name: str) -> None:
+    """Write search result to CSV and print summary."""
+    from aksha.types import SearchResult
+
+    if csv_path:
+        result.to_csv(csv_path)
+    else:
+        output_path.mkdir(exist_ok=True)
+        result.to_csv(output_path / default_name)
+
+    print(f"Found {len(result)} hits")
+
+
 def _add_search_parser(subparsers) -> None:
     """Add search subcommand."""
     parser = subparsers.add_parser("search", help="Search sequences with HMM profiles")
@@ -107,23 +133,17 @@ def _cmd_search(args: argparse.Namespace) -> int:
     from aksha.search import search
 
     thresholds = _threshold_opts_from_args(args)
-    output_path = Path(args.output)
+    output_dir, csv_path = _resolve_output(args.output)
 
     result = search(
         sequences=args.sequences,
         hmms=args.hmms,
         thresholds=thresholds,
         threads=args.threads,
-        output_dir=output_path.parent if output_path.suffix else output_path,
+        output_dir=output_dir,
     )
 
-    if output_path.suffix:
-        result.to_csv(output_path)
-    else:
-        output_path.mkdir(exist_ok=True)
-        result.to_csv(output_path / "search_results.tsv")
-
-    print(f"Found {len(result)} hits")
+    _write_result(result, output_dir, csv_path, "search_results.tsv")
     return 0
 
 
@@ -143,23 +163,17 @@ def _cmd_scan(args: argparse.Namespace) -> int:
     from aksha.scan import scan
 
     thresholds = _threshold_opts_from_args(args)
-    output_path = Path(args.output)
+    output_dir, csv_path = _resolve_output(args.output)
 
     result = scan(
         sequences=args.sequences,
         hmms=args.hmms,
         thresholds=thresholds,
         threads=args.threads,
-        output_dir=output_path.parent if output_path.suffix else output_path,
+        output_dir=output_dir,
     )
 
-    if output_path.suffix:
-        result.to_csv(output_path)
-    else:
-        output_path.mkdir(exist_ok=True)
-        result.to_csv(output_path / "scan_results.tsv")
-
-    print(f"Found {len(result)} hits")
+    _write_result(result, output_dir, csv_path, "scan_results.tsv")
     return 0
 
 
@@ -179,24 +193,17 @@ def _cmd_phmmer(args: argparse.Namespace) -> int:
     from aksha.phmmer import phmmer
 
     thresholds = _threshold_opts_from_args(args)
-
-    output_path = Path(args.output)
+    output_dir, csv_path = _resolve_output(args.output)
 
     result = phmmer(
         query=args.query,
         target=args.target,
         thresholds=thresholds,
         threads=args.threads,
-        output_dir=output_path.parent if output_path.suffix else output_path,
+        output_dir=output_dir,
     )
 
-    if output_path.suffix:
-        result.to_csv(output_path)
-    else:
-        output_path.mkdir(exist_ok=True)
-        result.to_csv(output_path / "phmmer_results.tsv")
-
-    print(f"Found {len(result)} hits")
+    _write_result(result, output_dir, csv_path, "phmmer_results.tsv")
     return 0
 
 
@@ -217,8 +224,7 @@ def _cmd_jackhmmer(args: argparse.Namespace) -> int:
     from aksha.jackhmmer import jackhmmer
 
     thresholds = _threshold_opts_from_args(args)
-
-    output_path = Path(args.output)
+    output_dir, csv_path = _resolve_output(args.output)
 
     result = jackhmmer(
         query=args.query,
@@ -226,16 +232,10 @@ def _cmd_jackhmmer(args: argparse.Namespace) -> int:
         thresholds=thresholds,
         threads=args.threads,
         max_iterations=args.iterations,
-        output_dir=output_path.parent if output_path.suffix else output_path,
+        output_dir=output_dir,
     )
 
-    if output_path.suffix:
-        result.to_csv(output_path)
-    else:
-        output_path.mkdir(exist_ok=True)
-        result.to_csv(output_path / "jackhmmer_results.tsv")
-
-    print(f"Found {len(result)} hits")
+    _write_result(result, output_dir, csv_path, "jackhmmer_results.tsv")
     return 0
 
 
@@ -255,24 +255,17 @@ def _cmd_nhmmer(args: argparse.Namespace) -> int:
     from aksha.nhmmer import nhmmer
 
     thresholds = _threshold_opts_from_args(args)
-
-    output_path = Path(args.output)
+    output_dir, csv_path = _resolve_output(args.output)
 
     result = nhmmer(
         sequences=args.sequences,
         hmms=args.hmms,
         thresholds=thresholds,
         threads=args.threads,
-        output_dir=output_path.parent if output_path.suffix else output_path,
+        output_dir=output_dir,
     )
 
-    if output_path.suffix:
-        result.to_csv(output_path)
-    else:
-        output_path.mkdir(exist_ok=True)
-        result.to_csv(output_path / "nhmmer_results.tsv")
-
-    print(f"Found {len(result)} hits")
+    _write_result(result, output_dir, csv_path, "nhmmer_results.tsv")
     return 0
 
 

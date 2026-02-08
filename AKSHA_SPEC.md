@@ -16,37 +16,53 @@ Aksha is a Python library and CLI tool for scalable HMM-based sequence searching
 
 ---
 
+## Post-Implementation Changes
+
+The following architectural changes were made during implementation:
+
+1. **`_compat.py` removed** — Python version compat (tomli/tomllib) lives in `config.py`; `tomli` added as conditional dependency.
+2. **`platformdirs` replaces hand-rolled XDG** — `config.py` uses `platformdirs.user_config_dir("aksha")` / `user_data_dir("aksha")` instead of manual `XDG_*` fallbacks. Env var overrides (`AKSHA_CONFIG_DIR`, `AKSHA_DATA_DIR`) still work.
+3. **Lazy sequence iteration** — `iter_sequences()` added in `parsers.py`; all five search pipelines use it instead of `parse_sequences()` so only one file's sequences are in memory at a time.
+4. **`hits_from_pyhmmer` consolidated** — `results.py` now has `sequence_id` and `skip_duplicates` keyword args so all five pipelines share a single hit-extraction path.
+5. **`SearchResult` memory fixes** — `_count` field tracks hit count for disk-backed results; `__len__` and `__iter__` work correctly when `_output_path` is set; `to_csv()` copies the file directly via `shutil.copy2` instead of round-tripping through pandas.
+6. **`_save_state` custom DB fix** — Custom databases now persist `custom: True`, `molecule_type`, and `citation` so they survive process restarts.
+7. **Tarfile security** — `databases.py` filters tar members through `_safe_tar_members()` to prevent path traversal and symlink attacks.
+8. **CLI helpers** — `_resolve_output()` and `_write_result()` deduplicate output logic across all five `_cmd_*` functions; `--incE`, `--incT`, `--incdomE`, `--incdomT` flags added.
+9. **Error messages** — `_resolve_hmms` now distinguishes "unknown database" from "known but not installed" with an actionable message.
+
+---
+
 ## File Structure
 
 ```
 aksha/
 ├── __init__.py           # Public API exports
 ├── types.py              # Dataclasses, TypedDicts, type aliases
-├── config.py             # Configuration management, path resolution
-├── parsers.py            # HMM and sequence file parsing
+├── config.py             # Configuration management (platformdirs)
+├── parsers.py            # HMM and sequence file parsing + iter_sequences
 ├── thresholds.py         # Threshold logic (cascade, cutoffs)
-├── results.py            # SearchResult class, output handling
+├── results.py            # ResultCollector, hits_from_pyhmmer
 ├── search.py             # hmmsearch implementation
-├── scan.py               # hmmscan implementation  
+├── scan.py               # hmmscan implementation
 ├── phmmer.py             # phmmer implementation
 ├── jackhmmer.py          # jackhmmer implementation
 ├── nhmmer.py             # nhmmer (nucleotide search)
 ├── databases.py          # Database installation and management
 ├── cli.py                # Argparse CLI, all subcommands
-├── _compat.py            # Python version compatibility helpers
 ├── data/
 │   └── databases.json    # Bundled database definitions (URLs, citations)
 ├── py.typed              # PEP 561 marker
-└── tests/
-    ├── __init__.py
-    ├── conftest.py       # Pytest fixtures
-    ├── test_config.py
-    ├── test_parsers.py
-    ├── test_search.py
-    └── fixtures/
-        ├── small.faa     # 10 protein sequences
-        ├── small.fna     # 10 nucleotide sequences
-        └── small.hmm     # 2-3 HMM profiles
+tests/
+├── conftest.py           # Pytest fixtures
+├── test_search.py        # Search pipeline tests
+├── test_barrnap.py       # barrnap nhmmer integration test
+└── fixtures/
+    ├── small.faa         # 10 protein sequences
+    ├── small.fna         # 10 nucleotide sequences
+    ├── small.hmm         # 2-3 HMM profiles
+    ├── small_nuc.hmm     # Nucleotide HMM profile
+    ├── cutoff_ga.hmm     # HMM with gathering cutoffs
+    └── rrna_16S.fa       # 16S rRNA test sequences
 ```
 
 ---
@@ -78,6 +94,7 @@ dependencies = [
     "tqdm>=4.65.0",
     "requests>=2.28.0",
     "platformdirs>=3.0.0",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
@@ -237,32 +254,59 @@ class SequenceHit:
 @dataclass
 class SearchResult:
     """Container for search results with uniform interface.
-    
+
     Handles both in-memory and on-disk storage transparently.
+    Disk-backed results stream from TSV without loading into memory.
     """
     hits: list[SequenceHit] = field(default_factory=list)
     _dataframe: Optional[pd.DataFrame] = field(default=None, repr=False)
     _output_path: Optional[Path] = field(default=None, repr=False)
-    
+    _count: int = field(default=0, repr=False)
+
     def __len__(self) -> int:
+        if self._count:
+            return self._count
         if self._dataframe is not None:
             return len(self._dataframe)
         return len(self.hits)
-    
+
     def __iter__(self) -> Iterator[SequenceHit]:
+        if self._output_path is not None:
+            return self._iter_from_disk()
         return iter(self.hits)
-    
+
+    def _iter_from_disk(self) -> Iterator[SequenceHit]:
+        """Stream SequenceHit objects from disk TSV without loading all into memory."""
+        import csv
+        from itertools import groupby
+        from operator import itemgetter
+
+        with open(self._output_path, newline="", encoding="utf-8") as fh:
+            reader = csv.reader(fh, delimiter="\t")
+            next(reader)  # skip header
+            for key, group in groupby(reader, key=itemgetter(0, 1)):
+                sequence_id, hmm_name = key
+                domains: list[DomainHit] = []
+                seq_evalue = seq_bitscore = 0.0
+                for row in group:
+                    seq_evalue = float(row[2])
+                    seq_bitscore = float(row[3])
+                    domains.append(DomainHit(
+                        c_evalue=float(row[4]), i_evalue=float(row[5]),
+                        bitscore=float(row[6]), env_from=int(row[7]),
+                        env_to=int(row[8]), ali_from=int(row[9]), ali_to=int(row[10]),
+                    ))
+                yield SequenceHit(
+                    sequence_id=sequence_id, hmm_name=hmm_name,
+                    evalue=seq_evalue, bitscore=seq_bitscore, domains=tuple(domains),
+                )
+
     def to_dataframe(self) -> pd.DataFrame:
-        """Convert results to DataFrame.
-        
-        Expands domain hits into separate rows.
-        """
+        """Convert results to DataFrame.  Expands domain hits into separate rows."""
         if self._dataframe is not None:
             return self._dataframe
-        
         if self._output_path is not None:
             return pd.read_csv(self._output_path, sep="\t")
-        
         rows = []
         for hit in self.hits:
             for domain in hit.domains:
@@ -279,28 +323,33 @@ class SearchResult:
                     "ali_from": domain.ali_from,
                     "ali_to": domain.ali_to,
                 })
-        
         return pd.DataFrame(rows)
-    
+
     def to_csv(self, path: PathLike, **kwargs) -> Path:
-        """Write results to TSV file."""
+        """Write results to TSV file.  Copies directly for disk-backed results."""
+        import shutil
         path = Path(path)
+        if self._output_path is not None and self._output_path != path:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(self._output_path, path)
+            return path
         df = self.to_dataframe()
         df.to_csv(path, sep="\t", index=False, **kwargs)
         return path
-    
+
     @classmethod
     def from_dataframe(cls, df: pd.DataFrame) -> "SearchResult":
         """Create SearchResult from DataFrame."""
         result = cls()
         result._dataframe = df
         return result
-    
+
     @classmethod
-    def from_file(cls, path: PathLike) -> "SearchResult":
+    def from_file(cls, path: PathLike, count: int = 0) -> "SearchResult":
         """Create SearchResult referencing an output file."""
         result = cls()
         result._output_path = Path(path)
+        result._count = count
         return result
 
 
@@ -332,19 +381,19 @@ class DatabaseInfo:
 
 ### `config.py`
 
-Configuration management with XDG compliance and environment variable overrides.
+Configuration management using `platformdirs` for cross-platform path resolution.
 
 ```python
 """Configuration management for Aksha.
 
 Path resolution precedence:
 1. Environment variables (AKSHA_DATA_DIR, AKSHA_CONFIG_DIR)
-2. User config file (~/.config/aksha/config.toml)
-3. XDG defaults (~/.local/share/aksha, ~/.config/aksha)
+2. User config file (<platformdirs config>/config.toml)
+3. platformdirs defaults (platform-appropriate locations)
 
 Example config.toml:
     data_dir = "/scratch/shared/hmm_databases"
-    
+
     [defaults]
     threads = 8
     cut_ga = true
@@ -359,10 +408,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+import platformdirs
+
 if sys.version_info >= (3, 11):
     import tomllib
 else:
-    # Python 3.10 compatibility
     import tomli as tomllib
 
 from aksha.types import DatabaseInfo, MoleculeType
@@ -400,10 +450,8 @@ class AkshaConfig:
         """Resolve config directory path."""
         if env := os.environ.get("AKSHA_CONFIG_DIR"):
             return Path(env).expanduser()
-        if xdg := os.environ.get("XDG_CONFIG_HOME"):
-            return Path(xdg) / "aksha"
-        return Path.home() / ".config" / "aksha"
-    
+        return Path(platformdirs.user_config_dir("aksha"))
+
     @staticmethod
     def _resolve_data_dir(user_config: dict[str, Any]) -> Path:
         """Resolve data directory path."""
@@ -411,9 +459,7 @@ class AkshaConfig:
             return Path(env).expanduser()
         if config_path := user_config.get("data_dir"):
             return Path(config_path).expanduser()
-        if xdg := os.environ.get("XDG_DATA_HOME"):
-            return Path(xdg) / "aksha"
-        return Path.home() / ".local" / "share" / "aksha"
+        return Path(platformdirs.user_data_dir("aksha"))
     
     def ensure_dirs(self) -> None:
         """Create config and data directories if needed."""
@@ -489,11 +535,16 @@ class DatabaseRegistry:
         state = {}
         for name, entry in self._entries.items():
             if entry.installed or entry.path:
-                state[name] = {
+                rec: dict[str, Any] = {
                     "installed": entry.installed,
                     "path": entry.path,
                     "version": entry.version,
                 }
+                if name not in self._bundled_names:
+                    rec["custom"] = True
+                    rec["molecule_type"] = entry.molecule_type.name.lower()
+                    rec["citation"] = entry.citation
+                state[name] = rec
         
         self.config.ensure_dirs()
         with open(self._state_file, "w") as f:
@@ -618,7 +669,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Union, Sequence, Optional, overload
+from typing import Union, Sequence, Optional, Iterator, overload
 
 import pyhmmer.easel
 import pyhmmer.plan7
@@ -823,6 +874,59 @@ def _parse_sequence_directory(
     
     logger.info(f"Parsed sequences from {len(result)} files in {path}")
     return result
+
+
+def iter_sequences(
+    source: SequenceInput,
+    *,
+    molecule_type: MoleculeType = MoleculeType.PROTEIN,
+    alphabet: Optional[Alphabet] = None,
+    show_progress: bool = True,
+) -> Iterator[tuple[Path, SequenceBlock]]:
+    """Lazily yield (path, SequenceBlock) pairs — one file at a time.
+
+    For directory input, only one file's sequences live in memory at a time.
+    For single-file or pre-loaded input, yields the single entry.
+    All five search pipelines use this instead of parse_sequences().
+    """
+    if alphabet is None:
+        alphabet = _get_alphabet(molecule_type)
+
+    if isinstance(source, pyhmmer.easel.DigitalSequenceBlock):
+        yield Path("<memory>"), source
+        return
+
+    if isinstance(source, (list, tuple)):
+        if all(isinstance(s, pyhmmer.easel.DigitalSequence) for s in source):
+            block = pyhmmer.easel.DigitalSequenceBlock(alphabet, source)
+            yield Path("<memory>"), block
+            return
+
+    path = Path(source)
+    if not path.exists():
+        raise FileNotFoundError(f"Sequence path not found: {path}")
+
+    if path.is_file():
+        yield path, _parse_sequence_file(path, alphabet)
+        return
+
+    if path.is_dir():
+        seq_files = sorted(
+            f for f in path.iterdir()
+            if f.suffix.lower() in (".faa", ".fna", ".fa", ".fasta", ".fas")
+        )
+        if not seq_files:
+            raise ValueError(f"No sequence files found in directory: {path}")
+
+        iterator = tqdm(seq_files, desc="Parsing sequences") if show_progress else seq_files
+        for seq_path in iterator:
+            try:
+                yield seq_path, _parse_sequence_file(seq_path, alphabet)
+            except Exception as e:
+                logger.warning(f"Failed to parse {seq_path}: {e}")
+        return
+
+    raise ValueError(f"Invalid sequence source: {source}")
 
 
 def check_hmm_thresholds(hmm: HMM) -> dict[str, bool]:
@@ -1083,10 +1187,10 @@ class ResultCollector:
         if self._temp_file:
             self._temp_file.close()
             self._temp_file = None
-        
+
         if self._using_disk and self._temp_path:
-            return SearchResult.from_file(self._temp_path)
-        
+            return SearchResult.from_file(self._temp_path, count=self._count)
+
         return SearchResult(hits=self._hits)
     
     def __enter__(self) -> "ResultCollector":
@@ -1100,20 +1204,27 @@ class ResultCollector:
 def hits_from_pyhmmer(
     pyhmmer_hits,
     hmm_name: str,
+    *,
+    sequence_id: Optional[str] = None,
+    skip_duplicates: bool = False,
 ) -> Iterator[SequenceHit]:
     """Convert PyHMMER hits to SequenceHit objects.
-    
+
     Args:
         pyhmmer_hits: TopHits object from PyHMMER
         hmm_name: Name of the query HMM
-        
+        sequence_id: Override sequence_id (used by scan where query is the sequence)
+        skip_duplicates: Skip hits marked as duplicates (used by jackhmmer)
+
     Yields:
         SequenceHit objects for included hits
     """
     for hit in pyhmmer_hits:
         if not hit.included:
             continue
-        
+        if skip_duplicates and getattr(hit, "duplicate", False):
+            continue
+
         domains = tuple(
             DomainHit(
                 c_evalue=domain.c_evalue,
@@ -1126,10 +1237,10 @@ def hits_from_pyhmmer(
             )
             for domain in hit.domains.reported
         )
-        
+
         yield SequenceHit(
-            sequence_id=hit.name.decode(),
-            hmm_name=hmm_name,
+            sequence_id=sequence_id or hit.name.decode(),
+            hmm_name=hmm_name if not sequence_id else hit.name.decode(),
             evalue=hit.evalue,
             bitscore=hit.score,
             domains=domains,
@@ -1162,12 +1273,17 @@ from aksha.types import (
     HMM,
     SequenceBlock,
 )
-from aksha.parsers import parse_hmms, parse_sequences, HMMInput, SequenceInput
+from aksha.parsers import parse_hmms, iter_sequences, HMMInput, SequenceInput
 from aksha.thresholds import build_search_kwargs, group_hmms_by_cutoff
 from aksha.results import ResultCollector, hits_from_pyhmmer
 from aksha.config import get_registry
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_cpus(threads: int) -> int:
+    """Normalize thread count (0 -> all available)."""
+    return threads if threads > 0 else (os.cpu_count() or 1)
 
 
 def search(
@@ -1179,49 +1295,23 @@ def search(
     output_dir: Optional[PathLike] = None,
     show_progress: bool = True,
 ) -> SearchResult:
-    """Search sequences against HMM profiles using hmmsearch.
-    
-    Args:
-        sequences: Protein sequences (path, directory, or pre-loaded)
-        hmms: HMM profiles (path, directory, database name, or pre-loaded)
-        thresholds: Threshold configuration (default: no cutoffs)
-        threads: CPU threads (0 = auto-detect)
-        output_dir: Output directory for large results
-        show_progress: Show progress bar
-        
-    Returns:
-        SearchResult containing hits
-        
-    Example:
-        # Search with installed database
-        result = search("proteins.faa", "PFAM", thresholds=ThresholdOptions(cut_ga=True))
-        
-        # Search with custom HMMs
-        result = search("proteins.faa", "custom.hmm")
-        
-        # Get results as DataFrame
-        df = result.to_dataframe()
-    """
+    """Search sequences against HMM profiles using hmmsearch."""
     if thresholds is None:
         thresholds = ThresholdOptions()
-    
-    # Resolve HMM source
+
     hmm_list = _resolve_hmms(hmms)
-    
-    # Parse sequences
-    sequence_dict = parse_sequences(
+
+    sequence_iter = iter_sequences(
         sequences,
         molecule_type=MoleculeType.PROTEIN,
         show_progress=show_progress,
     )
-    
-    # Setup output
+
     output_path = Path(output_dir) if output_dir else None
-    
-    # Run search
+
     with ResultCollector(output_dir=output_path) as collector:
         _run_hmmsearch(
-            sequence_dict=sequence_dict,
+            sequence_iter=sequence_iter,
             hmms=hmm_list,
             thresholds=thresholds,
             threads=threads,
@@ -1233,20 +1323,22 @@ def search(
 
 def _resolve_hmms(source: Union[HMMInput, str]) -> list[HMM]:
     """Resolve HMM source to list of HMM objects."""
-    # Check if it's a database name
     if isinstance(source, str) and not Path(source).exists():
         registry = get_registry()
         db_path = registry.get_path(source)
         if db_path:
-            logger.info(f"Using installed database: {source} at {db_path}")
+            logger.info("Using installed database: %s at %s", source, db_path)
             return parse_hmms(db_path)
-        # Fall through to parse as path (will raise FileNotFoundError)
-    
+        if registry.get(source) is not None:
+            raise FileNotFoundError(
+                f"Database '{source}' is not installed. "
+                f"Run: aksha database install {source}"
+            )
     return parse_hmms(source)
 
 
 def _run_hmmsearch(
-    sequence_dict: dict[Path, SequenceBlock],
+    sequence_iter,
     hmms: list[HMM],
     thresholds: ThresholdOptions,
     threads: int,
@@ -1254,26 +1346,19 @@ def _run_hmmsearch(
     show_progress: bool,
 ) -> None:
     """Execute hmmsearch across all sequence files."""
-    # Group HMMs by cutoff type (for cascade mode)
     hmm_groups = group_hmms_by_cutoff(hmms, thresholds)
-    
-    # Build base kwargs
     base_kwargs = build_search_kwargs(thresholds)
-    
-    # Progress bar over sequence files
-    seq_iterator = tqdm(sequence_dict.items(), desc="Searching") if show_progress else sequence_dict.items()
-    
-    for seq_path, sequences in seq_iterator:
-        logger.debug(f"Searching {seq_path} ({len(sequences)} sequences)")
-        
+    cpus = _resolve_cpus(threads)
+
+    for seq_path, sequences in sequence_iter:
+        logger.debug("Searching %s (%d sequences)", seq_path, len(sequences))
+
         for cutoff_type, hmm_group in hmm_groups.items():
-            # Build kwargs for this group
             kwargs = base_kwargs.copy()
             if cutoff_type:
                 kwargs["bit_cutoffs"] = cutoff_type
-            
-            # Run search
-            for hits in pyhmmer.hmmsearch(hmm_group, sequences, cpus=threads, **kwargs):
+
+            for hits in pyhmmer.hmmsearch(hmm_group, sequences, cpus=cpus, **kwargs):
                 hmm_name = hits.query.name.decode()
                 for hit in hits_from_pyhmmer(hits, hmm_name):
                     collector.add(hit)
@@ -1283,14 +1368,11 @@ def _run_hmmsearch(
 
 ### `scan.py`
 
-hmmscan implementation (sequences as queries, HMMs as database).
+hmmscan implementation (sequences as queries, HMMs as database). Uses `hits_from_pyhmmer`
+with `sequence_id` override to flip the query/target perspective.
 
 ```python
-"""HMM scan implementation using PyHMMER.
-
-Unlike search (HMMs as queries), scan uses sequences as queries
-against an HMM database.
-"""
+"""HMM scan implementation using PyHMMER."""
 
 from __future__ import annotations
 
@@ -1299,19 +1381,12 @@ from pathlib import Path
 from typing import Optional, Union
 
 import pyhmmer
-from tqdm import tqdm
 
-from aksha.types import (
-    PathLike,
-    MoleculeType,
-    ThresholdOptions,
-    SearchResult,
-)
-from aksha.parsers import parse_hmms, parse_sequences, HMMInput, SequenceInput
+from aksha.types import PathLike, MoleculeType, ThresholdOptions, SearchResult
+from aksha.parsers import parse_hmms, iter_sequences, HMMInput, SequenceInput
 from aksha.thresholds import build_search_kwargs, group_hmms_by_cutoff
 from aksha.results import ResultCollector, hits_from_pyhmmer
-from aksha.config import get_registry
-from aksha.search import _resolve_hmms
+from aksha.search import _resolve_hmms, _resolve_cpus
 
 logger = logging.getLogger(__name__)
 
@@ -1325,105 +1400,39 @@ def scan(
     output_dir: Optional[PathLike] = None,
     show_progress: bool = True,
 ) -> SearchResult:
-    """Scan sequences against HMM database using hmmscan.
-    
-    Unlike search(), this uses sequences as queries against the HMM database.
-    Better when you have few sequences and many HMMs.
-    
-    Args:
-        sequences: Protein sequences (path, directory, or pre-loaded)
-        hmms: HMM profiles (path, directory, database name, or pre-loaded)
-        thresholds: Threshold configuration
-        threads: CPU threads (0 = auto-detect)
-        output_dir: Output directory for large results
-        show_progress: Show progress bar
-        
-    Returns:
-        SearchResult containing hits
-    """
+    """Scan sequences against HMM database using hmmscan."""
     if thresholds is None:
         thresholds = ThresholdOptions()
-    
+
     hmm_list = _resolve_hmms(hmms)
-    sequence_dict = parse_sequences(
-        sequences,
-        molecule_type=MoleculeType.PROTEIN,
-        show_progress=show_progress,
+    sequence_iter = iter_sequences(
+        sequences, molecule_type=MoleculeType.PROTEIN, show_progress=show_progress,
     )
-    
+
     output_path = Path(output_dir) if output_dir else None
-    
-    with ResultCollector(output_dir=output_path) as collector:
-        _run_hmmscan(
-            sequence_dict=sequence_dict,
-            hmms=hmm_list,
-            thresholds=thresholds,
-            threads=threads,
-            collector=collector,
-            show_progress=show_progress,
-        )
-        return collector.finalize()
-
-
-def _run_hmmscan(
-    sequence_dict: dict[Path, SequenceBlock],
-    hmms: list[HMM],
-    thresholds: ThresholdOptions,
-    threads: int,
-    collector: ResultCollector,
-    show_progress: bool,
-) -> None:
-    """Execute hmmscan across all sequence files."""
-    hmm_groups = group_hmms_by_cutoff(hmms, thresholds)
+    hmm_groups = group_hmms_by_cutoff(hmm_list, thresholds)
     base_kwargs = build_search_kwargs(thresholds)
-    
-    seq_iterator = tqdm(sequence_dict.items(), desc="Scanning") if show_progress else sequence_dict.items()
-    
-    for seq_path, sequences in seq_iterator:
-        logger.debug(f"Scanning {seq_path} ({len(sequences)} sequences)")
-        
-        for cutoff_type, hmm_group in hmm_groups.items():
-            kwargs = base_kwargs.copy()
-            if cutoff_type:
-                kwargs["bit_cutoffs"] = cutoff_type
-            
-            # Note: hmmscan takes (sequences, hmms) not (hmms, sequences)
-            for hits in pyhmmer.hmmscan(sequences, hmm_group, cpus=threads, **kwargs):
-                seq_name = hits.query_name.decode()
-                for hit in hits:
-                    if not hit.included:
-                        continue
-                    
-                    hmm_name = hit.name.decode()
-                    # Reconstruct as SequenceHit
-                    # (scan returns HMM as hit, need to flip perspective)
-                    from aksha.types import SequenceHit, DomainHit
-                    
-                    domains = tuple(
-                        DomainHit(
-                            c_evalue=d.c_evalue,
-                            i_evalue=d.i_evalue,
-                            bitscore=d.score,
-                            env_from=d.env_from,
-                            env_to=d.env_to,
-                            ali_from=d.ali_from,
-                            ali_to=d.ali_to,
-                        )
-                        for d in hit.domains.reported
-                    )
-                    
-                    collector.add(SequenceHit(
-                        sequence_id=seq_name,
-                        hmm_name=hmm_name,
-                        evalue=hit.evalue,
-                        bitscore=hit.score,
-                        domains=domains,
-                    ))
+    cpus = _resolve_cpus(threads)
+
+    with ResultCollector(output_dir=output_path) as collector:
+        for seq_path, sequences_block in sequence_iter:
+            for cutoff_type, hmm_group in hmm_groups.items():
+                kwargs = base_kwargs.copy()
+                if cutoff_type:
+                    kwargs["bit_cutoffs"] = cutoff_type
+                # hmmscan: sequences as queries, HMMs as database
+                for hits in pyhmmer.hmmscan(sequences_block, hmm_group, cpus=cpus, **kwargs):
+                    seq_name = hits.query_name.decode()
+                    for hit in hits_from_pyhmmer(hits, hmm_name="", sequence_id=seq_name):
+                        collector.add(hit)
+        return collector.finalize()
 ```
 
 ---
 
 ### `phmmer.py`
+
+Uses `iter_sequences` with a single-file guard.
 
 ```python
 """phmmer: protein sequence vs protein sequence search."""
@@ -1435,19 +1444,12 @@ from pathlib import Path
 from typing import Optional
 
 import pyhmmer
-from tqdm import tqdm
 
-from aksha.types import (
-    PathLike,
-    MoleculeType,
-    ThresholdOptions,
-    SearchResult,
-    SequenceHit,
-    DomainHit,
-)
-from aksha.parsers import parse_sequences, SequenceInput
+from aksha.types import PathLike, MoleculeType, ThresholdOptions, SearchResult
+from aksha.parsers import iter_sequences, SequenceInput
 from aksha.thresholds import build_search_kwargs
-from aksha.results import ResultCollector
+from aksha.results import ResultCollector, hits_from_pyhmmer
+from aksha.search import _resolve_cpus
 
 logger = logging.getLogger(__name__)
 
@@ -1461,76 +1463,37 @@ def phmmer(
     output_dir: Optional[PathLike] = None,
     show_progress: bool = True,
 ) -> SearchResult:
-    """Search query sequences against target sequences using phmmer.
-    
-    phmmer builds a profile from each query sequence and searches
-    against the target database. Useful for finding homologs without
-    pre-built HMMs.
-    
-    Args:
-        query: Query protein sequences
-        target: Target protein sequences (database)
-        thresholds: Threshold configuration
-        threads: CPU threads (0 = auto-detect)
-        output_dir: Output directory for large results
-        show_progress: Show progress bar
-        
-    Returns:
-        SearchResult containing hits
-    """
+    """Search query sequences against target sequences using phmmer."""
     if thresholds is None:
         thresholds = ThresholdOptions()
-    
-    # Parse sequences
-    query_dict = parse_sequences(query, molecule_type=MoleculeType.PROTEIN, show_progress=False)
-    target_dict = parse_sequences(target, molecule_type=MoleculeType.PROTEIN, show_progress=False)
-    
-    # Flatten to single blocks (phmmer expects single blocks)
-    query_seqs = list(query_dict.values())[0]
-    target_seqs = list(target_dict.values())[0]
-    
+
+    query_iter = iter_sequences(query, molecule_type=MoleculeType.PROTEIN, show_progress=False)
+    _, query_seqs = next(query_iter)
+    if next(query_iter, None) is not None:
+        raise ValueError("phmmer expects a single query file, got a directory with multiple files")
+
+    target_iter = iter_sequences(target, molecule_type=MoleculeType.PROTEIN, show_progress=False)
+    _, target_seqs = next(target_iter)
+
     kwargs = build_search_kwargs(thresholds)
     output_path = Path(output_dir) if output_dir else None
-    
+    cpus = _resolve_cpus(threads)
+
     with ResultCollector(output_dir=output_path) as collector:
-        results = pyhmmer.phmmer(query_seqs, target_seqs, cpus=threads, **kwargs)
-        
-        iterator = tqdm(results, desc="phmmer") if show_progress else results
-        
-        for hits in iterator:
+        for hits in pyhmmer.phmmer(query_seqs, target_seqs, cpus=cpus, **kwargs):
             query_name = hits.query_name.decode()
-            
-            for hit in hits:
-                if not hit.included:
-                    continue
-                
-                domains = tuple(
-                    DomainHit(
-                        c_evalue=d.c_evalue,
-                        i_evalue=d.i_evalue,
-                        bitscore=d.score,
-                        env_from=d.env_from,
-                        env_to=d.env_to,
-                        ali_from=d.ali_from,
-                        ali_to=d.ali_to,
-                    )
-                    for d in hit.domains.reported
-                )
-                
-                collector.add(SequenceHit(
-                    sequence_id=hit.name.decode(),
-                    hmm_name=query_name,  # Query is the "profile"
-                    evalue=hit.evalue,
-                    bitscore=hit.score,
-                    domains=domains,
-                ))
-        
+            for hit in hits_from_pyhmmer(hits, query_name):
+                collector.add(hit)
         return collector.finalize()
 ```
 
 ---
 
 ### `jackhmmer.py`
+
+Uses `iter_sequences` with single-file guard. Uses `hits_from_pyhmmer` with `skip_duplicates=True`.
+Note: `final_results.hits` (not `final_results` itself) must be passed to `hits_from_pyhmmer`
+because `IterationResult` iterates over HMMs, not hits.
 
 ```python
 """jackhmmer: iterative protein sequence search."""
@@ -1542,19 +1505,12 @@ from pathlib import Path
 from typing import Optional
 
 import pyhmmer
-from tqdm import tqdm
 
-from aksha.types import (
-    PathLike,
-    MoleculeType,
-    ThresholdOptions,
-    SearchResult,
-    SequenceHit,
-    DomainHit,
-)
-from aksha.parsers import parse_sequences, SequenceInput
+from aksha.types import PathLike, MoleculeType, ThresholdOptions, SearchResult
+from aksha.parsers import iter_sequences, SequenceInput
 from aksha.thresholds import build_search_kwargs
-from aksha.results import ResultCollector
+from aksha.results import ResultCollector, hits_from_pyhmmer
+from aksha.search import _resolve_cpus
 
 logger = logging.getLogger(__name__)
 
@@ -1569,84 +1525,48 @@ def jackhmmer(
     output_dir: Optional[PathLike] = None,
     show_progress: bool = True,
 ) -> SearchResult:
-    """Iteratively search query sequences against targets using jackhmmer.
-    
-    jackhmmer performs iterative searches, building an HMM from hits
-    at each iteration to find more distant homologs.
-    
-    Args:
-        query: Query protein sequences
-        target: Target protein sequences (database)
-        thresholds: Threshold configuration
-        threads: CPU threads (0 = auto-detect)
-        max_iterations: Maximum search iterations
-        output_dir: Output directory for large results
-        show_progress: Show progress bar
-        
-    Returns:
-        SearchResult containing hits from final iteration
-    """
+    """Iteratively search query sequences against targets using jackhmmer."""
     if thresholds is None:
         thresholds = ThresholdOptions()
-    
-    query_dict = parse_sequences(query, molecule_type=MoleculeType.PROTEIN, show_progress=False)
-    target_dict = parse_sequences(target, molecule_type=MoleculeType.PROTEIN, show_progress=False)
-    
-    query_seqs = list(query_dict.values())[0]
-    target_seqs = list(target_dict.values())[0]
-    
+
+    query_iter = iter_sequences(query, molecule_type=MoleculeType.PROTEIN, show_progress=False)
+    _, query_seqs = next(query_iter)
+    if next(query_iter, None) is not None:
+        raise ValueError("jackhmmer expects a single query file, got a directory with multiple files")
+
+    target_iter = iter_sequences(target, molecule_type=MoleculeType.PROTEIN, show_progress=False)
+    _, target_seqs = next(target_iter)
+
     kwargs = build_search_kwargs(thresholds)
     output_path = Path(output_dir) if output_dir else None
-    
+    cpus = _resolve_cpus(threads)
+
     with ResultCollector(output_dir=output_path) as collector:
-        # jackhmmer returns an iterator over iterations
         search_iter = pyhmmer.jackhmmer(
-            query_seqs, 
-            target_seqs, 
-            cpus=threads,
-            max_iterations=max_iterations,
-            **kwargs,
+            query_seqs, target_seqs,
+            cpus=cpus, max_iterations=max_iterations, **kwargs,
         )
-        
-        # Get final iteration results
+
         final_results = None
         for iteration in search_iter:
             final_results = iteration
-        
+
         if final_results is None:
             return collector.finalize()
-        
-        for hit in final_results.hits:
-            if not hit.included or hit.duplicate:
-                continue
-            
-            domains = tuple(
-                DomainHit(
-                    c_evalue=d.c_evalue,
-                    i_evalue=d.i_evalue,
-                    bitscore=d.score,
-                    env_from=d.env_from,
-                    env_to=d.env_to,
-                    ali_from=d.ali_from,
-                    ali_to=d.ali_to,
-                )
-                for d in hit.domains.reported
-            )
-            
-            collector.add(SequenceHit(
-                sequence_id=hit.name.decode(),
-                hmm_name="jackhmmer_query",
-                evalue=hit.evalue,
-                bitscore=hit.score,
-                domains=domains,
-            ))
-        
+
+        # .hits gives TopHits; iterating IterationResult directly yields HMMs
+        for hit in hits_from_pyhmmer(final_results.hits, "jackhmmer_query", skip_duplicates=True):
+            collector.add(hit)
+
         return collector.finalize()
 ```
 
 ---
 
 ### `nhmmer.py`
+
+Has its own `_resolve_nhmmer_hmms` (separate from search's) because nhmmer needs
+to probe the HMM alphabet for correct sequence digitization.
 
 ```python
 """nhmmer: nucleotide HMM search."""
@@ -1658,22 +1578,30 @@ from pathlib import Path
 from typing import Optional, Union
 
 import pyhmmer
-from tqdm import tqdm
 
-from aksha.types import (
-    PathLike,
-    MoleculeType,
-    ThresholdOptions,
-    SearchResult,
-    SequenceHit,
-    DomainHit,
-)
-from aksha.parsers import parse_hmms, parse_sequences, HMMInput, SequenceInput
+from aksha.types import PathLike, MoleculeType, ThresholdOptions, SearchResult
+from aksha.parsers import parse_hmms, iter_sequences, HMMInput, SequenceInput
 from aksha.thresholds import build_search_kwargs
-from aksha.results import ResultCollector
+from aksha.results import ResultCollector, hits_from_pyhmmer
+from aksha.search import _resolve_cpus
 from aksha.config import get_registry
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_nhmmer_hmms(source: Union[HMMInput, str]) -> list:
+    """Resolve HMM source for nhmmer (nucleotide models)."""
+    if isinstance(source, str) and not Path(source).exists():
+        registry = get_registry()
+        db_path = registry.get_path(source)
+        if db_path:
+            return parse_hmms(db_path)
+        if registry.get(source) is not None:
+            raise FileNotFoundError(
+                f"Database '{source}' is not installed. "
+                f"Run: aksha database install {source}"
+            )
+    return parse_hmms(source)
 
 
 def nhmmer(
@@ -1685,74 +1613,31 @@ def nhmmer(
     output_dir: Optional[PathLike] = None,
     show_progress: bool = True,
 ) -> SearchResult:
-    """Search nucleotide sequences against nucleotide HMMs using nhmmer.
-    
-    Args:
-        sequences: Nucleotide sequences (path, directory, or pre-loaded)
-        hmms: Nucleotide HMM profiles
-        thresholds: Threshold configuration
-        threads: CPU threads (0 = auto-detect)
-        output_dir: Output directory for large results
-        show_progress: Show progress bar
-        
-    Returns:
-        SearchResult containing hits
-    """
+    """Search nucleotide sequences against nucleotide HMMs using nhmmer."""
     if thresholds is None:
         thresholds = ThresholdOptions()
-    
-    # Resolve HMMs (check if database name)
-    if isinstance(hmms, str) and not Path(hmms).exists():
-        registry = get_registry()
-        db_path = registry.get_path(hmms)
-        if db_path:
-            hmm_list = parse_hmms(db_path)
-        else:
-            raise FileNotFoundError(f"HMM source not found: {hmms}")
-    else:
-        hmm_list = parse_hmms(hmms)
-    
-    # Parse nucleotide sequences
-    sequence_dict = parse_sequences(
-        sequences,
-        molecule_type=MoleculeType.NUCLEOTIDE,
-        show_progress=show_progress,
+
+    hmm_list = _resolve_nhmmer_hmms(hmms)
+    alphabet = hmm_list[0].alphabet if hmm_list else None
+
+    sequence_iter = iter_sequences(
+        sequences, molecule_type=MoleculeType.NUCLEOTIDE,
+        alphabet=alphabet, show_progress=show_progress,
     )
-    
+
     kwargs = build_search_kwargs(thresholds)
+    if kwargs.get("bit_cutoffs") and not all(h.cutoffs.gathering_available() for h in hmm_list):
+        kwargs.pop("bit_cutoffs", None)
+
     output_path = Path(output_dir) if output_dir else None
-    
+    cpus = _resolve_cpus(threads)
+
     with ResultCollector(output_dir=output_path) as collector:
-        seq_iterator = tqdm(sequence_dict.items(), desc="nhmmer") if show_progress else sequence_dict.items()
-        
-        for seq_path, sequences_block in seq_iterator:
-            for hits in pyhmmer.nhmmer(hmm_list, sequences_block, cpus=threads, **kwargs):
-                hmm_name = hits.query_name.decode()
-                
-                for hit in hits:
-                    if not hit.included:
-                        continue
-                    
-                    # nhmmer hits don't have domain structure like protein HMMs
-                    # Create a single "domain" spanning the hit
-                    domains = (DomainHit(
-                        c_evalue=hit.evalue,
-                        i_evalue=hit.evalue,
-                        bitscore=hit.score,
-                        env_from=hit.env_from,
-                        env_to=hit.env_to,
-                        ali_from=hit.env_from,
-                        ali_to=hit.env_to,
-                    ),)
-                    
-                    collector.add(SequenceHit(
-                        sequence_id=hit.name.decode(),
-                        hmm_name=hmm_name,
-                        evalue=hit.evalue,
-                        bitscore=hit.score,
-                        domains=domains,
-                    ))
-        
+        for seq_path, sequences_block in sequence_iter:
+            for hits in pyhmmer.nhmmer(hmm_list, sequences_block, cpus=cpus, **kwargs):
+                hmm_name = hits.query.name.decode()
+                for hit in hits_from_pyhmmer(hits, hmm_name):
+                    collector.add(hit)
         return collector.finalize()
 ```
 
@@ -1880,6 +1765,20 @@ def _install_standard(
     return target_dir
 
 
+def _safe_tar_members(tar: tarfile.TarFile, target_dir: Path):
+    """Filter tar members to prevent path traversal attacks."""
+    resolved = target_dir.resolve()
+    for member in tar.getmembers():
+        member_path = (target_dir / member.name).resolve()
+        if not str(member_path).startswith(str(resolved)):
+            logger.warning("Skipping unsafe tar member: %s", member.name)
+            continue
+        if member.issym() or member.islnk():
+            logger.warning("Skipping symbolic link in tar: %s", member.name)
+            continue
+        yield member
+
+
 def _download_and_extract(url: str, target_dir: Path, show_progress: bool) -> None:
     """Download and extract a file."""
     filename = url.split("/")[-1]
@@ -1896,7 +1795,7 @@ def _download_and_extract(url: str, target_dir: Path, show_progress: bool) -> No
     if tarfile.is_tarfile(download_path):
         logger.info(f"Extracting {filename}")
         with tarfile.open(download_path, "r:*") as tar:
-            tar.extractall(target_dir)
+            tar.extractall(target_dir, members=_safe_tar_members(tar, target_dir))
         download_path.unlink()
         _flatten_single_subdir(target_dir)
     
@@ -2156,6 +2055,10 @@ def _add_threshold_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument("-T", "--bitscore", type=float, help="Bitscore threshold")
     group.add_argument("--domE", type=float, help="Domain E-value threshold")
     group.add_argument("--domT", type=float, help="Domain bitscore threshold")
+    group.add_argument("--incE", type=float, help="Inclusion E-value threshold")
+    group.add_argument("--incT", type=float, help="Inclusion bitscore threshold")
+    group.add_argument("--incdomE", type=float, help="Domain inclusion E-value threshold")
+    group.add_argument("--incdomT", type=float, help="Domain inclusion bitscore threshold")
 
 
 def _threshold_opts_from_args(args: argparse.Namespace) -> ThresholdOptions:
@@ -2169,7 +2072,29 @@ def _threshold_opts_from_args(args: argparse.Namespace) -> ThresholdOptions:
         bitscore=getattr(args, "bitscore", None),
         dom_evalue=getattr(args, "domE", None),
         dom_bitscore=getattr(args, "domT", None),
+        inc_evalue=getattr(args, "incE", None),
+        inc_bitscore=getattr(args, "incT", None),
+        inc_dom_evalue=getattr(args, "incdomE", None),
+        inc_dom_bitscore=getattr(args, "incdomT", None),
     )
+
+
+def _resolve_output(output: str) -> tuple[Path, Optional[Path]]:
+    """Parse -o into (output_dir, final_csv_path or None)."""
+    p = Path(output)
+    if p.suffix:
+        return p.parent, p
+    return p, None
+
+
+def _write_result(result, output_path: Path, csv_path: Optional[Path], default_name: str) -> None:
+    """Write search result to CSV and print summary."""
+    if csv_path:
+        result.to_csv(csv_path)
+    else:
+        output_path.mkdir(exist_ok=True)
+        result.to_csv(output_path / default_name)
+    print(f"Found {len(result)} hits")
 
 
 def _add_search_parser(subparsers) -> None:
@@ -2186,26 +2111,19 @@ def _add_search_parser(subparsers) -> None:
 def _cmd_search(args: argparse.Namespace) -> int:
     """Execute search command."""
     from aksha.search import search
-    
+
     thresholds = _threshold_opts_from_args(args)
-    output_path = Path(args.output)
-    
+    output_dir, csv_path = _resolve_output(args.output)
+
     result = search(
         sequences=args.sequences,
         hmms=args.hmms,
         thresholds=thresholds,
         threads=args.threads,
-        output_dir=output_path.parent if output_path.suffix else output_path,
+        output_dir=output_dir,
     )
-    
-    # Write output
-    if output_path.suffix:
-        result.to_csv(output_path)
-    else:
-        output_path.mkdir(exist_ok=True)
-        result.to_csv(output_path / "search_results.tsv")
-    
-    print(f"Found {len(result)} hits")
+
+    _write_result(result, output_dir, csv_path, "search_results.tsv")
     return 0
 
 
@@ -2223,25 +2141,19 @@ def _add_scan_parser(subparsers) -> None:
 def _cmd_scan(args: argparse.Namespace) -> int:
     """Execute scan command."""
     from aksha.scan import scan
-    
+
     thresholds = _threshold_opts_from_args(args)
-    output_path = Path(args.output)
-    
+    output_dir, csv_path = _resolve_output(args.output)
+
     result = scan(
         sequences=args.sequences,
         hmms=args.hmms,
         thresholds=thresholds,
         threads=args.threads,
-        output_dir=output_path.parent if output_path.suffix else output_path,
+        output_dir=output_dir,
     )
-    
-    if output_path.suffix:
-        result.to_csv(output_path)
-    else:
-        output_path.mkdir(exist_ok=True)
-        result.to_csv(output_path / "scan_results.tsv")
-    
-    print(f"Found {len(result)} hits")
+
+    _write_result(result, output_dir, csv_path, "scan_results.tsv")
     return 0
 
 
@@ -2259,18 +2171,19 @@ def _add_phmmer_parser(subparsers) -> None:
 def _cmd_phmmer(args: argparse.Namespace) -> int:
     """Execute phmmer command."""
     from aksha.phmmer import phmmer
-    
+
     thresholds = _threshold_opts_from_args(args)
-    
+    output_dir, csv_path = _resolve_output(args.output)
+
     result = phmmer(
         query=args.query,
         target=args.target,
         thresholds=thresholds,
         threads=args.threads,
+        output_dir=output_dir,
     )
-    
-    result.to_csv(args.output)
-    print(f"Found {len(result)} hits")
+
+    _write_result(result, output_dir, csv_path, "phmmer_results.tsv")
     return 0
 
 
@@ -2289,19 +2202,20 @@ def _add_jackhmmer_parser(subparsers) -> None:
 def _cmd_jackhmmer(args: argparse.Namespace) -> int:
     """Execute jackhmmer command."""
     from aksha.jackhmmer import jackhmmer
-    
+
     thresholds = _threshold_opts_from_args(args)
-    
+    output_dir, csv_path = _resolve_output(args.output)
+
     result = jackhmmer(
         query=args.query,
         target=args.target,
         thresholds=thresholds,
         threads=args.threads,
         max_iterations=args.iterations,
+        output_dir=output_dir,
     )
-    
-    result.to_csv(args.output)
-    print(f"Found {len(result)} hits")
+
+    _write_result(result, output_dir, csv_path, "jackhmmer_results.tsv")
     return 0
 
 
@@ -2319,18 +2233,19 @@ def _add_nhmmer_parser(subparsers) -> None:
 def _cmd_nhmmer(args: argparse.Namespace) -> int:
     """Execute nhmmer command."""
     from aksha.nhmmer import nhmmer
-    
+
     thresholds = _threshold_opts_from_args(args)
-    
+    output_dir, csv_path = _resolve_output(args.output)
+
     result = nhmmer(
         sequences=args.sequences,
         hmms=args.hmms,
         thresholds=thresholds,
         threads=args.threads,
+        output_dir=output_dir,
     )
-    
-    result.to_csv(args.output)
-    print(f"Found {len(result)} hits")
+
+    _write_result(result, output_dir, csv_path, "nhmmer_results.tsv")
     return 0
 
 
@@ -2765,33 +2680,33 @@ def test_search_with_thresholds(small_fasta, small_hmm, temp_dir):
 ### Migration from Astra
 
 - The old code is reference only
-- Do not copy-paste - rewrite cleanly
+- Do not copy-paste — rewrite cleanly
 - The JSON database format changes slightly (see databases.json spec)
-- Config paths change from ~/.config/Astra to XDG-compliant paths
+- Config paths use `platformdirs` (not hand-rolled XDG)
 
 ---
 
 ## Checklist
 
-- [ ] Set up pyproject.toml
-- [ ] Create package structure
-- [ ] Implement types.py
-- [ ] Implement config.py
-- [ ] Implement parsers.py  
-- [ ] Implement thresholds.py
-- [ ] Implement results.py
-- [ ] Implement search.py
-- [ ] Implement scan.py
-- [ ] Implement phmmer.py
-- [ ] Implement jackhmmer.py
-- [ ] Implement nhmmer.py
-- [ ] Implement databases.py
-- [ ] Implement cli.py
-- [ ] Create __init__.py
-- [ ] Create data/databases.json
-- [ ] Create test fixtures
-- [ ] Write tests
+- [x] Set up pyproject.toml
+- [x] Create package structure
+- [x] Implement types.py
+- [x] Implement config.py (platformdirs)
+- [x] Implement parsers.py (incl. iter_sequences)
+- [x] Implement thresholds.py
+- [x] Implement results.py (incl. consolidated hits_from_pyhmmer)
+- [x] Implement search.py
+- [x] Implement scan.py
+- [x] Implement phmmer.py
+- [x] Implement jackhmmer.py
+- [x] Implement nhmmer.py
+- [x] Implement databases.py (incl. tarfile security)
+- [x] Implement cli.py (incl. _resolve_output, _write_result, full threshold flags)
+- [x] Create __init__.py
+- [x] Create data/databases.json
+- [x] Create test fixtures
+- [x] Write tests
 - [ ] Test CLI end-to-end
-- [ ] Update README
+- [x] Update README
 - [ ] Build and test install
 - [ ] Upload to PyPI
