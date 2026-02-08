@@ -1,0 +1,125 @@
+{
+  "databases": [
+    {
+      "name": "PFAM",
+      "url": "https://ftp.ebi.ac.uk/pub/databases/Pfam/current_release/Pfam-A.hmm.gz",
+      "molecule_type": "protein",
+      "domain": true,
+      "has_thresholds": true,
+      "citation": "Mistry J et al. Pfam: The protein families database in 2021. Nucleic Acids Res. 2021;49(D1):D412-D419.",
+      "notes": "Contains GA, TC, NC bitscore cutoffs"
+    },
+    {
+      "name": "KOFAM",
+      "url": "https://www.genome.jp/ftp/db/kofam/profiles.tar.gz",
+      "molecule_type": "protein",
+      "domain": false,
+      "has_thresholds": true,
+      "citation": "Aramaki T et al. KofamKOALA: KEGG Ortholog assignment based on profile HMM. Bioinformatics. 2020;36(7):2251-2252.",
+      "notes": "Thresholds injected during installation"
+    },
+    {
+      "name": "DFAM",
+      "url": "https://dfam.org/releases/Dfam_3.7/families/Dfam.hmm.gz",
+      "molecule_type": "nucleotide",
+      "domain": false,
+      "has_thresholds": false,
+      "citation": "Storer J et al. The Dfam community resource of transposable element families. Mobile DNA. 2021;12:2."
+    },
+    {
+      "name": "NCBI",
+      "url": "https://ftp.ncbi.nlm.nih.gov/hmm/current/hmm_PGAP.HMM.tgz",
+      "molecule_type": "protein",
+      "domain": false,
+      "has_thresholds": false,
+      "citation": "Lu S et al. CDD/SPARCLE: the conserved domain database in 2020. Nucleic Acids Res. 2020;48(D1):D265-D268.",
+      "notes": "Contains TIGRFAM database"
+    },
+    {
+      "name": "dbCAN",
+      "url": "https://bcb.unl.edu/dbCAN2/download/Databases/dbCAN-old@UGA/dbCAN-fam-HMMs.txt.v11",
+      "molecule_type": "protein",
+      "domain": false,
+      "has_thresholds": false,
+      "citation": "Yin Y et al. dbCAN: a web resource for automated carbohydrate-active enzyme annotation. Nucleic Acids Res. 2012;40(W1):W445-W451.",
+      "notes": "Default evalue 1e-3"
+    },
+    {
+      "name": "VOGdb",
+      "url": "https://fileshare.csb.univie.ac.at/vog/latest/vog.hmm.tar.gz",
+      "molecule_type": "protein",
+      "domain": false,
+      "has_thresholds": false,
+      "citation": "http://vogdb.org",
+      "notes": "Viral protein orthologs"
+    },
+    {
+      "name": "Resfam",
+      "url": "http://dantaslab.wustl.edu/resfams/Resfams-full.hmm.gz",
+      "molecule_type": "protein",
+      "domain": false,
+      "has_thresholds": false,
+      "citation": "Gibson MK et al. Improved annotation of antibiotic resistance functions. ISME J. 2015;9(1):207-216.",
+      "notes": "Antibiotic resistance gene families"
+    },
+    {
+      "name": "AntiFam",
+      "url": "https://ftp.ebi.ac.uk/pub/databases/Pfam/AntiFam/current/Antifam.tar.gz",
+      "molecule_type": "protein",
+      "domain": false,
+      "has_thresholds": true,
+      "citation": "Eberhardt RY et al. AntiFam: a tool to help identify spurious ORFs. Database. 2012;2012:bas003.",
+      "notes": "Identifies spurious ORF predictions"
+    },
+    {
+      "name": "FOAM",
+      "url": "http://files.cqls.oregonstate.edu/David_Lab/FOAM_version1/FOAM-hmm_rel1.hmm",
+      "molecule_type": "protein",
+      "domain": false,
+      "has_thresholds": false,
+      "citation": "Prestat E et al. FOAM: Functional Ontology Assignments for Metagenomes. Nucleic Acids Res. 2014;42(19):e145."
+    },
+    {
+      "name": "DefenseFinder",
+      "url": "https://github.com/mdmparis/defense-finder-models/tree/master/profiles/",
+      "molecule_type": "protein",
+      "domain": false,
+      "has_thresholds": false,
+      "citation": "Tesson F et al. Systematic and quantitative view of the antiviral arsenal of prokaryotes. Nat Commun. 2022."
+    },
+    {
+      "name": "PADLOC",
+      "url": "https://github.com/padlocbio/padloc-db/tree/master/hmm/",
+      "molecule_type": "protein",
+      "domain": false,
+      "has_thresholds": false,
+      "citation": "Payne LJ et al. Identification and classification of antiviral defence systems in bacteria and archaea with PADLOC. Nucleic Acids Res. 2021;49(19):10868-10878."
+    },
+    {
+      "name": "CANT-HYD",
+      "url": "https://github.com/dgittins/CANT-HYD-HydrocarbonBiodegradation/blob/main/HMMs/concatenated%20HMMs/CANT-HYD.hmm",
+      "molecule_type": "protein",
+      "domain": false,
+      "has_thresholds": true,
+      "citation": "Khot V et al. CANT-HYD: A Curated Database for Annotation of Marker Genes Involved in Hydrocarbon Degradation. Front Microbiol. 2022;12:764058.",
+      "notes": "Contains TC and NC cutoffs"
+    },
+    {
+      "name": "NMPFamsDB",
+      "url": "https://bib.fleming.gr/NMPFamsDB/download_files/pHMMs_all.tgz",
+      "molecule_type": "protein",
+      "domain": false,
+      "has_thresholds": false,
+      "citation": "Baltoumas FA et al. NMPFamsDB: a database of novel protein families from microbial metagenomes. Nucleic Acids Res. 2024;52(D1):D592-D599."
+    },
+    {
+      "name": "barrnap",
+      "url": "https://github.com/tseemann/barrnap/tree/master/db",
+      "molecule_type": "nucleotide",
+      "domain": false,
+      "has_thresholds": false,
+      "citation": "https://github.com/tseemann/barrnap",
+      "notes": "16S/23S rRNA HMMs from Rfam seed alignments"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+*.tsv
+api_suite_runs/
+aksha_test/
+test_barrnap
