@@ -91,6 +91,20 @@ def _install_standard(
     return target_dir
 
 
+def _safe_tar_members(tar: tarfile.TarFile, target_dir: Path):
+    """Filter tar members to prevent path traversal attacks."""
+    resolved = target_dir.resolve()
+    for member in tar.getmembers():
+        member_path = (target_dir / member.name).resolve()
+        if not str(member_path).startswith(str(resolved)):
+            logger.warning("Skipping unsafe tar member: %s", member.name)
+            continue
+        if member.issym() or member.islnk():
+            logger.warning("Skipping symbolic link in tar: %s", member.name)
+            continue
+        yield member
+
+
 def _download_and_extract(url: str, target_dir: Path, show_progress: bool) -> None:
     """Download and extract a file."""
     filename = url.split("/")[-1]
@@ -105,7 +119,7 @@ def _download_and_extract(url: str, target_dir: Path, show_progress: bool) -> No
     if tarfile.is_tarfile(download_path):
         logger.info("Extracting %s", filename)
         with tarfile.open(download_path, "r:*") as tar:
-            tar.extractall(target_dir)
+            tar.extractall(target_dir, members=_safe_tar_members(tar, target_dir))
         download_path.unlink()
         _flatten_single_subdir(target_dir)
     elif filename.endswith(".gz") and not filename.endswith(".tar.gz"):

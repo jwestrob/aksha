@@ -31,6 +31,11 @@ def _resolve_nhmmer_hmms(source: Union[HMMInput, str]) -> list:
         if db_path:
             logger.info("Using installed database: %s at %s", source, db_path)
             return parse_hmms(db_path)
+        if registry.get(source) is not None:
+            raise FileNotFoundError(
+                f"Database '{source}' is not installed. "
+                f"Run: aksha database install {source}"
+            )
     return parse_hmms(source)
 
 

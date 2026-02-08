@@ -67,6 +67,10 @@ def _add_threshold_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument("-T", "--bitscore", type=float, help="Bitscore threshold")
     group.add_argument("--domE", type=float, help="Domain E-value threshold")
     group.add_argument("--domT", type=float, help="Domain bitscore threshold")
+    group.add_argument("--incE", type=float, help="Inclusion E-value threshold")
+    group.add_argument("--incT", type=float, help="Inclusion bitscore threshold")
+    group.add_argument("--incdomE", type=float, help="Domain inclusion E-value threshold")
+    group.add_argument("--incdomT", type=float, help="Domain inclusion bitscore threshold")
 
 
 def _threshold_opts_from_args(args: argparse.Namespace) -> ThresholdOptions:
@@ -80,6 +84,10 @@ def _threshold_opts_from_args(args: argparse.Namespace) -> ThresholdOptions:
         bitscore=getattr(args, "bitscore", None),
         dom_evalue=getattr(args, "domE", None),
         dom_bitscore=getattr(args, "domT", None),
+        inc_evalue=getattr(args, "incE", None),
+        inc_bitscore=getattr(args, "incT", None),
+        inc_dom_evalue=getattr(args, "incdomE", None),
+        inc_dom_bitscore=getattr(args, "incdomT", None),
     )
 
 
