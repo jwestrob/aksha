@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import platformdirs
 import pytest
 
 from aksha import nhmmer, ThresholdOptions
@@ -10,8 +11,9 @@ from aksha import nhmmer, ThresholdOptions
 @pytest.mark.integration
 def test_barrnap_db_nhmmer_hits(temp_dir, rrna_16s_fasta):
     """nhmmer against installed barrnap DB should find the 16S sequence."""
-    if not (Path.home() / ".local" / "share" / "aksha" / "barrnap").exists():
-        pytest.skip("barrnap database not installed under ~/.local/share/aksha/barrnap")
+    data_dir = Path(platformdirs.user_data_dir("aksha"))
+    if not (data_dir / "barrnap").exists():
+        pytest.skip(f"barrnap database not installed under {data_dir / 'barrnap'}")
 
     result = nhmmer(
         sequences=rrna_16s_fasta,

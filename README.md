@@ -50,8 +50,11 @@ Add `-v` for verbose logging.
 - Large runs: when hits exceed ~100k, collection spills to disk (`.aksha_temp_results.tsv` in the output dir) before finalizing.
 
 ## Databases & Paths
-- Default data dir: `~/.local/share/aksha`; config dir: `~/.config/aksha`.
-- Environment overrides: `AKSHA_DATA_DIR`, `AKSHA_CONFIG_DIR`, or XDG vars.
+- Default directories follow platform conventions via [platformdirs](https://github.com/tox-dev/platformdirs):
+  - Linux: `~/.local/share/aksha`, `~/.config/aksha`
+  - macOS: `~/Library/Application Support/aksha`
+  - Windows: `%APPDATA%\aksha`
+- Environment overrides: `AKSHA_DATA_DIR`, `AKSHA_CONFIG_DIR`.
 - Installed DB metadata is tracked in `databases.json` in the data dir.
 
 ## Troubleshooting

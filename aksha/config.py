@@ -2,12 +2,12 @@
 
 Path resolution precedence:
 1. Environment variables (AKSHA_DATA_DIR, AKSHA_CONFIG_DIR)
-2. User config file (~/.config/aksha/config.toml)
-3. XDG defaults (~/.local/share/aksha, ~/.config/aksha)
+2. User config file (platform-specific config dir / config.toml)
+3. platformdirs defaults (XDG on Linux, ~/Library on macOS, %APPDATA% on Windows)
 
 Example config.toml:
     data_dir = "/scratch/shared/hmm_databases"
-    
+
     [defaults]
     threads = 8
     cut_ga = true
@@ -21,6 +21,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+
+import platformdirs
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -63,9 +65,7 @@ class AkshaConfig:
         """Resolve config directory path."""
         if env := os.environ.get("AKSHA_CONFIG_DIR"):
             return Path(env).expanduser()
-        if xdg := os.environ.get("XDG_CONFIG_HOME"):
-            return Path(xdg) / "aksha"
-        return Path.home() / ".config" / "aksha"
+        return Path(platformdirs.user_config_dir("aksha"))
 
     @staticmethod
     def _resolve_data_dir(user_config: dict[str, Any]) -> Path:
@@ -74,9 +74,7 @@ class AkshaConfig:
             return Path(env).expanduser()
         if config_path := user_config.get("data_dir"):
             return Path(config_path).expanduser()
-        if xdg := os.environ.get("XDG_DATA_HOME"):
-            return Path(xdg) / "aksha"
-        return Path.home() / ".local" / "share" / "aksha"
+        return Path(platformdirs.user_data_dir("aksha"))
 
     def ensure_dirs(self) -> None:
         """Create config and data directories if needed."""
@@ -102,6 +100,7 @@ class DatabaseRegistry:
         self.config = config
         self._state_file = config.data_dir / "databases.json"
         self._entries: dict[str, DatabaseInfo] = {}
+        self._bundled_names: set[str] = set()
         self._load()
 
     def _load(self) -> None:
@@ -118,6 +117,7 @@ class DatabaseRegistry:
                 local_state = json.load(f)
 
         # Merge bundled + local
+        self._bundled_names = {db["name"] for db in bundled["databases"]}
         for db in bundled["databases"]:
             name = db["name"]
             state = local_state.get(name, {})
@@ -151,12 +151,18 @@ class DatabaseRegistry:
         """Persist installation state to disk."""
         state = {}
         for name, entry in self._entries.items():
-            if entry.installed or entry.path:
-                state[name] = {
-                    "installed": entry.installed,
-                    "path": entry.path,
-                    "version": entry.version,
-                }
+            if not (entry.installed or entry.path):
+                continue
+            record: dict[str, Any] = {
+                "installed": entry.installed,
+                "path": entry.path,
+                "version": entry.version,
+            }
+            if name not in self._bundled_names:
+                record["custom"] = True
+                record["molecule_type"] = entry.molecule_type.name
+                record["citation"] = entry.citation
+            state[name] = record
 
         self.config.ensure_dirs()
         with open(self._state_file, "w") as f:
