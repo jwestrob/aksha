@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Optional, Union
+from typing import Iterator, Optional, Union
 
 import pyhmmer
 
@@ -14,6 +14,7 @@ from aksha.types import (
     MoleculeType,
     ThresholdOptions,
     SearchResult,
+    SequenceBlock,
     HMM,
 )
 from aksha.parsers import parse_hmms, iter_sequences, HMMInput, SequenceInput
@@ -55,6 +56,8 @@ def search(
         thresholds = ThresholdOptions()
 
     hmm_list = _resolve_hmms(hmms)
+    if not hmm_list:
+        raise ValueError("No HMM profiles found. Check your --hmms path or database name.")
 
     sequence_iter = iter_sequences(
         sequences,
@@ -95,7 +98,7 @@ def _resolve_hmms(source: Union[HMMInput, str]) -> list[HMM]:
 
 
 def _run_hmmsearch(
-    sequence_iter,
+    sequence_iter: Iterator[tuple[Path, SequenceBlock]],
     hmms: list[HMM],
     thresholds: ThresholdOptions,
     threads: int,

@@ -6,6 +6,7 @@ readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Jacob West-Roberts" }]
 requires-python = ">=3.10"
+keywords = ["hmm", "bioinformatics", "hmmer", "pyhmmer", "sequence-search", "protein", "genomics"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
@@ -16,6 +17,10 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
+
+[project.urls]
+Repository = "https://github.com/jwestrob/aksha"
+Issues = "https://github.com/jwestrob/aksha/issues"
 dependencies = [
     "pyhmmer>=0.10.0",
     "pandas>=2.0.0",

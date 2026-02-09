@@ -104,7 +104,7 @@ def _resolve_output(output: str) -> tuple[Path, Optional[Path]]:
     return p, None
 
 
-def _write_result(result, output_path: Path, csv_path: Optional[Path], default_name: str) -> None:
+def _write_result(result: "SearchResult", output_path: Path, csv_path: Optional[Path], default_name: str) -> None:
     """Write search result to CSV and print summary."""
     from aksha.types import SearchResult
 

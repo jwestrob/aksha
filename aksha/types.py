@@ -80,6 +80,11 @@ class ThresholdOptions:
         cutoff_count = sum([self.cut_ga, self.cut_tc, self.cut_nc])
         if cutoff_count > 1:
             raise ValueError("Only one of cut_ga, cut_tc, cut_nc can be True")
+        if self.cascade and cutoff_count > 0:
+            raise ValueError(
+                "Cannot combine cascade=True with an explicit cutoff (cut_ga/cut_tc/cut_nc). "
+                "Cascade mode automatically selects the best available cutoff per HMM."
+            )
 
     def get_explicit_cutoff(self) -> Optional[BitscoreCutoff]:
         """Return explicitly requested cutoff type, if any."""

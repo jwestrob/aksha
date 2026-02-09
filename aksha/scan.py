@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional, Union
+from typing import Iterator, Optional, Union
 
 import pyhmmer
 
@@ -17,6 +17,7 @@ from aksha.types import (
     MoleculeType,
     ThresholdOptions,
     SearchResult,
+    SequenceBlock,
     HMM,
 )
 from aksha.parsers import iter_sequences, HMMInput, SequenceInput
@@ -45,6 +46,9 @@ def scan(
         thresholds = ThresholdOptions()
 
     hmm_list = _resolve_hmms(hmms)
+    if not hmm_list:
+        raise ValueError("No HMM profiles found. Check your --hmms path or database name.")
+
     sequence_iter = iter_sequences(
         sequences,
         molecule_type=MoleculeType.PROTEIN,
@@ -66,7 +70,7 @@ def scan(
 
 
 def _run_hmmscan(
-    sequence_iter,
+    sequence_iter: Iterator[tuple[Path, SequenceBlock]],
     hmms: list[HMM],
     thresholds: ThresholdOptions,
     threads: int,

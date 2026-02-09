@@ -53,6 +53,8 @@ def nhmmer(
         thresholds = ThresholdOptions()
 
     hmm_list = _resolve_nhmmer_hmms(hmms)
+    if not hmm_list:
+        raise ValueError("No HMM profiles found. Check your --hmms path or database name.")
 
     # Use the HMM alphabet (barrnap models are RNA) to digitize sequences correctly
     alphabet = hmm_list[0].alphabet if hmm_list else None
@@ -65,8 +67,13 @@ def nhmmer(
     )
 
     kwargs = build_search_kwargs(thresholds)
-    # If cut_ga requested but HMM lacks gathering cutoffs, drop bit_cutoffs to avoid MissingCutoffs
+    # If bit cutoffs requested but HMMs lack them, fall back gracefully
     if kwargs.get("bit_cutoffs") and not all(h.cutoffs.gathering_available() for h in hmm_list):
+        logger.warning(
+            "Requested bit_cutoffs='%s' but not all HMMs have cutoffs available; "
+            "falling back to default thresholds",
+            kwargs["bit_cutoffs"],
+        )
         kwargs.pop("bit_cutoffs", None)
     output_path = Path(output_dir) if output_dir else None
     cpus = _resolve_cpus(threads)
