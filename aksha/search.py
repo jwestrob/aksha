@@ -74,7 +74,6 @@ def search(
             thresholds=thresholds,
             threads=threads,
             collector=collector,
-            show_progress=show_progress,
         )
         return collector.finalize()
 
@@ -103,7 +102,6 @@ def _run_hmmsearch(
     thresholds: ThresholdOptions,
     threads: int,
     collector: ResultCollector,
-    show_progress: bool,
 ) -> None:
     """Execute hmmsearch across all sequence files."""
     hmm_groups = group_hmms_by_cutoff(hmms, thresholds)

@@ -19,6 +19,7 @@ from aksha.types import (
     SequenceHit,
     DomainHit,
     MoleculeType,
+    BitscoreCutoff,
     DatabaseInfo,
 )
 from aksha.search import search
@@ -53,6 +54,7 @@ __all__ = [
     "SequenceHit",
     "DomainHit",
     "MoleculeType",
+    "BitscoreCutoff",
     "DatabaseInfo",
     # Config
     "get_config",

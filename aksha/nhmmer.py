@@ -14,29 +14,12 @@ from aksha.types import (
     ThresholdOptions,
     SearchResult,
 )
-from aksha.parsers import parse_hmms, iter_sequences, HMMInput, SequenceInput
+from aksha.parsers import iter_sequences, HMMInput, SequenceInput
 from aksha.thresholds import build_search_kwargs
 from aksha.results import ResultCollector, hits_from_pyhmmer
-from aksha.search import _resolve_cpus
-from aksha.config import get_registry
+from aksha.search import _resolve_hmms, _resolve_cpus
 
 logger = logging.getLogger(__name__)
-
-
-def _resolve_nhmmer_hmms(source: Union[HMMInput, str]) -> list:
-    """Resolve HMM source for nhmmer (nucleotide models)."""
-    if isinstance(source, str) and not Path(source).exists():
-        registry = get_registry()
-        db_path = registry.get_path(source)
-        if db_path:
-            logger.info("Using installed database: %s at %s", source, db_path)
-            return parse_hmms(db_path)
-        if registry.get(source) is not None:
-            raise FileNotFoundError(
-                f"Database '{source}' is not installed. "
-                f"Run: aksha database install {source}"
-            )
-    return parse_hmms(source)
 
 
 def nhmmer(
@@ -52,7 +35,7 @@ def nhmmer(
     if thresholds is None:
         thresholds = ThresholdOptions()
 
-    hmm_list = _resolve_nhmmer_hmms(hmms)
+    hmm_list = _resolve_hmms(hmms)
     if not hmm_list:
         raise ValueError("No HMM profiles found. Check your --hmms path or database name.")
 

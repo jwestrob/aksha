@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 import pyhmmer
+from tqdm import tqdm
 
 from aksha.types import (
     PathLike,
@@ -63,8 +64,9 @@ def jackhmmer(
             **kwargs,
         )
 
+        iterator = tqdm(search_iter, desc="jackhmmer iterations") if show_progress else search_iter
         final_results = None
-        for iteration in search_iter:
+        for iteration in iterator:
             final_results = iteration
 
         if final_results is None:

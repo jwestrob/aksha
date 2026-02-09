@@ -64,7 +64,6 @@ def scan(
             thresholds=thresholds,
             threads=threads,
             collector=collector,
-            show_progress=show_progress,
         )
         return collector.finalize()
 
@@ -75,7 +74,6 @@ def _run_hmmscan(
     thresholds: ThresholdOptions,
     threads: int,
     collector: ResultCollector,
-    show_progress: bool,
 ) -> None:
     """Execute hmmscan across all sequence files."""
     hmm_groups = group_hmms_by_cutoff(hmms, thresholds)

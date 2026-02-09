@@ -270,7 +270,7 @@ def _parse_sequence_directory(
     return result
 
 
-def check_hmm_thresholds(hmm: HMM) -> dict[str, bool]:
+def _check_hmm_thresholds(hmm: HMM) -> dict[str, bool]:
     """Check which threshold types are available for an HMM.
 
     Returns:
@@ -296,7 +296,7 @@ def get_best_available_cutoff(
     Returns:
         Cutoff type name or None if no cutoffs available
     """
-    available = check_hmm_thresholds(hmm)
+    available = _check_hmm_thresholds(hmm)
 
     for cutoff in preferred_order:
         if available.get(cutoff):
