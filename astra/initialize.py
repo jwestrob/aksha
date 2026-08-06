@@ -7,7 +7,11 @@ import subprocess
 import sys
 import tarfile
 import textwrap
+import time
+from datetime import datetime
+from email.utils import parsedate_to_datetime
 import pyhmmer.plan7
+import pyhmmer.hmmer
 from tqdm import tqdm
 import urllib.request
 from platformdirs import user_config_dir
@@ -15,6 +19,9 @@ import pandas as pd
 import requests
 from tqdm import tqdm
 from shutil import copyfile
+
+# Define package directory path
+package_dir = os.path.dirname(os.path.abspath(__file__))
 
 
 class TqdmUpTo(tqdm):
@@ -27,9 +34,9 @@ def initialize_config():
     app_name = "Astra"
     app_author = "YourOrg"  # Replace with the actual name of your organization or app author
 
-    # The default directory for the HMM databases.json (inside the package directory)
-    package_dir = os.path.dirname(os.path.abspath(__file__))
-    default_db_json_path = os.path.join(user_config_dir(app_name, app_author), 'hmm_databases.json')
+    # Use os.path.expanduser to get the proper config path
+    config_dir = os.path.expanduser("~/.config/Astra")
+    default_db_json_path = os.path.join(config_dir, 'hmm_databases.json')
 
     # Check if hmm_databases.json exists in the user's config directory
     if not os.path.exists(default_db_json_path):
@@ -39,7 +46,7 @@ def initialize_config():
         # Check if hmm_databases.json exists in the repository/package directory
         if os.path.exists(repo_db_json_path):
             # Copy hmm_databases.json from the repository/package directory to the user's config directory
-            os.makedirs(os.path.dirname(default_db_json_path), exist_ok=True)  # Ensure the directory exists
+            os.makedirs(config_dir, exist_ok=True)  # Ensure the directory exists
             copyfile(repo_db_json_path, default_db_json_path)
             print(f"'hmm_databases.json' copied to {default_db_json_path}")
         else:
@@ -50,15 +57,32 @@ def initialize_config():
     with open(default_db_json_path, 'r') as f:
         hmm_databases = json.load(f)
 
+    # A user config written by an older Astra won't know about databases added
+    # since. Merge in any new entries so they become installable without the
+    # user having to blow away their config (and their 'installed' flags).
+    repo_db_json_path = os.path.join(package_dir, 'hmm_databases.json')
+    if os.path.exists(repo_db_json_path):
+        with open(repo_db_json_path, 'r') as f:
+            packaged = json.load(f)
+
+        known = {db['name'] for db in hmm_databases['db_urls']}
+        new_dbs = [db for db in packaged['db_urls'] if db['name'] not in known]
+        if new_dbs:
+            hmm_databases['db_urls'].extend(new_dbs)
+            with open(default_db_json_path, 'w') as f:
+                json.dump(hmm_databases, f, indent=4)
+            print("Added newly available databases to your config: "
+                  + ', '.join(db['name'] for db in new_dbs))
+
     return hmm_databases
 
 def load_config():
     app_name = "Astra"
     app_author = "YourOrg"  # Replace with the actual name of your organization or app author
 
-    # The default directory for the HMM databases.json (inside the package directory)
-    package_dir = os.path.dirname(os.path.abspath(__file__))
-    default_db_json_path = os.path.join(user_config_dir(app_name, app_author), 'hmm_databases.json')
+    # Use os.path.expanduser to get the proper config path
+    config_dir = os.path.expanduser("~/.config/Astra")
+    default_db_json_path = os.path.join(config_dir, 'hmm_databases.json')
 
     # Attempt to load the existing hmm_databases.json
     if os.path.exists(default_db_json_path):
@@ -85,6 +109,9 @@ def load_config():
         # Update the hmm_databases.json file with the new db_path
         with open(default_db_json_path, 'w') as f:
             json.dump(hmm_databases, f)
+    
+    # Always ensure db_path is properly expanded
+    hmm_databases['db_path'] = os.path.expanduser(hmm_databases['db_path'])
 
     return hmm_databases
 
@@ -132,14 +159,126 @@ def download_progress_hook(count, block_size, total_size):
     sys.stdout.write("\r%2d%%" % percent)
     sys.stdout.flush()
 
+def press_hmm_database(db_dir, db_name=None):
+    """Concatenate individual HMM files into a single pressed database.
+
+    Creates ``{db_name}.hmm`` (concatenated text) and the four pressed
+    index files (``.h3m``, ``.h3i``, ``.h3f``, ``.h3p``) inside *db_dir*.
+    Loading from a pressed database is ~50x faster than parsing thousands
+    of individual ``.hmm`` files.
+
+    If the directory contains a single multi-model ``.hmm`` file, it is
+    pressed in-place (no concatenation needed).
+    """
+    if db_name is None:
+        db_name = os.path.basename(db_dir.rstrip('/'))
+
+    pressed_base = os.path.join(db_dir, db_name)
+    # Already pressed?
+    if all(os.path.exists(f"{pressed_base}.{ext}") for ext in ('h3m', 'h3i', 'h3f', 'h3p')):
+        print(f"  {db_name} is already pressed — skipping.")
+        return pressed_base
+
+    hmm_files = sorted(f for f in os.listdir(db_dir)
+                       if f.endswith(('.hmm', '.HMM'))
+                       and f != f"{db_name}.hmm")  # Don't re-read our own concat file
+
+    if not hmm_files:
+        print(f"  No .hmm files found in {db_dir} — nothing to press.")
+        return None
+
+    t0 = time.perf_counter()
+
+    if len(hmm_files) == 1:
+        # Single multi-model file — press directly
+        src = os.path.join(db_dir, hmm_files[0])
+        print(f"  Pressing {hmm_files[0]} ({db_name})...")
+        with pyhmmer.plan7.HMMFile(src) as hf:
+            hmms = list(hf)
+    else:
+        # Many individual files — read all into memory, then press
+        print(f"  Reading {len(hmm_files)} HMM files for {db_name}...")
+        hmms = []
+        for fname in tqdm(hmm_files, desc="  Loading HMMs"):
+            fpath = os.path.join(db_dir, fname)
+            with pyhmmer.plan7.HMMFile(fpath) as hf:
+                hmms.append(hf.read())
+
+    print(f"  Pressing {len(hmms)} HMMs → {pressed_base}.h3{{m,i,f,p}}...")
+    pyhmmer.hmmer.hmmpress(hmms, pressed_base)
+
+    elapsed = time.perf_counter() - t0
+    print(f"  Done pressing {db_name} ({elapsed:.1f}s)")
+    return pressed_base
+
+
+def remote_version(url):
+    """Release identifier for a download: the source file's Last-Modified date.
+
+    Most of the databases Astra installs publish no version string at all, but
+    every HTTP source exposes a modification date, which is enough to tell two
+    installs of the same database apart. Returns None if the server won't say.
+    """
+    try:
+        request = urllib.request.Request(url, method='HEAD')
+        with urllib.request.urlopen(request) as response:
+            last_modified = response.headers.get('Last-Modified')
+    except Exception as exc:
+        print(f"Could not determine the remote version of {url}: {exc}")
+        return None
+
+    if not last_modified:
+        return None
+
+    try:
+        return parsedate_to_datetime(last_modified).strftime('%Y-%m-%d')
+    except (TypeError, ValueError):
+        return last_modified
+
+
+def hmm_build_date(hmm_path):
+    """The build date in an HMM's DATE field, as YYYY-MM-DD.
+
+    Lets us identify which release a profile came from when the config has no
+    version recorded for it (e.g. it was installed by an older Astra).
+    """
+    try:
+        with open(hmm_path) as handle:
+            for line in handle:
+                if line.startswith('DATE'):
+                    stamp = line[4:].strip()
+                    try:
+                        return datetime.strptime(stamp, '%a %b %d %H:%M:%S %Y').strftime('%Y-%m-%d')
+                    except ValueError:
+                        return stamp
+                if line.startswith('HMM '):
+                    break
+    except OSError:
+        pass
+
+    return None
+
+
+def record_version(db_entry, source_url, version=None):
+    """Stamp a database entry with what was installed, from where, and when."""
+    if version is None and source_url.startswith('http'):
+        version = remote_version(source_url)
+
+    db_entry['source_url'] = source_url
+    db_entry['version'] = version
+    db_entry['installed_date'] = time.strftime('%Y-%m-%d')
+    return version
+
+
 def install_KOFAM():
-    
+
     #Separate function to install KOFAM because we need to manually add bitscore cutoffs to HMM models
     #which drastically reduces size of the output (288M from a 36M metaproteome vs. Pfam's 24M output!!)
     db_name = 'KOFAM'
     parsed_json = load_config()
     config = load_config()
-    db_path = config['db_path']    
+    db_path = os.path.expandvars(os.path.expanduser(config['db_path']))
+    print('DB PATH IN INSTALL_KOFAM: {}'.format(db_path))
 
 
     for db in parsed_json['db_urls']:
@@ -153,7 +292,7 @@ def install_KOFAM():
             print("Database {} already installed.".format(db['name']))
             continue
         if db['name'] == db_name:
-            target_folder = os.path.abspath(os.path.join(db_path, db_name))  # Use absolute path
+            target_folder = os.path.expanduser(os.path.join(db_path, db_name))
             
             os.makedirs(target_folder, exist_ok=True)
             
@@ -188,10 +327,10 @@ def install_KOFAM():
                     os.rmdir(single_dir)  # Remove the now-empty directory
             
 
-            # BUG IS HERE COME FIND ME
             # Mark installation as complete in hmm_databases.json
             db['installed'] = True
             db["installation_dir"] = target_folder  # Add installation directory
+            record_version(db, url)
             # Write changes to the JSON file 
             json_path = os.path.join(db_path, 'hmm_databases.json')  # Use db_path here
             print(json_path)
@@ -239,11 +378,15 @@ def install_KOFAM():
         hmm_file = os.path.join(kofam_dir,'{}.hmm'.format(knum))
         #Add the threshold and overwrite the file!!
         add_threshold(hmm_file, threshold)
+
+    # Press the database for fast loading at search time
+    print("\nPressing KOFAM database for fast loading...")
+    press_hmm_database(kofam_dir, db_name='KOFAM')
     return
 
 def add_threshold(hmm_file_path, threshold):
     # Some thresholds in ko_list are specified for HMMs not provided by the package...
-    
+
     if not os.path.exists(hmm_file_path) or threshold == 0.0 or threshold == '-':
         # '-' values shouldn't still exist in this set, but if the threshold is 0
         # or the HMM is specified in KO_list but not provided in the HMM set,
@@ -259,14 +402,265 @@ def add_threshold(hmm_file_path, threshold):
 
     with open(hmm_file_path, "wb") as dst:
         hmm.write(dst)
-    
+
     return
 
-def install_databases(db_name, parsed_json=None, db_path=None):
 
+def add_hyddb_thresholds(hmm_file_path, ga_threshold, nc_threshold):
+    """
+    Add GA (gathering) and NC (noise) thresholds to all HMMs in a file.
+    Used for HydDB where conservative and loose thresholds differ.
+    """
+    if not os.path.exists(hmm_file_path):
+        return
+
+    # Read all HMMs from the file
+    hmms = []
+    with pyhmmer.plan7.HMMFile(hmm_file_path) as hmm_file:
+        for hmm in hmm_file:
+            hmm.cutoffs.gathering = ga_threshold, ga_threshold
+            hmm.cutoffs.noise = nc_threshold, nc_threshold
+            hmms.append(hmm)
+
+    # Write all HMMs back to the file
+    with open(hmm_file_path, "wb") as dst:
+        for hmm in hmms:
+            hmm.write(dst)
+
+
+def install_HydDB():
+    """
+    Install HydDB hydrogenase HMM profiles with appropriate bitscore thresholds.
+
+    Thresholds from HydDB README (https://github.com/GreeningLab/HydDB):
+    - [FeFe]: Conservative (GA)=50, Loose (NC)=15.9
+    - [NiFe]: Conservative (GA)=120, Loose (NC)=34.5
+    - [Fe]-only: Loose (NC)=54.4 (no conservative threshold available, use loose for GA)
+    """
+    db_name = 'HydDB'
+    parsed_json = load_config()
+    config = load_config()
+    db_path = os.path.expandvars(os.path.expanduser(config['db_path']))
+
+    # Check if already installed
+    for db in parsed_json['db_urls']:
+        if db['name'] == db_name:
+            if db['installed'] and db['installation_dir']:
+                print(f"Database {db_name} already installed.")
+                return
+
+    target_folder = os.path.expanduser(os.path.join(db_path, db_name))
+    os.makedirs(target_folder, exist_ok=True)
+
+    print(f"Downloading {db_name} to {target_folder}...")
+
+    # HMM files and their thresholds (GA=conservative, NC=loose)
+    # Thresholds from: https://github.com/GreeningLab/HydDB/blob/main/README.md
+    hmm_files = {
+        'FeFe-HydDB_MM2022.hmm': {'GA': 50.0, 'NC': 15.9},
+        'NiFe-HydDB_MM2022.hmm': {'GA': 120.0, 'NC': 34.5},
+        'Fe_only-HydDB_MM2022.hmm': {'GA': 54.4, 'NC': 54.4},  # No conservative threshold available
+    }
+
+    base_url = 'https://raw.githubusercontent.com/GreeningLab/HydDB/main/hmm_profiles/'
+
+    for hmm_file, thresholds in hmm_files.items():
+        url = base_url + hmm_file
+        download_path = os.path.join(target_folder, hmm_file)
+
+        # Download the file
+        print(f"Downloading {hmm_file}...")
+        with TqdmUpTo(unit='B', unit_scale=True, miniters=1, desc=hmm_file) as t:
+            urllib.request.urlretrieve(url, download_path, reporthook=t.update_to)
+
+        # Add thresholds to all HMMs in the file
+        print(f"Adding thresholds to {hmm_file} (GA={thresholds['GA']}, NC={thresholds['NC']})...")
+        add_hyddb_thresholds(download_path, thresholds['GA'], thresholds['NC'])
+
+    # Update config
+    for db in parsed_json['db_urls']:
+        if db['name'] == db_name:
+            db['installed'] = True
+            db['installation_dir'] = target_folder
+            record_version(db, base_url)
+            break
+
+    # Write updated config
+    config_dir = os.path.expanduser("~/.config/Astra")
+    json_path = os.path.join(config_dir, 'hmm_databases.json')
+    with open(json_path, 'w') as f:
+        json.dump(parsed_json, f, indent=4)
+
+    print(f"{db_name} successfully downloaded and thresholds applied.")
+
+    # Press the database for fast loading at search time
+    print(f"\nPressing {db_name} database for fast loading...")
+    press_hmm_database(target_folder, db_name=db_name)
+
+
+def fetch_ko_thresholds(db_path, kos):
+    """Bitscore thresholds for a set of KOs, from KOfam's ``ko_list``.
+
+    Downloads ``ko_list`` if it isn't already sitting in ``db_path`` (KOFAM's
+    installer leaves it there).  KOs whose threshold is '-' are omitted.
+    """
+    ko_list_path = os.path.join(db_path, 'ko_list')
+
+    if not os.path.exists(ko_list_path):
+        ko_list_url = 'https://www.genome.jp/ftp/db/kofam/ko_list.gz'
+        gz_path = ko_list_path + '.gz'
+        print("Downloading ko_list for marker thresholds...")
+        with TqdmUpTo(unit='B', unit_scale=True, miniters=1, desc='ko_list.gz') as t:
+            urllib.request.urlretrieve(ko_list_url, gz_path, reporthook=t.update_to)
+        with gzip.open(gz_path, 'rb') as f_in, open(ko_list_path, 'wb') as f_out:
+            shutil.copyfileobj(f_in, f_out)
+
+    ko_list = pd.read_csv(ko_list_path, sep='\t')
+    wanted = ko_list[ko_list['knum'].isin(kos) & (ko_list['threshold'] != '-')]
+    return {row['knum']: float(row['threshold']) for _, row in wanted.iterrows()}
+
+
+def install_RP16():
+    """Install the 16 ribosomal-protein markers used by ``astra search --16rp``.
+
+    All 16 markers are KOfam KOs, so rather than vendoring profiles into the
+    package they are lifted out of the KOFAM database Astra already knows how
+    to install.  If KOFAM isn't installed, the profiles are pulled from
+    upstream instead; KOfam ships thresholds in ``ko_list`` rather than in the
+    profiles themselves, so those get their cutoffs injected here (an
+    installed KOFAM has already had this done to it).
+
+    RP16 inherits its version from whichever KOFAM release it was built from,
+    which is recorded in the config alongside the profiles.
+    """
+    from astra import rp16
+
+    db_name = 'RP16'
+    parsed_json = load_config()
+    db_path = os.path.expandvars(os.path.expanduser(parsed_json['db_path']))
+
+    for db in parsed_json['db_urls']:
+        if db['name'] == db_name and db['installed'] and db['installation_dir']:
+            print(f"Database {db_name} already installed.")
+            return
+
+    target_folder = os.path.join(db_path, db_name)
+    os.makedirs(target_folder, exist_ok=True)
+
+    kos = list(rp16.RP16_MARKERS)
+    source_version = None
+
+    kofam_dir = None
+    for db in parsed_json['db_urls']:
+        if db['name'] == 'KOFAM' and db['installed'] and db['installation_dir']:
+            if os.path.isdir(db['installation_dir']):
+                kofam_dir = db['installation_dir']
+                source_version = db.get('version')
+            break
+
+    if kofam_dir is not None:
+        print(f"Taking {len(kos)} markers from the installed KOFAM database...")
+        missing = []
+        for ko in kos:
+            src = os.path.join(kofam_dir, f"{ko}.hmm")
+            if not os.path.exists(src):
+                missing.append(ko)
+                continue
+            shutil.copyfile(src, os.path.join(target_folder, rp16.profile_filename(ko)))
+        if missing:
+            # Fall back to upstream for whatever the local KOFAM didn't have.
+            print(f"Not found in local KOFAM: {', '.join(missing)}. Fetching from upstream...")
+            source_version = fetch_kofam_markers(missing, target_folder, db_path, rp16)
+    else:
+        print(f"KOFAM is not installed; fetching {len(kos)} markers from upstream...")
+        source_version = fetch_kofam_markers(kos, target_folder, db_path, rp16)
+
+    expected = {rp16.profile_filename(ko) for ko in kos}
+    absent = sorted(f for f in expected if not os.path.exists(os.path.join(target_folder, f)))
+    if absent:
+        print(f"ERROR: {db_name} installation incomplete, missing: {', '.join(absent)}")
+        return
+
+    if source_version is None:
+        # A KOFAM installed before Astra tracked versions won't have one
+        # recorded, but the profiles themselves carry their build date.
+        source_version = hmm_build_date(os.path.join(target_folder, sorted(expected)[0]))
+
+    for index, db in enumerate(parsed_json['db_urls']):
+        if db['name'] == db_name:
+            parsed_json['db_urls'][index]['installed'] = True
+            parsed_json['db_urls'][index]['installation_dir'] = target_folder
+            record_version(parsed_json['db_urls'][index],
+                           source_url=db['url'], version=source_version)
+            break
+
+    config_dir = os.path.expanduser("~/.config/Astra")
+    with open(os.path.join(config_dir, 'hmm_databases.json'), 'w') as f:
+        json.dump(parsed_json, f, indent=4)
+
+    print(f"{db_name}: {len(expected)} marker profiles installed to {target_folder} "
+          f"(KOfam {source_version or 'version unknown'})")
+
+    print(f"\nPressing {db_name} database for fast loading...")
+    press_hmm_database(target_folder, db_name=db_name)
+
+
+def fetch_kofam_markers(kos, target_folder, db_path, rp16):
+    """Pull specific KOfam profiles from upstream and inject their thresholds.
+
+    KOfam publishes no per-profile download, so this streams the release
+    tarball and keeps only the members we asked for.  Returns the KOfam
+    release identifier the profiles came from.
+    """
+    url = 'https://www.genome.jp/ftp/db/kofam/profiles.tar.gz'
+    tar_path = os.path.join(db_path, 'profiles.tar.gz')
+    version = remote_version(url)
+
+    if not os.path.exists(tar_path):
+        print("Downloading KOfam profiles (no per-profile download is published)...")
+        with TqdmUpTo(unit='B', unit_scale=True, miniters=1, desc='profiles.tar.gz') as t:
+            urllib.request.urlretrieve(url, tar_path, reporthook=t.update_to)
+
+    wanted = {f"{ko}.hmm": ko for ko in kos}
+    found = {}
+    with tarfile.open(tar_path, 'r:gz') as tar:
+        for member in tar:
+            if not member.isfile():
+                continue
+            ko = wanted.get(os.path.basename(member.name))
+            if ko is None:
+                continue
+            dest = os.path.join(target_folder, rp16.profile_filename(ko))
+            src = tar.extractfile(member)
+            if src is None:
+                continue
+            with open(dest, 'wb') as dst:
+                shutil.copyfileobj(src, dst)
+            found[ko] = dest
+            if len(found) == len(wanted):
+                break
+
+    # Upstream profiles carry no cutoffs; KOfam keeps them in ko_list.
+    thresholds = fetch_ko_thresholds(db_path, list(found))
+    for ko, dest in found.items():
+        if ko in thresholds:
+            add_threshold(dest, thresholds[ko])
+
+    return version
+
+
+def install_databases(db_name, parsed_json=None, db_path=None):
     # Are you trying to install KOFAM? Let's have separate logic for that.
     if db_name == 'KOFAM':
         return install_KOFAM()
+
+    # HydDB also needs special handling for different GA/NC thresholds
+    if db_name == 'HydDB':
+        return install_HydDB()
+
+    # RP16 is assembled from KOFAM + PFAM rather than downloaded as a unit
+    if db_name == 'RP16':
+        return install_RP16()
 
     # Did you call this as a function from an external script?
     # Want to model that function call as 'initialize.install_databases(db_name)'
@@ -287,13 +681,15 @@ def install_databases(db_name, parsed_json=None, db_path=None):
                 print(f"Database {db_name} already installed.")
                 continue
 
-            target_folder = os.path.abspath(os.path.join(db_path, db_name))
+            # Use the config directory path for database installation
+            target_folder = os.path.expandvars(os.path.expanduser(os.path.join(db_path, db_name)))
+            print(target_folder)
 
             if os.path.exists(target_folder) and os.listdir(target_folder):
                 print(f"Folder for {db_name} exists and is not empty. Skipping download.")
                 if not db.get('installation_dir'):
                     db['installation_dir'] = target_folder
-                    update_required = False
+                    update_required = True
                 continue
 
             # Create target directory if it does not exist
@@ -317,22 +713,35 @@ def install_databases(db_name, parsed_json=None, db_path=None):
                     # Special case for GitHub URLs
                     url = url.rstrip("/")
                     if 'Karthik' in db_name:
-                        #Hard-code this one because the directory structure is different compared to the other github repos 
+                        #Hard-code this one because the directory structure is different compared to the other github repos
                         repo_api_url = 'https://api.github.com/repos/kanantharaman/metabolic-hmms/contents/'
                     else:
-                        repo_api_url = url.replace("github.com", "api.github.com/repos").replace("/tree/master", "/contents")
-                    response = requests.get(repo_api_url)
-                    if response.status_code == 200:
-                        files = response.json()
-                        for file in files:
-                            file_name = file['name']
-                            if file_name.lower().endswith('.hmm'):  # Only download .hmm or .HMM files
-                                file_url = file['download_url']
-                                download_path = os.path.join(target_folder, file_name)
-                                with TqdmUpTo(unit='B', unit_scale=True, miniters=1, desc=file_name) as t:  
-                                    urllib.request.urlretrieve(file_url, download_path, reporthook=t.update_to)
-                    else:
-                        print(f"Failed to fetch GitHub directory: {response.status_code}")
+                        repo_api_url = url.replace("github.com", "api.github.com/repos").replace("/tree/master", "/contents").replace("/tree/main", "/contents")
+                    # Paginate through all results (GitHub API caps at 1000 per page by default,
+                    # but may return fewer; the Link header signals more pages)
+                    all_files = []
+                    page_url = repo_api_url + "?per_page=1000"
+                    while page_url:
+                        response = requests.get(page_url)
+                        if response.status_code != 200:
+                            print(f"Failed to fetch GitHub directory: {response.status_code}")
+                            break
+                        all_files.extend(response.json())
+                        # Check for next page via Link header
+                        page_url = None
+                        link_header = response.headers.get("Link", "")
+                        for part in link_header.split(","):
+                            if 'rel="next"' in part:
+                                page_url = part.split(";")[0].strip().strip("<>")
+                    for file in all_files:
+                        file_name = file['name']
+                        if file_name.lower().endswith('.hmm'):  # Only download .hmm or .HMM files
+                            file_url = file['download_url']
+                            download_path = os.path.join(target_folder, file_name)
+                            with TqdmUpTo(unit='B', unit_scale=True, miniters=1, desc=file_name) as t:
+                                urllib.request.urlretrieve(file_url, download_path, reporthook=t.update_to)
+                    if not all_files:
+                        print(f"No files found at {repo_api_url}")
 
 
             # Check if the URL points to a directory (ends with '/')
@@ -380,16 +789,22 @@ def install_databases(db_name, parsed_json=None, db_path=None):
 
             
             print(f"{db_name} successfully downloaded and extracted.")
+
+            # Press the database for fast loading at search time
+            print(f"\nPressing {db_name} database for fast loading...")
+            press_hmm_database(target_folder, db_name=db_name)
+
             parsed_json['db_urls'][index]['installed'] = True
             parsed_json['db_urls'][index]['installation_dir'] = target_folder
+            record_version(parsed_json['db_urls'][index], url)
             update_required = True
             break  # Break after updating the relevant database
 
 
     if update_required:
-        print(db_path)
-        # Update the JSON file outside the loop to reflect the installed status and installation_dir
-        json_path = os.path.join(db_path, 'hmm_databases.json')
+        # Update the JSON file in the config directory
+        config_dir = os.path.expanduser("~/.config/Astra")
+        json_path = os.path.join(config_dir, 'hmm_databases.json')
         with open(json_path, 'w') as f:
             json.dump(parsed_json, f, indent=4)
 
@@ -401,15 +816,23 @@ def show_installed_databases(parsed_json):
     installed_protein_dbs = [db for db in parsed_json['db_urls'] if db['installed'] and db['molecule_type'] == 'protein']
     installed_nucleotide_dbs = [db for db in parsed_json['db_urls'] if db['installed'] and db['molecule_type'] == 'nucleotide']
     
+    def describe(db):
+        line = f"    - {db['name']} (Installed in: {db['installation_dir']})"
+        if db.get('version'):
+            line += f"\n        release {db['version']}"
+            if db.get('installed_date'):
+                line += f", installed {db['installed_date']}"
+        return line
+
     if installed_protein_dbs:
         print("  Protein Databases:")
         for db in installed_protein_dbs:
-            print(f"    - {db['name']} (Installed in: {db['installation_dir']})")
-    
+            print(describe(db))
+
     if installed_nucleotide_dbs:
         print("  Nucleotide Databases:")
         for db in installed_nucleotide_dbs:
-            print(f"    - {db['name']} (Installed in: {db['installation_dir']})")
+            print(describe(db))
 
 
 
@@ -445,6 +868,34 @@ def main(args):
         hmms = hmms.split(',')
     else:
         hmms = [hmms]
+
+    # Press existing databases if the flag is set
+    if getattr(args, 'press', False):
+        for db in parsed_json['db_urls']:
+            if db['installed'] and db['installation_dir']:
+                if hmms and db['name'] not in hmms:
+                    continue
+                print(f"\nPressing {db['name']}...")
+                press_hmm_database(db['installation_dir'], db_name=db['name'])
+        return
+
+    # Reinstalling on top of an existing install is a no-op unless we clear the
+    # flags first: every installer short-circuits on 'already installed'.
+    if getattr(args, 'force', False):
+        named = [db for db in parsed_json['db_urls'] if db['name'] in hmms]
+        for db in named:
+            if db['installed'] and db['installation_dir']:
+                stale_dir = os.path.expandvars(os.path.expanduser(db['installation_dir']))
+                if os.path.isdir(stale_dir):
+                    print(f"--force: removing the existing {db['name']} install at {stale_dir}")
+                    shutil.rmtree(stale_dir)
+            db['installed'] = False
+            db['installation_dir'] = ''
+
+        if named:
+            config_dir = os.path.expanduser("~/.config/Astra")
+            with open(os.path.join(config_dir, 'hmm_databases.json'), 'w') as f:
+                json.dump(parsed_json, f, indent=4)
 
     # Install the databases
     # Iterate through user-provided database names or special keywords for batch installation

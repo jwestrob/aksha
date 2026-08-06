@@ -174,3 +174,6 @@ poetry.toml
 pyrightconfig.json
 
 # End of https://www.toptal.com/developers/gitignore/api/python
+
+# HMM profiles are installed via `astra initialize`, never vendored here
+astra/data/

@@ -1,164 +1,131 @@
 
-import argparse
-import asyncio
-import collections
+import gc
 import logging
 import os
-import shutil
-import subprocess
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
-from copy import deepcopy
+import shutil
 
-import numpy as np
-import pandas as pd
 import pyhmmer
 from tqdm import tqdm
 
 from astra import initialize
-from astra.search import(
-    Result,
+from astra.search import (
     extract_sequences,
     has_thresholds,
     parse_hmms,
     parse_protein_input,
 )
 
-# Pyhmmer-specific issues:
-"""
-- Pickle protocol not supported for sequences
-- Thresholds are altered by pickling when parsing HMMs in parallel with ProcessPoolExecutor
-"""
 
-def hmmscan(protein_dict, hmms, threads, options, db_name = None):
-    #Runs HMMscan on all provided FASTA files using 'threads' threads
-    #uses default parameters unless specified
+HEADER = ("sequence_id\thmm_name\tbitscore\tevalue\tc_evalue\ti_evalue\t"
+          "env_from\tenv_to\tdom_bitscore\n")
 
 
-    results_dataframes = {}  # Initialize an empty dictionary to store results as DataFrames
+def process_scan_hits(hits, fh):
+    """Write hmmscan hits to an open file handle.
 
-    #Construct scan options; need to make sure names are consistent with pyHMMER
-    #and we only specify one bitscore threshold
+    In hmmscan, query is the sequence and hit.name is the HMM.
+    """
+    seq_name = hits.query.name
+    for hit in hits:
+        if hit.included:
+            hmm_name = hit.name
+            full_bitscore = hit.score
+            full_evalue = hit.evalue
+            for domain in hit.domains.reported:
+                fh.write(f"{seq_name}\t{hmm_name}\t{full_bitscore:.2f}\t{full_evalue:.2e}\t"
+                         f"{domain.c_evalue:.2e}\t{domain.i_evalue:.2e}\t"
+                         f"{domain.env_from}\t{domain.env_to}\t{domain.score:.2f}\n")
+
+
+def hmmscan(all_sequences, hmms, threads, options, outdir, db_name=None):
+    """Run hmmscan: scan sequences against an HMM library.
+
+    Returns the path to the temp results directory.
+    """
     hmmscan_kwargs = define_kwargs(options)
 
-    #Do we need to check whether we have a mixture of thresholded and non-thresholded models?
-    if 'bit_cutoffs' in hmmscan_kwargs and not db_name in ['PFAM', 'FOAM']:
-        #pyHMMER rightly throws an error when you try to use thresholds that don't exist in the model.
-        #Let's separate these out because often a single set of HMMs will contain thresholded
-        #as well as unthresholded models.
-        print("Separating thresholded and non-thresholded HMMs...")
-        logging.info("Separating thresholded and non-thresholded HMMs...")
+    tmp_dir = os.path.join(outdir, 'tmp_results')
+    os.makedirs(tmp_dir, exist_ok=True)
 
-        with ProcessPoolExecutor(threads) as executor:
-            # Create a Boolean mask indicating which HMMs have thresholds
-            has_thresholds_mask = list(executor.map(has_thresholds, hmms))
+    # Separate thresholded vs unthresholded HMMs if bit_cutoffs requested
+    hmms_with_thresh = None
+    hmms_without_thresh = None
+    bit_cutoff = None
 
-        # Convert the mask to a NumPy array for efficient indexing
-        has_thresholds_mask_np = np.array(has_thresholds_mask)
-
-        # Filter HMMs with thresholds using the mask
-        hmms_with_thresholds = np.array(hmms)[has_thresholds_mask_np].tolist()
-
-        # Filter HMMs without thresholds using the inverse of the mask
-        hmms_without_thresholds = np.array(hmms)[~has_thresholds_mask_np].tolist()
-
-        if len(hmms_with_thresholds) == 0:
-            print("Bitscore cutoffs were specified, but specified HMMs do not contain these thresholds.")
-            print("Defaulting to other specified threshold parameters (if none were specified, none will be applied)...")
-            logging.info("Bitscore cutoffs were specified, but specified HMMs do not contain these thresholds.")
-            logging.info("Defaulting to other specified threshold parameters (if none were specified, none will be applied)...")
-            hmms_with_thresholds = None
-
-        if len(hmms_without_thresholds) == 0:
-            hmms_without_thresholds = None
-
-
-
-        #This was a bit tricky. pyHMMER doesn't like NoneType for bit_cutoffs
-        #And I don't want to specify any other thresholds for models with cutoffs
-        #So we have to isolate that parameter, and remove it from the kwargs 
-        #Used in a scan for non-thresholded models
-        bit_cutoff = hmmscan_kwargs['bit_cutoffs']
-
-        del hmmscan_kwargs['bit_cutoffs']
-    elif db_name in ['PFAM', 'FOAM'] and 'bit_cutoffs' in hmmscan_kwargs:
-
-        #These dbs have thresholds for every HMM
-        hmms_with_thresholds = hmms
-        hmms_without_thresholds = None
-        bit_cutoff = hmmscan_kwargs['bit_cutoffs']
-    else:
-        #All unthresholded
-        hmms_with_thresholds = None
-        hmms_without_thresholds = hmms
-        
-
-    print("Scanning...")
-
-    for fasta_file, sequences in tqdm(protein_dict.items()):
-        results = []
-        
-        if hmms_with_thresholds is not None:
-            #print("Scanning with {} thresholded HMMs...".format(len(hmms_with_thresholds)))
-            # Run the thresholded HMMs
-            for hits in pyhmmer.hmmscan(sequences, hmms_with_thresholds, cpus=threads, bit_cutoffs=bit_cutoff):
-                cog = hits.query_name.decode()
-                for hit in hits:
-                    if hit.included:
-                        hit_name = hit.name.decode()
-                        full_bitscore = hit.score 
-                        full_evalue = hit.evalue
-                        for domain in hit.domains.reported:
-                            results.append(Result(hit_name, cog, full_bitscore, full_evalue, domain.c_evalue, 
-                                  domain.i_evalue, domain.env_from, domain.env_to, domain.score))
-
-        if hmms_without_thresholds is not None:
-            #print("Scanning with {} unthresholded HMMs...".format(len(hmms_without_thresholds)))
-            #print(hmmscan_kwargs)
-            #Run the unthresholded HMMs, making sure to specify bit_cutoffs=None
-            for hits in pyhmmer.hmmscan(hmms_without_thresholds, sequences, cpus=threads, **hmmscan_kwargs):
-                cog = hits.query_name.decode()
-                for hit in hits:
-                    if hit.included:
-                        hit_name = hit.name.decode()
-                        full_bitscore = hit.score 
-                        full_evalue = hit.evalue
-                        for domain in hit.domains.reported:
-                            results.append(Result(hit_name, cog, full_bitscore, full_evalue, domain.c_evalue, 
-                                  domain.i_evalue, domain.env_from, domain.env_to, domain.score))
-                    
-        # Convert the results to a DataFrame
-        #Is it necessary to cast it as a list?
-        result_df = pd.DataFrame(results)
-        
-        if meta == False:
-            # Store the DataFrame in the dictionary
-            results_dataframes[fasta_file] = result_df
+    if 'bit_cutoffs' in hmmscan_kwargs:
+        if db_name in ('PFAM', 'FOAM'):
+            # These DBs have thresholds for every HMM
+            hmms_with_thresh = hmms
+            bit_cutoff = hmmscan_kwargs.pop('bit_cutoffs')
         else:
-            #If meta is true, we don't want to hold all the results in RAM. We want to write an output file for every DB-metagenome scan.
-            basename_fasta = os.path.basename(fasta_file)
-            try:
-                #Make sure the outdir exists and db_name is specified
-                result_df.to_csv(os.path.join(outdir, basename_fasta + '_' + db_name + '_results.tsv'), sep='\t', index=False)
-            except:
-                #Hey man idk, maybe it doesn't? Maybe you called scan as a function from a python script?
-                #If so, write output files to the current working directory instead.
-                if db_name is None:
-                    #Is there no db_name and meta is specified?
-                    result_df.to_csv(os.path.join(outdir, basename_fasta + '_results.tsv'), sep='\t', index=False)
-                else:
-                    result_df.to_csv(fasta_file + '_' + db_name + '.results.tsv', sep='\t', index=False)
-    if meta == False:
-        return results_dataframes
+            # Mixed DB — split by threshold availability
+            print("Separating thresholded and non-thresholded HMMs...")
+            hmms_with_thresh = [h for h in hmms if has_thresholds(h)]
+            hmms_without_thresh = [h for h in hmms if not has_thresholds(h)]
+            bit_cutoff = hmmscan_kwargs.pop('bit_cutoffs')
+
+            if not hmms_with_thresh:
+                print("No HMMs have the requested thresholds — using e-value/bitscore only.")
+                hmms_with_thresh = None
+            if not hmms_without_thresh:
+                hmms_without_thresh = None
     else:
+        hmms_without_thresh = hmms
+
+    print(f"Scanning {len(all_sequences)} sequences against {len(hmms)} HMMs ({threads} threads)...")
+
+    out_file = os.path.join(tmp_dir, "scan_results.tsv")
+    with open(out_file, 'w') as fh:
+        fh.write(HEADER)
+
+        if hmms_with_thresh:
+            print(f"  Thresholded pass ({len(hmms_with_thresh)} HMMs, bit_cutoffs={bit_cutoff})...")
+            for hits in pyhmmer.hmmscan(all_sequences, hmms_with_thresh,
+                                         cpus=threads, bit_cutoffs=bit_cutoff):
+                process_scan_hits(hits, fh)
+
+        if hmms_without_thresh:
+            print(f"  Unthresholded pass ({len(hmms_without_thresh)} HMMs)...")
+            for hits in pyhmmer.hmmscan(all_sequences, hmms_without_thresh,
+                                         cpus=threads, **hmmscan_kwargs):
+                process_scan_hits(hits, fh)
+
+    gc.collect()
+    return tmp_dir
+
+
+def combine_results(tmp_dir, output_file):
+    """Move or combine temp result files into the final output."""
+    tmp_files = sorted(f for f in os.listdir(tmp_dir) if f.endswith('_results.tsv'))
+    if not tmp_files:
+        print("No results found to combine.")
         return
+
+    if len(tmp_files) == 1:
+        shutil.move(os.path.join(tmp_dir, tmp_files[0]), output_file)
+        print(f"Results → {output_file}")
+        return
+
+    total_rows = 0
+    header_written = False
+    with open(output_file, 'w') as out:
+        for filename in tmp_files:
+            with open(os.path.join(tmp_dir, filename)) as inp:
+                header = inp.readline()
+                if not header_written:
+                    out.write(header)
+                    header_written = True
+                for line in inp:
+                    out.write(line)
+                    total_rows += 1
+    print(f"Combined {total_rows:,} hits from {len(tmp_files)} files → {output_file}")
 
 
 def define_kwargs(options):
     kwargs = {}
 
-    #Calibrated threshold parameters
     if options['cut_ga']:
         kwargs['bit_cutoffs'] = 'gathering'
     elif options['cut_nc']:
@@ -166,239 +133,141 @@ def define_kwargs(options):
     elif options['cut_tc']:
         kwargs['bit_cutoffs'] = 'trusted'
 
-
-    #Numerical threshold parameters
     if options['bitscore'] is not None:
-        #Make sure it's the right format, or castable as such!
-        if not isinstance(options['bitscore'], float):
-            try:
-                kwargs['T'] = float(options['bitscore'])
-            except ValueError:
-                print("Error: bitscore threshold must be a float or castable as a float.")
-                logging.info("Error: bitscore threshold must be a float or castable as a float.")
+        try:
+            kwargs['T'] = float(options['bitscore'])
+        except (ValueError, TypeError):
+            print("Error: bitscore threshold must be a float.")
 
     if options['domE'] is not None:
-        #Make sure it's the right format, or castable as such!
-        if not isinstance(options['domE'], float):
-            try:
-                kwargs['domE'] = float(options['domE'])
-            except ValueError:
-                print("Error: domE must be a float or castable to float.")
-                logging.info("Error: domE must be a float or castable to float.")
+        try:
+            kwargs['domE'] = float(options['domE'])
+        except (ValueError, TypeError):
+            print("Error: domE must be a float.")
 
     if options['domT'] is not None:
-        #Make sure it's the right format, or castable as such!
-        if not isinstance(options['domT'], float):
-            try:
-                kwargs['domT'] = float(options['domT'])
-            except ValueError:
-                print("Error: domT must be a float or castable to float.")
-                logging.info("Error: domT must be a float or castable to float.")
+        try:
+            kwargs['domT'] = float(options['domT'])
+        except (ValueError, TypeError):
+            print("Error: domT must be a float.")
 
     if options['incE'] is not None:
-        #Make sure it's the right format, or castable as such!
-        if not isinstance(options['incE'], float):
-            try:
-                kwargs['incE'] = float(options['incE'])
-            except ValueError:
-                print("Error: domT must be a float or castable to float.")
-                logging.error("Error: domT must be a float or castable to float.")
+        try:
+            kwargs['incE'] = float(options['incE'])
+        except (ValueError, TypeError):
+            print("Error: incE must be a float.")
 
     if options['incT'] is not None:
-        #Make sure it's the right format, or castable as such!
-        if not isinstance(options['incT'], float):
-            try:
-                kwargs['incT'] = float(options['incT'])
-            except ValueError:
-                print("Error: incT must be a float or castable to float.")
-                logging.error("Error: incT must be a float or castable to float.")
+        try:
+            kwargs['incT'] = float(options['incT'])
+        except (ValueError, TypeError):
+            print("Error: incT must be a float.")
 
     if options['incdomE'] is not None:
-        #Make sure it's the right format, or castable as such!
-        if not isinstance(options['incdomE'], float):
-            try:
-                kwargs['incdomE'] = float(options['incdomE'])
-            except ValueError:
-                print("Error: incdomE must be a float or castable to float.")
-                logging.error("Error: incdomE must be a float or castable to float.")
+        try:
+            kwargs['incdomE'] = float(options['incdomE'])
+        except (ValueError, TypeError):
+            print("Error: incdomE must be a float.")
 
     if options['incdomT'] is not None:
-        #Make sure it's the right format, or castable as such!
-        if not isinstance(options['incdomT'], float):
-            try:
-                kwargs['incdomT'] = float(options['incdomT'])
-            except ValueError:
-                print("Error: incdomT must be a float or castable to float.")
-                logging.error("Error: incdomT must be a float or castable to float.")
+        try:
+            kwargs['incdomT'] = float(options['incdomT'])
+        except (ValueError, TypeError):
+            print("Error: incdomT must be a float.")
 
     if options['evalue'] is not None:
-        #Make sure it's the right format, or castable as such!
-        if not isinstance(options['incdomT'], float):
-            try:
-                kwargs['E'] = float(options['evalue'])
-            except ValueError:
-                print("Error: evalue must be a float or castable to float.")
-                logging.error("Error: evalue must be a float or castable to float.")
+        try:
+            kwargs['E'] = float(options['evalue'])
+        except (ValueError, TypeError):
+            print("Error: evalue must be a float.")
 
     return kwargs
 
 
 def main(args):
     t1 = time.time()
-    # Required arguments
     hmm_in = args.hmm_in
-    prot_in = args.prot_in 
-
-    #boolean; indicates input is metagenomic files
-    global meta
-    meta = args.meta
-
-    #Set this as global; we don't want to have to pass it
-    global outdir 
+    prot_in = args.prot_in
     outdir = args.outdir
+    meta = args.meta
+    threads = args.threads
     log_file_path = os.path.join(outdir, 'astra_scan_log.txt')
-    write_seqs = args.write_seqs
 
-    # Check if the output directory already exists
     if not os.path.exists(outdir):
         os.makedirs(outdir)
-        if write_seqs:
-            os.makedirs(os.path.join(outdir, 'fastas'), exist_ok = True)  # Also create a 'fastas' folder within the output directory
-
 
     logging.basicConfig(filename=log_file_path, level=logging.INFO,
                         format='%(asctime)s %(levelname)s: %(message)s',
                         datefmt='%Y-%m-%d %H:%M:%S')
-    installed_hmms = args.installed_hmms
 
-    # Optional arguments
-    evalue = args.evalue
-    bitscore = args.bitscore
-
-    # Boolean flags
-    cut_ga = args.cut_ga
-    cut_nc = args.cut_nc
-    cut_tc = args.cut_tc
-
-
-    #again i am too lazy to pass this parameter in a function call SUE ME
-    global threads
-    threads = args.threads
-
-    #initialize default options
     hmmscan_options = {
-    "cut_ga":cut_ga,
-    "cut_nc":cut_nc,
-    "cut_tc":cut_tc,
-    "evalue":evalue,
-    "bitscore":bitscore,
-    "domE":args.domE,
-    "domT":args.domT,
-    "incE":args.incE,
-    "incT":args.incT,
-    "incdomE":args.incdomE,
-    "incdomT":args.incdomT,
+        "cut_ga": args.cut_ga,
+        "cut_nc": args.cut_nc,
+        "cut_tc": args.cut_tc,
+        "evalue": args.evalue,
+        "bitscore": args.bitscore,
+        "domE": args.domE,
+        "domT": args.domT,
+        "incE": args.incE,
+        "incT": args.incT,
+        "incdomE": args.incdomE,
+        "incdomT": args.incdomT,
     }
 
-    if hmm_in is None and installed_hmms is None:
-        error_out = "Either a user-provided or pre-installed HMM database must be specified. You know better."
-        print(error_out)
-        logging.error(error_out)
+    if hmm_in is None and args.installed_hmms is None:
+        print("Either a user-provided or pre-installed HMM database must be specified.")
         sys.exit(1)
 
-    # Check if more than one of --evalue, --bitscore, --cut_nc, --cut_tc, and --cut_ga are specified
-    specified_flags = [args.cut_nc, args.cut_tc, args.cut_ga]
-    if sum(specified_flags) > 1:
-        print("Error: You can only specify one of --bitscore, --cut_nc, --cut_tc, and --cut_ga.")
-        logging.info("Error: You can only specify one of --bitscore, --cut_nc, --cut_tc, and --cut_ga.")
-        print("If you specify a bitscore threshold and a pre-defined cutoff (e.g. --cut_ga) the pre-defined cutoff will be used")
-        logging.info("If you specify a bitscore threshold and a pre-defined cutoff (e.g. --cut_ga) the pre-defined cutoff will be used")
-        print("where available, otherwise the specified bitscore threshold will be used.")
-        logging.info("where available, otherwise the specified bitscore threshold will be used.")
-
-
-
-
-
-    #Check protein input and parse
     protein_dict = parse_protein_input(prot_in, threads)
+
+    # Pre-flatten sequences once
+    all_sequences = []
+    for seqs in protein_dict.values():
+        all_sequences.extend(seqs)
+    print(f"Total sequences loaded: {len(all_sequences)}")
+
+    # Free protein_dict — scan doesn't need per-file provenance after flattening
+    del protein_dict
+    gc.collect()
 
     if hmm_in is not None:
         print("Scanning with user-provided HMM(s)...")
         logging.info("Scanning with user-provided HMM(s)...")
-        #Check HMM input and parse
-        user_hmms = parse_hmms(args.hmm_in)
-        #Obtain dictionary containing results dataframes for each input FASTA
-        results_dataframes_dict = hmmscan(protein_dict, user_hmms, threads, hmmscan_options)
-        
-        if args.write_seqs:
-            extract_sequences(results_dataframes_dict, outdir)
+        user_hmms, _ = parse_hmms(args.hmm_in)
+        tmp_dir = hmmscan(all_sequences, user_hmms, threads, hmmscan_options, outdir)
+        combine_results(tmp_dir, os.path.join(outdir, 'all_hits_df.tsv'))
+        del user_hmms
 
-        all_results_df = pd.concat([results_dataframes_dict[key] for key in results_dataframes_dict.keys()])
-        all_results_df.to_csv(os.path.join(outdir,'all_hits_df.tsv'), sep='\t', index=False)
+    if args.installed_hmms is not None:
+        installed_hmm_names = args.installed_hmms.split(',') if ',' in args.installed_hmms else [args.installed_hmms]
+        print(f"Scanning with pre-installed HMMs: {', '.join(installed_hmm_names)}")
+        logging.info(f"Scanning with pre-installed HMMs: {', '.join(installed_hmm_names)}")
 
-    if installed_hmms is not None:
-        #check HMM input and parse
-
-        # Step 1: Get paths for installed HMM databases
-        installed_hmm_paths = []
-        if ',' in installed_hmms:
-            installed_hmm_names = installed_hmms.split(',')
-        else:
-            installed_hmm_names = [installed_hmms]  # Single element list
-        if ',' in installed_hmm_names:
-            print("Scanning with pre-installed HMMs: ", ', '.join(installed_hmm_names))
-            logging.info("Scanning with pre-installed HMMs: ", ', '.join(installed_hmm_names))
-        else:
-            print("Scanning with pre-installed HMMs: {}".format(installed_hmm_names[0]))
-            logging.info("Scanning with pre-installed HMMs: {}".format(installed_hmm_names[0]))
-        #Load JSON with database and procedural information
-        parsed_json = initialize.load_json()
+        parsed_json = initialize.load_config()
 
         if 'all_prot' in installed_hmm_names:
-
-            # Replace 'all_prot' with all installed protein HMM database names
-            installed_hmm_names = []
-            installed_hmm_paths = []
-            for db in parsed_json['db_urls']:
-                if db['molecule_type'] == 'protein' and db['installed']:
-                    installed_hmm_names.append(db['name'])
-
+            installed_hmm_names = [db['name'] for db in parsed_json['db_urls']
+                                   if db['molecule_type'] == 'protein' and db['installed']]
 
         for hmm_db in installed_hmm_names:
             installed_hmm_in = next((item for item in parsed_json['db_urls'] if item["name"] == hmm_db), None)
             if installed_hmm_in is not None:
                 installation_dir = installed_hmm_in['installation_dir']
-                db_hmms = parse_hmms(installation_dir)
+                db_hmms, _ = parse_hmms(installation_dir)
+                tmp_dir = hmmscan(all_sequences, db_hmms, threads, hmmscan_options, outdir, hmm_db)
+                combine_results(tmp_dir, os.path.join(outdir, f'{hmm_db}_hits_df.tsv'))
+                del db_hmms
+                gc.collect()
             else:
-                #No installation_dir specified; print this and move on
-                print("No installation_dir specified for db " + hmm_db)
-                logging.info("No installation_dir specified for db " + hmm_db)
-                continue
+                print(f"No installation_dir specified for db {hmm_db}")
+                logging.info(f"No installation_dir specified for db {hmm_db}")
 
-            #if we're in meta mode, we don't want to keep all that shit in memory
-            #and the hmmscan function will write a file for each DB and each protein file
-            #because they're huge
-            if not meta:
-                results_dataframes_dict = hmmscan(protein_dict, db_hmms, threads, hmmscan_options, hmm_db)
-            else:
-                hmmscan(protein_dict, db_hmms, threads, hmmscan_options, hmm_db)
+    # Clean up temp directory
+    tmp_results_path = os.path.join(outdir, 'tmp_results')
+    if os.path.exists(tmp_results_path):
+        shutil.rmtree(tmp_results_path)
+        print(f"Temporary files removed from {tmp_results_path}")
 
-            if args.write_seqs:
-                extract_sequences(results_dataframes_dict, outdir)
-
-            if not meta:
-                db_results_df = pd.concat([results_dataframes_dict[key] for key in results_dataframes_dict.keys()])
-                db_results_df.to_csv(os.path.join(outdir,hmm_db + '_hits_df.tsv'), sep='\t', index=False)
-    time_printout  = "Process took {} seconds.".format(time.time()-t1)
+    time_printout = f"Process took {time.time()-t1} seconds."
     print(time_printout)
     logging.info(time_printout)
-
-if __name__ == "__main__":
-    main()
-
-
-#TODO:
-"""
-- Multithread extract_sequences
-"""

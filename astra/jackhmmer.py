@@ -1,64 +1,54 @@
-import collections
+
+import logging
 import os
 import sys
 import time
 
-import pandas as pd
 import pyhmmer
-import pyhmmer.plan7
-
-Result = collections.namedtuple("Result", ["sequence_id", "evalue", 
-                                      "env_from", "env_to", "bitscore"])
-def get_results_attributes(result):
-    bitscore = result.bitscore
-    c_evalue = result.evalue
-    query = result.sequence_id
-    env_from = result.env_from
-    env_to = result.env_to
-    return [query, c_evalue, env_from, env_to, bitscore]
 
 
-def jackhmmer(query, sequence_db, threads):
+HEADER = "sequence_id\tevalue\tenv_from\tenv_to\tbitscore\n"
 
-	search_protocol = pyhmmer.hmmer.jackhmmer(query, sequence_db, cpus=threads)
-
-	search_results = list(search_protocol)
-
-	results = []
-	for hit in search_results[0].hits:
-	    if hit.included and not hit.duplicate:
-	        hit_name = hit.name.decode()
-	        results.append(Result(hit_name, hit.evalue, 
-	                hit.domains[0].env_from, hit.domains[0].env_to, hit.score))
-	return results
 
 def main(args):
-	query_file = args.query_seqs
-	database_file = args.subject_seqs
-	threads = args.threads
+    t1 = time.time()
+    query_file = args.query_seqs
+    database_file = args.subject_seqs
+    threads = args.threads
+    outdir = args.outdir
 
-	outdir = args.outdir
+    if not os.path.exists(outdir):
+        os.makedirs(outdir)
 
-	# Check if the output directory already exists
-	if not os.path.exists(outdir):
-		os.makedirs(outdir)
+    log_file_path = os.path.join(outdir, 'astra_jackhmmer_log.txt')
+    logging.basicConfig(filename=log_file_path, level=logging.INFO,
+                        format='%(asctime)s %(levelname)s: %(message)s',
+                        datefmt='%Y-%m-%d %H:%M:%S')
 
-	#Parse query sequences
-	with pyhmmer.easel.SequenceFile(query_file, digital=True) as query_reader:
-		query = query_reader.read_block()
+    print("Reading query sequences...")
+    with pyhmmer.easel.SequenceFile(query_file, digital=True) as sf:
+        query = sf.read_block()
 
-	#Parse subject sequences
-	with pyhmmer.easel.SequenceFile(database_file, digital=True) as seq_file:
-		sequence_db = seq_file.read_block()
+    print("Reading target database...")
+    with pyhmmer.easel.SequenceFile(database_file, digital=True) as sf:
+        sequence_db = sf.read_block()
 
-	results = jackhmmer(query, sequence_db, threads)
+    print(f"Running jackhmmer: {len(query)} queries × {len(sequence_db)} targets ({threads} threads)...")
+    logging.info(f"jackhmmer: {len(query)} queries × {len(sequence_db)} targets")
 
-	results_df = pd.DataFrame(
-					list(map(get_results_attributes, results)), 
-					columns=["sequence_id", "evalue", "env_from", "env_to", "bitscore"]).sort_values(by='sequence_id')
+    out_file = os.path.join(outdir, 'jackhmmer_results.tsv')
+    total_hits = 0
+    with open(out_file, 'w') as fh:
+        fh.write(HEADER)
+        for hits in pyhmmer.hmmer.jackhmmer(query, sequence_db, cpus=threads):
+            for hit in hits:
+                if hit.included and not hit.duplicate:
+                    for domain in hit.domains.reported:
+                        fh.write(f"{hit.name}\t{hit.evalue:.2e}\t"
+                                 f"{domain.env_from}\t{domain.env_to}\t{hit.score:.2f}\n")
+                        total_hits += 1
 
-	results_df.to_csv(os.path.join(outdir, 'jackhmmer_out.tsv'), sep='\t', index=False)
-
-
-if __name__ == "__main__":
-	main(args)
+    print(f"Results: {total_hits} hits → {out_file}")
+    time_printout = f"Process took {time.time()-t1:.2f} seconds."
+    print(time_printout)
+    logging.info(time_printout)
