@@ -30,12 +30,20 @@ class TqdmUpTo(tqdm):
             self.total = tsize
         self.update(b * bsize - self.n)
 
-def initialize_config():
-    app_name = "Astra"
-    app_author = "YourOrg"  # Replace with the actual name of your organization or app author
+APP_NAME = "Astra"
 
-    # Use os.path.expanduser to get the proper config path
-    config_dir = os.path.expanduser("~/.config/Astra")
+
+def astra_config_dir():
+    """Directory holding hmm_databases.json and, by default, the databases.
+
+    On Linux this is ``~/.config/Astra``, which is where Astra has always put
+    it; platformdirs picks the right equivalent on macOS and Windows.
+    """
+    return user_config_dir(APP_NAME)
+
+
+def initialize_config():
+    config_dir = astra_config_dir()
     default_db_json_path = os.path.join(config_dir, 'hmm_databases.json')
 
     # Check if hmm_databases.json exists in the user's config directory
@@ -77,11 +85,7 @@ def initialize_config():
     return hmm_databases
 
 def load_config():
-    app_name = "Astra"
-    app_author = "YourOrg"  # Replace with the actual name of your organization or app author
-
-    # Use os.path.expanduser to get the proper config path
-    config_dir = os.path.expanduser("~/.config/Astra")
+    config_dir = astra_config_dir()
     default_db_json_path = os.path.join(config_dir, 'hmm_databases.json')
 
     # Attempt to load the existing hmm_databases.json
@@ -94,8 +98,7 @@ def load_config():
 
     # If 'db_path' is empty, prompt the user for the directory to store HMM databases
     if not hmm_databases.get('db_path'):
-        # Use platformdirs to get the standard configuration directory
-        default_db_path = user_config_dir(app_name, app_author)
+        default_db_path = astra_config_dir()
         print(f"The default directory for HMM databases is: {default_db_path}")
         user_input = input("Would you like to use the default directory for the HMM databases? [Y/n] ").strip().lower()
         if user_input == 'n':
@@ -486,7 +489,7 @@ def install_HydDB():
             break
 
     # Write updated config
-    config_dir = os.path.expanduser("~/.config/Astra")
+    config_dir = astra_config_dir()
     json_path = os.path.join(config_dir, 'hmm_databases.json')
     with open(json_path, 'w') as f:
         json.dump(parsed_json, f, indent=4)
@@ -594,7 +597,7 @@ def install_RP16():
                            source_url=db['url'], version=source_version)
             break
 
-    config_dir = os.path.expanduser("~/.config/Astra")
+    config_dir = astra_config_dir()
     with open(os.path.join(config_dir, 'hmm_databases.json'), 'w') as f:
         json.dump(parsed_json, f, indent=4)
 
@@ -803,7 +806,7 @@ def install_databases(db_name, parsed_json=None, db_path=None):
 
     if update_required:
         # Update the JSON file in the config directory
-        config_dir = os.path.expanduser("~/.config/Astra")
+        config_dir = astra_config_dir()
         json_path = os.path.join(config_dir, 'hmm_databases.json')
         with open(json_path, 'w') as f:
             json.dump(parsed_json, f, indent=4)
@@ -893,7 +896,7 @@ def main(args):
             db['installation_dir'] = ''
 
         if named:
-            config_dir = os.path.expanduser("~/.config/Astra")
+            config_dir = astra_config_dir()
             with open(os.path.join(config_dir, 'hmm_databases.json'), 'w') as f:
                 json.dump(parsed_json, f, indent=4)
 

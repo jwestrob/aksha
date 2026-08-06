@@ -16,21 +16,31 @@ Astra is a Python package designed to facilitate bioinformatic workflows involvi
 
 ## Installation
 
-To install the package, use pip (Not yet live! Don't try this!):
+To install the package, use pip:
 
 ```bash
-pip install astra
+pip install astra-hmm
 ```
-Dependencies:
 
-- Python packages (automatically installed via pip):
-	- pyhmmer
-	- tqdm
-	- urllib
-	- pandas
-	- biopython
-- External dependencies:
-	- [pullseq](https://github.com/bcthomas/pullseq)
+The distribution is named `astra-hmm` because `astra` was already taken on
+PyPI; the command and the importable package are both still `astra`.
+
+To install from a clone:
+
+```bash
+pip install -e .
+```
+
+Dependencies (all installed automatically via pip):
+
+- [pyhmmer](https://pyhmmer.readthedocs.io/) >= 0.10
+- pandas >= 2.0
+- tqdm
+- requests
+- platformdirs
+
+Python 3.9 or newer. No external binaries are required — HMMER itself comes
+bundled with PyHMMER.
 
 ## Usage
 
