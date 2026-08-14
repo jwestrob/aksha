@@ -291,6 +291,37 @@ class GPUConfigurationTests(unittest.TestCase):
 
 
 class CPUPathTests(unittest.TestCase):
+    def test_cpu_collection_boundaries_are_unchanged(self):
+        hmms = [SimpleNamespace(cutoffs=SimpleNamespace()) for _ in range(3)]
+        with tempfile.TemporaryDirectory(prefix="astra-cpu-gc-") as temporary:
+            with (
+                mock.patch.object(search, "HMM_CHUNK_SIZE", 2),
+                mock.patch.object(
+                    search.pyhmmer,
+                    "hmmsearch",
+                    side_effect=lambda *_args, **_kwargs: iter(()),
+                ),
+                mock.patch.object(search.gc, "collect") as collect,
+            ):
+                search.hmmsearch(
+                    {},
+                    hmms,
+                    1,
+                    search_options(temporary),
+                    all_sequences=[object()],
+                )
+                self.assertEqual(collect.call_count, 3)
+
+                collect.reset_mock()
+                search.hmmsearch(
+                    {"one.faa": [], "two.faa": []},
+                    hmms,
+                    1,
+                    search_options(temporary),
+                    macsyfinder_dir="macsyfinder",
+                )
+                self.assertEqual(collect.call_count, 2)
+
     def test_bulk_cpu_path_still_calls_only_pyhmmer_with_same_arguments(self):
         alphabet = pyhmmer.easel.Alphabet.amino()
         background = pyhmmer.plan7.Background(alphabet)
@@ -326,6 +357,101 @@ class CPUPathTests(unittest.TestCase):
 
 
 class BulkDispatchTests(unittest.TestCase):
+    def test_gpu_chunks_release_results_without_collecting_between_chunks(self):
+        class Result:
+            pass
+
+        pairs = [
+            SimpleNamespace(
+                cutoffs=SimpleNamespace(
+                    gathering=None, noise=None, trusted=None
+                )
+            )
+            for _ in range(3)
+        ]
+        modules, api = synthetic_plan7_gpu()
+        iterator_refs = []
+        result_refs = []
+        released_before_next = []
+
+        def gpu_search(*_args, **_kwargs):
+            if iterator_refs:
+                released_before_next.append(
+                    (iterator_refs[-1]() is None, result_refs[-1]() is None)
+                )
+
+            def results():
+                result = Result()
+                result_refs.append(weakref.ref(result))
+                yield result
+
+            iterator = results()
+            iterator_refs.append(weakref.ref(iterator))
+            return iterator
+
+        api.gpu_hmmsearch.side_effect = gpu_search
+        with tempfile.TemporaryDirectory(prefix="astra-gpu-gc-") as temporary:
+            with (
+                mock.patch.dict(sys.modules, modules),
+                mock.patch.object(search, "GPU_CELL_CAP", 2),
+                mock.patch.object(search.gc, "collect") as collect,
+                mock.patch.object(
+                    search, "process_hits_to_file", new=lambda *_args: None
+                ),
+            ):
+                search.hmmsearch(
+                    {},
+                    pairs,
+                    1,
+                    search_options(temporary),
+                    all_sequences=[object(), object()],
+                    gpu_sequence_batch=object(),
+                    gpu_postfilter=False,
+                )
+
+        self.assertEqual(released_before_next, [(True, True), (True, True)])
+        self.assertTrue(all(reference() is None for reference in iterator_refs))
+        self.assertTrue(all(reference() is None for reference in result_refs))
+        collect.assert_called_once_with()
+
+    def test_gpu_chunk_failure_closes_the_active_iterator(self):
+        pair = SimpleNamespace(
+            cutoffs=SimpleNamespace(gathering=None, noise=None, trusted=None)
+        )
+        modules, api = synthetic_plan7_gpu()
+        closed = []
+
+        def results():
+            try:
+                yield object()
+            finally:
+                closed.append(True)
+
+        api.gpu_hmmsearch.side_effect = lambda *_args, **_kwargs: results()
+        with tempfile.TemporaryDirectory(prefix="astra-gpu-gc-error-") as temporary:
+            with (
+                mock.patch.dict(sys.modules, modules),
+                mock.patch.object(search.gc, "collect") as collect,
+                mock.patch.object(
+                    search,
+                    "process_hits_to_file",
+                    side_effect=RuntimeError("write failed"),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "write failed"):
+                    search.hmmsearch(
+                        {},
+                        [pair],
+                        1,
+                        search_options(temporary),
+                        all_sequences=[object()],
+                        gpu_sequence_batch=object(),
+                        gpu_postfilter=False,
+                    )
+
+        self.assertEqual(closed, [True])
+        collect.assert_not_called()
+
     def test_gpu_groups_whole_pairs_and_applies_cell_capped_chunks_in_order(self):
         def pair(cutoff):
             cutoffs = {"gathering": None, "noise": None, "trusted": None}

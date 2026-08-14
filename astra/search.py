@@ -473,9 +473,24 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                             hit_iterator = gpu_hmmsearch(
                                 hmm_chunk, gpu_sequence_batch, cpus=threads, **kwargs
                             )
-                    for hits in hit_iterator:
-                        process_hits_to_file(hits, fh)
-                    gc.collect()
+                    try:
+                        for hits in hit_iterator:
+                            process_hits_to_file(hits, fh)
+                    except BaseException:
+                        if gpu_sequence_batch is not None:
+                            close = getattr(hit_iterator, "close", None)
+                            if close is not None:
+                                try:
+                                    close()
+                                except BaseException:
+                                    pass
+                        raise
+                    finally:
+                        if gpu_sequence_batch is not None:
+                            hit_iterator = None
+                            hits = None
+                    if gpu_sequence_batch is None:
+                        gc.collect()
                     print(" done")
 
         gc.collect()
