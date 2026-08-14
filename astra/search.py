@@ -5,11 +5,173 @@ import sys
 import time
 import logging
 import shutil
+from pathlib import Path
 from tqdm import tqdm
 import pyhmmer
 from concurrent.futures import ThreadPoolExecutor
 from astra import initialize
 from astra import rp16 as rp16_module
+
+
+PRESSED_SUFFIXES = ('h3m', 'h3i', 'h3f', 'h3p')
+HMM_CHUNK_SIZE = 2000
+GPU_CELL_CAP = 100_000_000
+
+
+class GPUConfigurationError(ValueError):
+    """Raised when an explicit installed-database GPU request is invalid."""
+
+
+def gpu_hmm_chunk_size(sequence_count):
+    """Bound one GPU candidate matrix while retaining Astra's 2,000-HMM cap."""
+    return min(
+        HMM_CHUNK_SIZE,
+        max(1, GPU_CELL_CAP // max(1, sequence_count)),
+    )
+
+
+def parse_gpu_manifest_mappings(entries):
+    """Parse repeatable ``DB=PATH`` values without accepting ambiguity."""
+    mappings = {}
+    for entry in entries or ():
+        if not isinstance(entry, str):
+            raise GPUConfigurationError("--gpu-manifest values must be DB=PATH strings")
+        db_name, separator, manifest_path = entry.partition('=')
+        db_name = db_name.strip()
+        manifest_path = manifest_path.strip()
+        if not separator or not db_name or not manifest_path:
+            raise GPUConfigurationError(
+                f"malformed --gpu-manifest value {entry!r}; expected DB=PATH"
+            )
+        if db_name in mappings:
+            raise GPUConfigurationError(
+                f"duplicate --gpu-manifest mapping for database {db_name!r}"
+            )
+        mappings[db_name] = os.path.expandvars(os.path.expanduser(manifest_path))
+    return mappings
+
+
+def discover_pressed_base(installation_dir):
+    """Return the unambiguous complete pressed base in an installation directory.
+
+    Astra's own press operation normally names the base after the directory.
+    Older installations such as HydDB instead keep a source-derived base name,
+    so they are accepted when exactly one complete pressed set is present.
+    """
+    try:
+        raw_directory = os.fspath(installation_dir)
+    except TypeError as error:
+        raise GPUConfigurationError("installed database has no installation directory") from error
+    if not raw_directory:
+        raise GPUConfigurationError("installed database has no installation directory")
+
+    db_dir = Path(os.path.expandvars(os.path.expanduser(raw_directory)))
+    if not db_dir.is_dir():
+        raise GPUConfigurationError(
+            f"installed database directory does not exist: {db_dir}"
+        )
+    db_dir = db_dir.resolve()
+
+    def complete(base):
+        return all(Path(f"{base}.{suffix}").is_file() for suffix in PRESSED_SUFFIXES)
+
+    candidates = set()
+    for member in db_dir.iterdir():
+        if member.suffix in {f'.{suffix}' for suffix in PRESSED_SUFFIXES}:
+            base = member.with_suffix('')
+            if complete(base):
+                candidates.add(base)
+
+    if not candidates:
+        raise GPUConfigurationError(
+            f"no complete pressed HMM set found in {db_dir}; expected .h3m/.h3i/.h3f/.h3p"
+        )
+    if len(candidates) != 1:
+        names = ', '.join(sorted(base.name for base in candidates))
+        raise GPUConfigurationError(
+            f"ambiguous pressed HMM sets in {db_dir}: {names}"
+        )
+    return candidates.pop()
+
+
+def _resolve_installed_hmm_names(installed_hmms, parsed_json):
+    names = installed_hmms.split(',') if ',' in installed_hmms else [installed_hmms]
+    if 'all_prot' in names:
+        names = [
+            db['name'] for db in parsed_json['db_urls']
+            if db['molecule_type'] == 'protein' and db['installed']
+        ]
+    return names
+
+
+def validate_gpu_configuration(mappings, installed_hmm_names, parsed_json,
+                               threads, macsyfinder_enabled):
+    """Reject explicit GPU mappings that cannot be consumed exactly once."""
+    if not mappings:
+        return
+    if isinstance(threads, bool) or not isinstance(threads, int) or threads <= 0:
+        raise GPUConfigurationError(
+            "--threads must be a positive integer when --gpu-manifest is used"
+        )
+    if macsyfinder_enabled:
+        raise GPUConfigurationError(
+            "--write_macsyfinder cannot be combined with --gpu-manifest"
+        )
+
+    requested_names = list(installed_hmm_names or ())
+    seen = set()
+    duplicates = set()
+    for name in requested_names:
+        if name in seen:
+            duplicates.add(name)
+        seen.add(name)
+    if duplicates:
+        raise GPUConfigurationError(
+            "duplicate installed HMM database(s) with GPU mappings: "
+            + ', '.join(sorted(duplicates))
+        )
+
+    requested = set(requested_names)
+    eligible = {
+        db['name'] for db in parsed_json['db_urls']
+        if (db.get('name') in requested
+            and db.get('installed')
+            and db.get('molecule_type') == 'protein'
+            and db.get('installation_dir'))
+    }
+    unused = sorted(set(mappings) - eligible)
+    if unused:
+        raise GPUConfigurationError(
+            "unused --gpu-manifest mapping(s): " + ', '.join(unused)
+        )
+
+
+def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
+                            all_sequences):
+    """Authenticate every mapped database and initialize one target batch."""
+    if not mappings:
+        return {}, None
+
+    from plan7_gpu import SequenceBatch
+    from plan7_gpu.pressed_manifest import validate_pressed_manifest
+
+    databases = {}
+    for db_name in installed_hmm_names:
+        manifest_path = mappings.get(db_name)
+        if manifest_path is None:
+            continue
+        database = next(
+            item for item in parsed_json['db_urls'] if item['name'] == db_name
+        )
+        pressed_base = discover_pressed_base(database['installation_dir'])
+        validate_pressed_manifest(pressed_base, manifest_path)
+        databases[db_name] = (pressed_base, manifest_path)
+
+    batch = SequenceBatch(
+        all_sequences,
+        alphabet=pyhmmer.easel.Alphabet.amino(),
+    )
+    return databases, batch
 
 
 def has_thresholds(x):
@@ -163,8 +325,15 @@ def extract_sequences(results_or_ids, protein_dict_or_outdir, outdir=None):
 
 
 
-def hmmsearch(protein_dict, hmms, threads, options, db_name=None, macsyfinder_dir=None, hmm_name_to_filename=None, all_sequences=None):
+def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
+              macsyfinder_dir=None, hmm_name_to_filename=None,
+              all_sequences=None, gpu_sequence_batch=None):
     hmmsearch_kwargs = define_kwargs(options)
+
+    if gpu_sequence_batch is not None and macsyfinder_dir is not None:
+        raise GPUConfigurationError(
+            "MacSyFinder output is unavailable for an explicitly GPU-mapped database"
+        )
 
     # Always write to temp files — bulk mode is faster and avoids
     # keeping huge result lists in memory.  The per-genome loop is
@@ -172,17 +341,24 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None, macsyfinder_di
     tmp_dir = os.path.join(options['outdir'], 'tmp_results')
     os.makedirs(tmp_dir, exist_ok=True)
 
-    def get_best_cutoff(hmm):
+    def cutoff_available(query, cutoff):
+        if gpu_sequence_batch is not None:
+            # PressedProfilePair.cutoffs is the immutable snapshot captured
+            # while the manifest-authenticated pressed streams were pinned.
+            return getattr(query.cutoffs, cutoff) is not None
+        return getattr(query.cutoffs, f"{cutoff}_available")()
+
+    def get_best_cutoff(query):
         if options['cascade']:
             cutoff_order = [
                 hmmsearch_kwargs.get('preferred_cutoff', 'trusted'),
                 'trusted', 'gathering', 'noise'
             ]
             for cutoff in cutoff_order:
-                if getattr(hmm.cutoffs, f"{cutoff}_available")():
+                if cutoff_available(query, cutoff):
                     return cutoff
         elif 'bit_cutoffs' in hmmsearch_kwargs:
-            if getattr(hmm.cutoffs, f"{hmmsearch_kwargs['bit_cutoffs']}_available")():
+            if cutoff_available(query, hmmsearch_kwargs['bit_cutoffs']):
                 return hmmsearch_kwargs['bit_cutoffs']
         return None
 
@@ -217,7 +393,6 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None, macsyfinder_di
     # and search once against the full pool.  This turns N_genomes * N_chunks
     # pyhmmer.hmmsearch() calls into just N_chunks calls — e.g. 54 instead of
     # 192,456 for KOFAM on DPANN (3,564 genomes × 54 chunks).
-    HMM_CHUNK_SIZE = 2000
     bulk_mode = not macsyfinder_dir
 
     HEADER = ("sequence_id\thmm_name\tbitscore\tevalue\tc_evalue\ti_evalue\t"
@@ -232,23 +407,35 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None, macsyfinder_di
         print(f"Bulk search: {len(all_sequences)} sequences × {len(hmms)} HMMs "
               f"({sum(len(g) for g, _ in group_kwargs_list)} grouped)")
 
+        hmm_chunk_size = HMM_CHUNK_SIZE
+        if gpu_sequence_batch is not None:
+            hmm_chunk_size = gpu_hmm_chunk_size(len(all_sequences))
+
         # Single output file — keep handle open across all chunks
         out_file = os.path.join(tmp_dir, "bulk_results.tsv")
         total_chunks = sum(
-            (len(g) + HMM_CHUNK_SIZE - 1) // HMM_CHUNK_SIZE
+            (len(g) + hmm_chunk_size - 1) // hmm_chunk_size
             for g, _ in group_kwargs_list
         )
         chunk_idx = 0
         with open(out_file, 'w') as fh:
             fh.write(HEADER)
             for hmm_group, kwargs in group_kwargs_list:
-                for chunk_start in range(0, len(hmm_group), HMM_CHUNK_SIZE):
-                    hmm_chunk = hmm_group[chunk_start:chunk_start + HMM_CHUNK_SIZE]
+                for chunk_start in range(0, len(hmm_group), hmm_chunk_size):
+                    hmm_chunk = hmm_group[chunk_start:chunk_start + hmm_chunk_size]
                     chunk_idx += 1
                     print(f"  Chunk {chunk_idx}/{total_chunks} "
                           f"({len(hmm_chunk)} HMMs)...", end="", flush=True)
-                    for hits in pyhmmer.hmmsearch(hmm_chunk, all_sequences,
-                                                  cpus=threads, **kwargs):
+                    if gpu_sequence_batch is None:
+                        hit_iterator = pyhmmer.hmmsearch(
+                            hmm_chunk, all_sequences, cpus=threads, **kwargs
+                        )
+                    else:
+                        from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
+                        hit_iterator = gpu_hmmsearch(
+                            hmm_chunk, gpu_sequence_batch, cpus=threads, **kwargs
+                        )
+                    for hits in hit_iterator:
                         process_hits_to_file(hits, fh)
                     gc.collect()
                     print(" done")
@@ -653,6 +840,11 @@ def main(args):
     hmm_in = args.hmm_in
     prot_in = args.prot_in
     outdir = args.outdir
+    gpu_manifests = parse_gpu_manifest_mappings(
+        getattr(args, 'gpu_manifest', ())
+    )
+    gpu_parsed_json = None
+    gpu_installed_hmm_names = None
     log_file_path = os.path.join(outdir, 'astra_search_log.txt')
 
     # --- Ribosomal-protein marker mode ---------------------------------
@@ -688,6 +880,23 @@ def main(args):
     elif synteny_threshold is not None:
         print("--synteny is only used with --16rp/--15rp; ignoring.")
         synteny_threshold = None
+
+    if gpu_manifests:
+        if args.installed_hmms is None:
+            gpu_parsed_json = {'db_urls': []}
+            gpu_installed_hmm_names = []
+        else:
+            gpu_parsed_json = initialize.load_config()
+            gpu_installed_hmm_names = _resolve_installed_hmm_names(
+                args.installed_hmms, gpu_parsed_json
+            )
+        validate_gpu_configuration(
+            gpu_manifests,
+            gpu_installed_hmm_names,
+            gpu_parsed_json,
+            args.threads,
+            getattr(args, 'write_macsyfinder', False),
+        )
 
     if not os.path.exists(outdir):
         os.makedirs(outdir)
@@ -744,6 +953,16 @@ def main(args):
         gc.collect()
         protein_dict = None  # keep the name bound for the code paths that check it
 
+    gpu_databases = {}
+    gpu_sequence_batch = None
+    if gpu_manifests:
+        gpu_databases, gpu_sequence_batch = preflight_gpu_databases(
+            gpu_manifests,
+            gpu_installed_hmm_names,
+            gpu_parsed_json,
+            all_sequences,
+        )
+
     # MacSyFinder-compatible output directory (per-HMM hmmsearch text files)
     macsyfinder_dir = None
     if getattr(args, 'write_macsyfinder', False):
@@ -756,48 +975,75 @@ def main(args):
         print(f"MacSyFinder-compatible output enabled → {macsyfinder_dir}/")
         logging.info(f"MacSyFinder-compatible output enabled → {macsyfinder_dir}/")
 
-    if hmm_in is not None:
-        print("Searching with user-provided HMM(s)...")
-        logging.info("Searching with user-provided HMM(s)...")
-        user_hmms, user_name_map = parse_hmms(hmm_in)
-        results = hmmsearch(protein_dict, user_hmms, args.threads, hmmsearch_options,
-                            macsyfinder_dir=macsyfinder_dir, hmm_name_to_filename=user_name_map,
-                            all_sequences=all_sequences)
-        if args.write_seqs:
-            extract_sequences_from_tmp(results, protein_dict, outdir)
-        hits_tsv = os.path.join(outdir,
-                                'rp16_raw_hits.tsv' if rp16_mode else 'user_hmms_hits_df.tsv')
-        combine_results(results, hits_tsv)
-        if rp16_mode:
-            rp16_module.process(hits_tsv, protein_dict, outdir, synteny_threshold)
-        del user_hmms
+    try:
+        if hmm_in is not None:
+            print("Searching with user-provided HMM(s)...")
+            logging.info("Searching with user-provided HMM(s)...")
+            user_hmms, user_name_map = parse_hmms(hmm_in)
+            results = hmmsearch(protein_dict, user_hmms, args.threads, hmmsearch_options,
+                                macsyfinder_dir=macsyfinder_dir, hmm_name_to_filename=user_name_map,
+                                all_sequences=all_sequences)
+            if args.write_seqs:
+                extract_sequences_from_tmp(results, protein_dict, outdir)
+            hits_tsv = os.path.join(outdir,
+                                    'rp16_raw_hits.tsv' if rp16_mode else 'user_hmms_hits_df.tsv')
+            combine_results(results, hits_tsv)
+            if rp16_mode:
+                rp16_module.process(hits_tsv, protein_dict, outdir, synteny_threshold)
+            del user_hmms
 
-    if args.installed_hmms is not None:
-        installed_hmm_names = args.installed_hmms.split(',') if ',' in args.installed_hmms else [args.installed_hmms]
-        print(f"Searching with pre-installed HMMs: {', '.join(installed_hmm_names)}")
-        logging.info(f"Searching with pre-installed HMMs: {', '.join(installed_hmm_names)}")
+        if args.installed_hmms is not None:
+            installed_hmm_names = args.installed_hmms.split(',') if ',' in args.installed_hmms else [args.installed_hmms]
+            print(f"Searching with pre-installed HMMs: {', '.join(installed_hmm_names)}")
+            logging.info(f"Searching with pre-installed HMMs: {', '.join(installed_hmm_names)}")
 
-        parsed_json = initialize.load_config()
+            parsed_json = (
+                gpu_parsed_json
+                if gpu_parsed_json is not None
+                else initialize.load_config()
+            )
 
-        if 'all_prot' in installed_hmm_names:
-            installed_hmm_names = [db['name'] for db in parsed_json['db_urls'] if db['molecule_type'] == 'protein' and db['installed']]
+            if 'all_prot' in installed_hmm_names:
+                installed_hmm_names = [db['name'] for db in parsed_json['db_urls'] if db['molecule_type'] == 'protein' and db['installed']]
 
-        for hmm_db in installed_hmm_names:
-            installed_hmm_in = next((item for item in parsed_json['db_urls'] if item["name"] == hmm_db), None)
-            if installed_hmm_in is not None:
-                installation_dir = installed_hmm_in['installation_dir']
-                db_hmms, db_name_map = parse_hmms(installation_dir)
-                tmp_dir = hmmsearch(protein_dict, db_hmms, args.threads, hmmsearch_options,
-                                    hmm_db, macsyfinder_dir=macsyfinder_dir, hmm_name_to_filename=db_name_map,
-                                    all_sequences=all_sequences)
-                if args.write_seqs:
-                    extract_sequences_from_tmp(tmp_dir, protein_dict, outdir)
-                combine_results(tmp_dir, os.path.join(outdir, f'{hmm_db}_hits_df.tsv'))
-                del db_hmms
-                gc.collect()
-            else:
-                print(f"No installation_dir specified for db {hmm_db}")
-                logging.info(f"No installation_dir specified for db {hmm_db}")
+            for hmm_db in installed_hmm_names:
+                installed_hmm_in = next((item for item in parsed_json['db_urls'] if item["name"] == hmm_db), None)
+                if installed_hmm_in is not None:
+                    installation_dir = installed_hmm_in['installation_dir']
+                    manifest_path = gpu_manifests.get(hmm_db)
+                    if manifest_path is None:
+                        db_hmms, db_name_map = parse_hmms(installation_dir)
+                        tmp_dir = hmmsearch(
+                            protein_dict, db_hmms, args.threads, hmmsearch_options,
+                            hmm_db, macsyfinder_dir=macsyfinder_dir,
+                            hmm_name_to_filename=db_name_map,
+                            all_sequences=all_sequences,
+                        )
+                    else:
+                        from plan7_gpu import load_pressed_profiles
+
+                        pressed_base, manifest_path = gpu_databases[hmm_db]
+                        print(f"  GPU search for {hmm_db}: {pressed_base}")
+                        logging.info(f"GPU search for {hmm_db}: {pressed_base}")
+                        db_hmms = load_pressed_profiles(
+                            pressed_base, manifest=manifest_path
+                        )
+                        tmp_dir = hmmsearch(
+                            protein_dict, db_hmms, args.threads, hmmsearch_options,
+                            hmm_db, all_sequences=all_sequences,
+                            gpu_sequence_batch=gpu_sequence_batch,
+                        )
+                    if args.write_seqs:
+                        extract_sequences_from_tmp(tmp_dir, protein_dict, outdir)
+                    combine_results(tmp_dir, os.path.join(outdir, f'{hmm_db}_hits_df.tsv'))
+                    del db_hmms
+                    gc.collect()
+                else:
+                    print(f"No installation_dir specified for db {hmm_db}")
+                    logging.info(f"No installation_dir specified for db {hmm_db}")
+    finally:
+        if gpu_sequence_batch is not None:
+            gpu_sequence_batch.close()
 
     # Write MacSyFinder config file and finalize hmmsearch output if enabled
     if macsyfinder_dir:

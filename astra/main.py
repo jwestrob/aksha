@@ -41,6 +41,11 @@ def main():
     parser_search.add_argument('--prot_in', required=True, help='Input file for protein sequences.')
     parser_search.add_argument('--outdir', required=True, help='Output directory for results.')
     parser_search.add_argument('--installed_hmms', default=None, type=str, help='Comma-separated list of installed HMM databases to use. If you specify a database that is not installed, Astra will not utilize it here. Go install it with initialize')
+    parser_search.add_argument(
+        '--gpu-manifest', action='append', default=[], metavar='DB=PATH',
+        help=('Use plan7_gpu for the named installed protein database, '
+              'authenticating its pressed files with PATH. Repeat for multiple databases.'),
+    )
 
     #16rp 
     parser_search.add_argument('--16rp', action='store_true', default=False, help='Retrieve 16 ribosomal protein markers for concatenated phylogenetic analysis [BACTERIA + ARCHAEA]. Requires the RP16 database (astra initialize --hmms RP16).')
