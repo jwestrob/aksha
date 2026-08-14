@@ -155,7 +155,7 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
                             all_sequences):
     """Load every attested mapped database and initialize one target batch."""
     if not mappings:
-        return {}, None
+        return {}, None, False
 
     from plan7_gpu import SequenceBatch, load_pressed_profiles
     from plan7_gpu.pressed_manifest import validate_pressed_manifest
@@ -179,11 +179,20 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
             load_pressed_profiles(pressed_base, manifest=manifest_path),
         )
 
+    postfilter = gpu_postfilter_available()
     batch = SequenceBatch(
         all_sequences,
         alphabet=pyhmmer.easel.Alphabet.amino(),
     )
-    return databases, batch
+    return databases, batch, postfilter
+
+
+def gpu_postfilter_available():
+    """Return whether plan7_gpu can resume HMMER after exact GPU filters."""
+    from plan7_gpu import _pipeline
+
+    probe = getattr(_pipeline, '_filter_scores_seam_available', None)
+    return callable(probe) and probe() is True
 
 
 def has_thresholds(x):
@@ -339,12 +348,23 @@ def extract_sequences(results_or_ids, protein_dict_or_outdir, outdir=None):
 
 def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
               macsyfinder_dir=None, hmm_name_to_filename=None,
-              all_sequences=None, gpu_sequence_batch=None):
+              all_sequences=None, gpu_sequence_batch=None,
+              gpu_postfilter=None):
     hmmsearch_kwargs = define_kwargs(options)
 
     if gpu_sequence_batch is not None and macsyfinder_dir is not None:
         raise GPUConfigurationError(
             "MacSyFinder output is unavailable for an explicitly GPU-mapped database"
+        )
+    if gpu_postfilter is None:
+        gpu_postfilter = (
+            gpu_postfilter_available() if gpu_sequence_batch is not None else False
+        )
+    elif type(gpu_postfilter) is not bool:
+        raise TypeError("gpu_postfilter must be bool or None")
+    if gpu_postfilter and gpu_sequence_batch is None:
+        raise GPUConfigurationError(
+            "exact GPU post-filter mode requires a GPU sequence batch"
         )
 
     # Always write to temp files — bulk mode is faster and avoids
@@ -444,9 +464,15 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                         )
                     else:
                         from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
-                        hit_iterator = gpu_hmmsearch(
-                            hmm_chunk, gpu_sequence_batch, cpus=threads, **kwargs
-                        )
+                        if gpu_postfilter:
+                            hit_iterator = gpu_hmmsearch(
+                                hmm_chunk, gpu_sequence_batch, cpus=threads,
+                                postfilter=True, **kwargs
+                            )
+                        else:
+                            hit_iterator = gpu_hmmsearch(
+                                hmm_chunk, gpu_sequence_batch, cpus=threads, **kwargs
+                            )
                     for hits in hit_iterator:
                         process_hits_to_file(hits, fh)
                     gc.collect()
@@ -954,12 +980,13 @@ def main(args):
 
     gpu_databases = {}
     gpu_sequence_batch = None
+    gpu_postfilter = False
     if gpu_manifests:
         # This check must happen before constructing a CUDA SequenceBatch or
         # creating any result path. With one HMM, a larger target set already
         # exceeds the bounded profile-by-target candidate matrix.
         gpu_hmm_chunk_size(len(all_sequences))
-        gpu_databases, gpu_sequence_batch = preflight_gpu_databases(
+        gpu_databases, gpu_sequence_batch, gpu_postfilter = preflight_gpu_databases(
             gpu_manifests,
             gpu_installed_hmm_names,
             gpu_parsed_json,
@@ -1043,12 +1070,20 @@ def main(args):
                         )
                     else:
                         pressed_base, db_hmms = gpu_databases.pop(hmm_db)
-                        print(f"  GPU search for {hmm_db}: {pressed_base}")
-                        logging.info(f"GPU search for {hmm_db}: {pressed_base}")
+                        gpu_mode = (
+                            "exact post-filter" if gpu_postfilter else "legacy SSV"
+                        )
+                        print(
+                            f"  GPU search for {hmm_db} ({gpu_mode}): {pressed_base}"
+                        )
+                        logging.info(
+                            f"GPU search for {hmm_db} ({gpu_mode}): {pressed_base}"
+                        )
                         tmp_dir = hmmsearch(
                             protein_dict, db_hmms, args.threads, hmmsearch_options,
                             hmm_db, all_sequences=all_sequences,
                             gpu_sequence_batch=gpu_sequence_batch,
+                            gpu_postfilter=gpu_postfilter,
                         )
                     if args.write_seqs:
                         extract_sequences_from_tmp(tmp_dir, protein_dict, outdir)

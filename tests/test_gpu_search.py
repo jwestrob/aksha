@@ -78,22 +78,33 @@ def make_pressed_members(directory, base_name):
     return base
 
 
-def synthetic_plan7_gpu():
+def synthetic_plan7_gpu(postfilter_available=None):
     """Return optional-package modules suitable for CPU-only wiring tests."""
     package = ModuleType("plan7_gpu")
     package.__path__ = []
     astra_search_module = ModuleType("plan7_gpu.astra_search")
     manifest_module = ModuleType("plan7_gpu.pressed_manifest")
+    pipeline_module = ModuleType("plan7_gpu._pipeline")
 
     api = SimpleNamespace(
         SequenceBatch=mock.Mock(name="SequenceBatch"),
         load_pressed_profiles=mock.Mock(name="load_pressed_profiles"),
         validate_pressed_manifest=mock.Mock(name="validate_pressed_manifest"),
         gpu_hmmsearch=mock.Mock(name="gpu_hmmsearch"),
+        filter_scores_seam_available=None,
     )
+    if postfilter_available is not None:
+        api.filter_scores_seam_available = mock.Mock(
+            name="filter_scores_seam_available",
+            return_value=postfilter_available,
+        )
+        pipeline_module._filter_scores_seam_available = (
+            api.filter_scores_seam_available
+        )
     package.SequenceBatch = api.SequenceBatch
     package.load_pressed_profiles = api.load_pressed_profiles
     package.astra_search = astra_search_module
+    package._pipeline = pipeline_module
     astra_search_module.hmmsearch = api.gpu_hmmsearch
     manifest_module.validate_pressed_manifest = api.validate_pressed_manifest
     return (
@@ -101,6 +112,7 @@ def synthetic_plan7_gpu():
             "plan7_gpu": package,
             "plan7_gpu.astra_search": astra_search_module,
             "plan7_gpu.pressed_manifest": manifest_module,
+            "plan7_gpu._pipeline": pipeline_module,
         },
         api,
     )
@@ -366,6 +378,78 @@ class BulkDispatchTests(unittest.TestCase):
             ],
         )
 
+    def test_exact_postfilter_mode_reaches_a_nonempty_gpu_chunk(self):
+        pair = SimpleNamespace(
+            cutoffs=SimpleNamespace(gathering=None, noise=None, trusted=None)
+        )
+        batch = object()
+        modules, api = synthetic_plan7_gpu()
+        api.gpu_hmmsearch.return_value = iter(())
+        with tempfile.TemporaryDirectory(prefix="astra-gpu-postfilter-") as temporary:
+            with mock.patch.dict(sys.modules, modules):
+                search.hmmsearch(
+                    {},
+                    [pair],
+                    1,
+                    search_options(temporary),
+                    all_sequences=[object()],
+                    gpu_sequence_batch=batch,
+                    gpu_postfilter=True,
+                )
+
+        api.gpu_hmmsearch.assert_called_once_with(
+            [pair], batch, cpus=1, postfilter=True
+        )
+
+
+class GPUPostfilterSelectionTests(unittest.TestCase):
+    def test_preflight_selects_live_seam_and_safely_falls_back_when_absent(self):
+        with tempfile.TemporaryDirectory(prefix="astra-gpu-mode-") as temporary:
+            root = Path(temporary)
+            db_dir = root / "GPUDB"
+            db_dir.mkdir()
+            pressed_base = make_pressed_members(db_dir, "profiles")
+            config = {
+                "db_urls": [
+                    {
+                        "name": "GPUDB",
+                        "installed": True,
+                        "installation_dir": os.fspath(db_dir),
+                        "molecule_type": "protein",
+                    }
+                ]
+            }
+
+            for available, expected in (
+                (True, True),
+                (False, False),
+                (None, False),
+            ):
+                with self.subTest(seam_available=available):
+                    modules, api = synthetic_plan7_gpu(available)
+                    pair = object()
+                    batch = object()
+                    api.load_pressed_profiles.return_value = (pair,)
+                    api.SequenceBatch.return_value = batch
+                    with mock.patch.dict(sys.modules, modules):
+                        databases, observed_batch, postfilter = (
+                            search.preflight_gpu_databases(
+                                {"GPUDB": "manifest.json"},
+                                ["GPUDB"],
+                                config,
+                                [object()],
+                            )
+                        )
+
+                    self.assertEqual(
+                        databases,
+                        {"GPUDB": (pressed_base.resolve(), (pair,))},
+                    )
+                    self.assertIs(observed_batch, batch)
+                    self.assertIs(postfilter, expected)
+                    if available is not None:
+                        api.filter_scores_seam_available.assert_called_once_with()
+
 
 class InstalledGPUSelectionTests(unittest.TestCase):
     def test_only_mapped_installed_databases_use_one_reused_gpu_batch(self):
@@ -402,7 +486,7 @@ class InstalledGPUSelectionTests(unittest.TestCase):
             fake_batch = mock.Mock(name="shared_sequence_batch")
             pair_one = object()
             pair_two = object()
-            modules, api = synthetic_plan7_gpu()
+            modules, api = synthetic_plan7_gpu(True)
             api.SequenceBatch.return_value = fake_batch
             api.load_pressed_profiles.side_effect = [(pair_one,), (pair_two,)]
 
@@ -455,9 +539,12 @@ class InstalledGPUSelectionTests(unittest.TestCase):
             self.assertIs(
                 run.call_args_list[2].kwargs["gpu_sequence_batch"], fake_batch
             )
+            self.assertIs(run.call_args_list[2].kwargs["gpu_postfilter"], True)
             self.assertIs(
                 run.call_args_list[3].kwargs["gpu_sequence_batch"], fake_batch
             )
+            self.assertIs(run.call_args_list[3].kwargs["gpu_postfilter"], True)
+            api.filter_scores_seam_available.assert_called_once_with()
 
     def test_explicit_gpu_error_propagates_without_cpu_fallback_and_closes_batch(self):
         with tempfile.TemporaryDirectory(prefix="astra-gpu-error-") as temporary:
