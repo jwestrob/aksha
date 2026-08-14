@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 import pyhmmer
@@ -74,6 +74,34 @@ def make_pressed_members(directory, base_name):
     for suffix in search.PRESSED_SUFFIXES:
         Path(f"{base}.{suffix}").touch()
     return base
+
+
+def synthetic_plan7_gpu():
+    """Return optional-package modules suitable for CPU-only wiring tests."""
+    package = ModuleType("plan7_gpu")
+    package.__path__ = []
+    astra_search_module = ModuleType("plan7_gpu.astra_search")
+    manifest_module = ModuleType("plan7_gpu.pressed_manifest")
+
+    api = SimpleNamespace(
+        SequenceBatch=mock.Mock(name="SequenceBatch"),
+        load_pressed_profiles=mock.Mock(name="load_pressed_profiles"),
+        validate_pressed_manifest=mock.Mock(name="validate_pressed_manifest"),
+        gpu_hmmsearch=mock.Mock(name="gpu_hmmsearch"),
+    )
+    package.SequenceBatch = api.SequenceBatch
+    package.load_pressed_profiles = api.load_pressed_profiles
+    package.astra_search = astra_search_module
+    astra_search_module.hmmsearch = api.gpu_hmmsearch
+    manifest_module.validate_pressed_manifest = api.validate_pressed_manifest
+    return (
+        {
+            "plan7_gpu": package,
+            "plan7_gpu.astra_search": astra_search_module,
+            "plan7_gpu.pressed_manifest": manifest_module,
+        },
+        api,
+    )
 
 
 class GPUConfigurationTests(unittest.TestCase):
@@ -206,7 +234,46 @@ class GPUConfigurationTests(unittest.TestCase):
         self.assertEqual(search.gpu_hmm_chunk_size(50_001), 1999)
         self.assertEqual(search.gpu_hmm_chunk_size(1_800_000), 55)
         self.assertEqual(search.gpu_hmm_chunk_size(100_000_000), 1)
-        self.assertEqual(search.gpu_hmm_chunk_size(100_000_001), 1)
+        with self.assertRaisesRegex(search.GPUConfigurationError, "at most"):
+            search.gpu_hmm_chunk_size(100_000_001)
+
+    def test_oversized_gpu_target_set_is_rejected_before_preflight_or_output(self):
+        with tempfile.TemporaryDirectory(prefix="astra-gpu-cap-") as temporary:
+            root = Path(temporary)
+            outdir = root / "out"
+            config = {
+                "db_urls": [
+                    {
+                        "name": "GPUDB",
+                        "installed": True,
+                        "installation_dir": os.fspath(root / "GPUDB"),
+                        "molecule_type": "protein",
+                    }
+                ]
+            }
+            args = search_args(
+                outdir,
+                installed_hmms="GPUDB",
+                gpu_manifest=["GPUDB=manifest.json"],
+            )
+
+            with (
+                mock.patch.object(search, "GPU_CELL_CAP", 1),
+                mock.patch.object(
+                    search.initialize, "load_config", return_value=config
+                ),
+                mock.patch.object(
+                    search,
+                    "parse_protein_input",
+                    return_value={"proteins.faa": [object(), object()]},
+                ),
+                mock.patch.object(search, "preflight_gpu_databases") as preflight,
+            ):
+                with self.assertRaisesRegex(search.GPUConfigurationError, "at most"):
+                    search.main(args)
+
+            preflight.assert_not_called()
+            self.assertFalse(outdir.exists())
 
 
 class CPUPathTests(unittest.TestCase):
@@ -246,8 +313,6 @@ class CPUPathTests(unittest.TestCase):
 
 class BulkDispatchTests(unittest.TestCase):
     def test_gpu_groups_whole_pairs_and_applies_cell_capped_chunks_in_order(self):
-        from plan7_gpu import astra_search
-
         def pair(cutoff):
             cutoffs = {"gathering": None, "noise": None, "trusted": None}
             if cutoff is not None:
@@ -264,14 +329,12 @@ class BulkDispatchTests(unittest.TestCase):
             pair("gathering"),
         ]
         targets = [object(), object()]
+        modules, api = synthetic_plan7_gpu()
+        api.gpu_hmmsearch.side_effect = lambda *args, **kwargs: iter(())
         with tempfile.TemporaryDirectory(prefix="astra-gpu-dispatch-") as temporary:
             with (
+                mock.patch.dict(sys.modules, modules),
                 mock.patch.object(search, "GPU_CELL_CAP", 5),
-                mock.patch.object(
-                    astra_search,
-                    "hmmsearch",
-                    side_effect=lambda *args, **kwargs: iter(()),
-                ) as gpu_search,
             ):
                 search.hmmsearch(
                     {},
@@ -283,7 +346,7 @@ class BulkDispatchTests(unittest.TestCase):
                 )
 
         self.assertEqual(
-            [call.args[0] for call in gpu_search.call_args_list],
+            [call.args[0] for call in api.gpu_hmmsearch.call_args_list],
             [
                 [pairs[0], pairs[2]],
                 [pairs[4], pairs[6]],
@@ -292,7 +355,7 @@ class BulkDispatchTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            [call.kwargs for call in gpu_search.call_args_list],
+            [call.kwargs for call in api.gpu_hmmsearch.call_args_list],
             [
                 {"cpus": 2, "bit_cutoffs": "gathering"},
                 {"cpus": 2, "bit_cutoffs": "gathering"},
@@ -304,9 +367,6 @@ class BulkDispatchTests(unittest.TestCase):
 
 class InstalledGPUSelectionTests(unittest.TestCase):
     def test_only_mapped_installed_databases_use_one_reused_gpu_batch(self):
-        from plan7_gpu import SequenceBatch, load_pressed_profiles
-
-        del SequenceBatch, load_pressed_profiles
         with tempfile.TemporaryDirectory(prefix="astra-selection-") as temporary:
             root = Path(temporary)
             cpu_dir = root / "CPUDB"
@@ -340,8 +400,12 @@ class InstalledGPUSelectionTests(unittest.TestCase):
             fake_batch = mock.Mock(name="shared_sequence_batch")
             pair_one = object()
             pair_two = object()
+            modules, api = synthetic_plan7_gpu()
+            api.SequenceBatch.return_value = fake_batch
+            api.load_pressed_profiles.side_effect = [(pair_one,), (pair_two,)]
 
             with (
+                mock.patch.dict(sys.modules, modules),
                 mock.patch.object(
                     search.initialize, "load_config", return_value=config
                 ),
@@ -360,16 +424,6 @@ class InstalledGPUSelectionTests(unittest.TestCase):
                 ) as run,
                 mock.patch.object(search, "combine_results"),
                 mock.patch.object(search, "cleanup_temp_files"),
-                mock.patch(
-                    "plan7_gpu.SequenceBatch", return_value=fake_batch
-                ) as batch_type,
-                mock.patch(
-                    "plan7_gpu.pressed_manifest.validate_pressed_manifest"
-                ) as validate_manifest,
-                mock.patch(
-                    "plan7_gpu.load_pressed_profiles",
-                    side_effect=[(pair_one,), (pair_two,)],
-                ) as load_pairs,
             ):
                 search.main(args)
 
@@ -377,17 +431,17 @@ class InstalledGPUSelectionTests(unittest.TestCase):
                 [call.args[0] for call in parse_hmms.call_args_list],
                 ["user.hmm", os.fspath(cpu_dir)],
             )
-            batch_type.assert_called_once()
+            api.SequenceBatch.assert_called_once()
             fake_batch.close.assert_called_once_with()
             self.assertEqual(
-                validate_manifest.call_args_list,
+                api.validate_pressed_manifest.call_args_list,
                 [
                     mock.call(gpu_one_base.resolve(), "one.json"),
                     mock.call(gpu_two_base.resolve(), "two.json"),
                 ],
             )
             self.assertEqual(
-                load_pairs.call_args_list,
+                api.load_pressed_profiles.call_args_list,
                 [
                     mock.call(gpu_one_base.resolve(), manifest="one.json"),
                     mock.call(gpu_two_base.resolve(), manifest="two.json"),
@@ -404,9 +458,6 @@ class InstalledGPUSelectionTests(unittest.TestCase):
             )
 
     def test_explicit_gpu_error_propagates_without_cpu_fallback_and_closes_batch(self):
-        from plan7_gpu import SequenceBatch, load_pressed_profiles
-
-        del SequenceBatch, load_pressed_profiles
         with tempfile.TemporaryDirectory(prefix="astra-gpu-error-") as temporary:
             root = Path(temporary)
             gpu_dir = root / "GPUDB"
@@ -428,8 +479,12 @@ class InstalledGPUSelectionTests(unittest.TestCase):
                 gpu_manifest=["GPUDB=manifest.json"],
             )
             fake_batch = mock.Mock(name="sequence_batch")
+            modules, api = synthetic_plan7_gpu()
+            api.SequenceBatch.return_value = fake_batch
+            api.load_pressed_profiles.return_value = (object(),)
 
             with (
+                mock.patch.dict(sys.modules, modules),
                 mock.patch.object(
                     search.initialize, "load_config", return_value=config
                 ),
@@ -439,9 +494,6 @@ class InstalledGPUSelectionTests(unittest.TestCase):
                     return_value={"proteins.faa": [object()]},
                 ),
                 mock.patch.object(search, "parse_hmms") as cpu_parser,
-                mock.patch("plan7_gpu.SequenceBatch", return_value=fake_batch),
-                mock.patch("plan7_gpu.pressed_manifest.validate_pressed_manifest"),
-                mock.patch("plan7_gpu.load_pressed_profiles", return_value=(object(),)),
                 mock.patch.object(
                     search, "hmmsearch", side_effect=RuntimeError("GPU failed")
                 ),
@@ -452,10 +504,74 @@ class InstalledGPUSelectionTests(unittest.TestCase):
             cpu_parser.assert_not_called()
             fake_batch.close.assert_called_once_with()
 
-    def test_manifest_error_propagates_without_batch_creation_or_cpu_fallback(self):
-        from plan7_gpu import SequenceBatch, load_pressed_profiles
+    def test_second_profile_load_fails_before_first_search_or_publish(self):
+        with tempfile.TemporaryDirectory(prefix="astra-gpu-preload-") as temporary:
+            root = Path(temporary)
+            config = {"db_urls": []}
+            bases = {}
+            for name in ("GPU1", "GPU2"):
+                directory = root / name
+                directory.mkdir()
+                bases[name] = make_pressed_members(directory, name)
+                config["db_urls"].append(
+                    {
+                        "name": name,
+                        "installed": True,
+                        "installation_dir": os.fspath(directory),
+                        "molecule_type": "protein",
+                    }
+                )
+            outdir = root / "out"
+            args = search_args(
+                outdir,
+                hmm_in="user.hmm",
+                installed_hmms="GPU1,GPU2",
+                gpu_manifest=["GPU1=one.json", "GPU2=two.json"],
+            )
+            modules, api = synthetic_plan7_gpu()
+            api.load_pressed_profiles.side_effect = [
+                (object(),),
+                RuntimeError("second profile load failed"),
+            ]
 
-        del SequenceBatch, load_pressed_profiles
+            with (
+                mock.patch.dict(sys.modules, modules),
+                mock.patch.object(
+                    search.initialize, "load_config", return_value=config
+                ),
+                mock.patch.object(
+                    search,
+                    "parse_protein_input",
+                    return_value={"proteins.faa": [object()]},
+                ),
+                mock.patch.object(search, "parse_hmms") as cpu_parser,
+                mock.patch.object(search, "hmmsearch") as run_search,
+                mock.patch.object(search, "combine_results") as publish,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "second profile load failed"):
+                    search.main(args)
+
+            self.assertEqual(
+                api.validate_pressed_manifest.call_args_list,
+                [
+                    mock.call(bases["GPU1"].resolve(), "one.json"),
+                    mock.call(bases["GPU2"].resolve(), "two.json"),
+                ],
+            )
+            self.assertEqual(
+                api.load_pressed_profiles.call_args_list,
+                [
+                    mock.call(bases["GPU1"].resolve(), manifest="one.json"),
+                    mock.call(bases["GPU2"].resolve(), manifest="two.json"),
+                ],
+            )
+            api.SequenceBatch.assert_not_called()
+            cpu_parser.assert_not_called()
+            run_search.assert_not_called()
+            publish.assert_not_called()
+            self.assertFalse(outdir.exists())
+
+    def test_manifest_error_propagates_without_batch_creation_or_cpu_fallback(self):
         with tempfile.TemporaryDirectory(prefix="astra-manifest-error-") as temporary:
             root = Path(temporary)
             gpu_dir = root / "GPUDB"
@@ -477,8 +593,11 @@ class InstalledGPUSelectionTests(unittest.TestCase):
                 installed_hmms="GPUDB",
                 gpu_manifest=["GPUDB=manifest.json"],
             )
+            modules, api = synthetic_plan7_gpu()
+            api.validate_pressed_manifest.side_effect = ValueError("manifest invalid")
 
             with (
+                mock.patch.dict(sys.modules, modules),
                 mock.patch.object(
                     search.initialize, "load_config", return_value=config
                 ),
@@ -488,20 +607,14 @@ class InstalledGPUSelectionTests(unittest.TestCase):
                     return_value={"proteins.faa": [object()]},
                 ),
                 mock.patch.object(search, "parse_hmms") as cpu_parser,
-                mock.patch("plan7_gpu.SequenceBatch") as batch_type,
-                mock.patch(
-                    "plan7_gpu.pressed_manifest.validate_pressed_manifest",
-                    side_effect=ValueError("manifest invalid"),
-                ),
-                mock.patch("plan7_gpu.load_pressed_profiles") as load_pairs,
                 mock.patch.object(search, "hmmsearch") as run_search,
             ):
                 with self.assertRaisesRegex(ValueError, "manifest invalid"):
                     search.main(args)
 
             cpu_parser.assert_not_called()
-            batch_type.assert_not_called()
-            load_pairs.assert_not_called()
+            api.SequenceBatch.assert_not_called()
+            api.load_pressed_profiles.assert_not_called()
             run_search.assert_not_called()
 
 

@@ -24,6 +24,11 @@ class GPUConfigurationError(ValueError):
 
 def gpu_hmm_chunk_size(sequence_count):
     """Bound one GPU candidate matrix while retaining Astra's 2,000-HMM cap."""
+    if sequence_count > GPU_CELL_CAP:
+        raise GPUConfigurationError(
+            f"explicit GPU search supports at most {GPU_CELL_CAP:,} targets; "
+            f"received {sequence_count:,}"
+        )
     return min(
         HMM_CHUNK_SIZE,
         max(1, GPU_CELL_CAP // max(1, sequence_count)),
@@ -148,14 +153,14 @@ def validate_gpu_configuration(mappings, installed_hmm_names, parsed_json,
 
 def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
                             all_sequences):
-    """Authenticate every mapped database and initialize one target batch."""
+    """Load every attested mapped database and initialize one target batch."""
     if not mappings:
         return {}, None
 
-    from plan7_gpu import SequenceBatch
+    from plan7_gpu import SequenceBatch, load_pressed_profiles
     from plan7_gpu.pressed_manifest import validate_pressed_manifest
 
-    databases = {}
+    database_specs = {}
     for db_name in installed_hmm_names:
         manifest_path = mappings.get(db_name)
         if manifest_path is None:
@@ -165,7 +170,14 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
         )
         pressed_base = discover_pressed_base(database['installation_dir'])
         validate_pressed_manifest(pressed_base, manifest_path)
-        databases[db_name] = (pressed_base, manifest_path)
+        database_specs[db_name] = (pressed_base, manifest_path)
+
+    databases = {}
+    for db_name, (pressed_base, manifest_path) in database_specs.items():
+        databases[db_name] = (
+            pressed_base,
+            load_pressed_profiles(pressed_base, manifest=manifest_path),
+        )
 
     batch = SequenceBatch(
         all_sequences,
@@ -898,19 +910,6 @@ def main(args):
             getattr(args, 'write_macsyfinder', False),
         )
 
-    if not os.path.exists(outdir):
-        os.makedirs(outdir)
-        if args.write_seqs:
-            os.makedirs(os.path.join(outdir, 'fastas'))
-
-    # Create temporary directory for results
-    tmp_results_dir = os.path.join(outdir, 'tmp_results')
-    os.makedirs(tmp_results_dir, exist_ok=True)
-
-    logging.basicConfig(filename=log_file_path, level=logging.INFO,
-                        format='%(asctime)s %(levelname)s: %(message)s',
-                        datefmt='%Y-%m-%d %H:%M:%S')
-
     hmmsearch_options = {
         "cascade": args.cascade,
         "cut_ga": args.cut_ga,
@@ -956,12 +955,35 @@ def main(args):
     gpu_databases = {}
     gpu_sequence_batch = None
     if gpu_manifests:
+        # This check must happen before constructing a CUDA SequenceBatch or
+        # creating any result path. With one HMM, a larger target set already
+        # exceeds the bounded profile-by-target candidate matrix.
+        gpu_hmm_chunk_size(len(all_sequences))
         gpu_databases, gpu_sequence_batch = preflight_gpu_databases(
             gpu_manifests,
             gpu_installed_hmm_names,
             gpu_parsed_json,
             all_sequences,
         )
+
+    try:
+        if not os.path.exists(outdir):
+            os.makedirs(outdir)
+            if args.write_seqs:
+                os.makedirs(os.path.join(outdir, 'fastas'))
+
+        # Create temporary directory for results only after every explicit GPU
+        # database and the shared target batch have completed preflight.
+        tmp_results_dir = os.path.join(outdir, 'tmp_results')
+        os.makedirs(tmp_results_dir, exist_ok=True)
+
+        logging.basicConfig(filename=log_file_path, level=logging.INFO,
+                            format='%(asctime)s %(levelname)s: %(message)s',
+                            datefmt='%Y-%m-%d %H:%M:%S')
+    except BaseException:
+        if gpu_sequence_batch is not None:
+            gpu_sequence_batch.close()
+        raise
 
     # MacSyFinder-compatible output directory (per-HMM hmmsearch text files)
     macsyfinder_dir = None
@@ -1020,14 +1042,9 @@ def main(args):
                             all_sequences=all_sequences,
                         )
                     else:
-                        from plan7_gpu import load_pressed_profiles
-
-                        pressed_base, manifest_path = gpu_databases[hmm_db]
+                        pressed_base, db_hmms = gpu_databases[hmm_db]
                         print(f"  GPU search for {hmm_db}: {pressed_base}")
                         logging.info(f"GPU search for {hmm_db}: {pressed_base}")
-                        db_hmms = load_pressed_profiles(
-                            pressed_base, manifest=manifest_path
-                        )
                         tmp_dir = hmmsearch(
                             protein_dict, db_hmms, args.threads, hmmsearch_options,
                             hmm_db, all_sequences=all_sequences,
