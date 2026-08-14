@@ -1042,7 +1042,7 @@ def main(args):
                             all_sequences=all_sequences,
                         )
                     else:
-                        pressed_base, db_hmms = gpu_databases[hmm_db]
+                        pressed_base, db_hmms = gpu_databases.pop(hmm_db)
                         print(f"  GPU search for {hmm_db}: {pressed_base}")
                         logging.info(f"GPU search for {hmm_db}: {pressed_base}")
                         tmp_dir = hmmsearch(

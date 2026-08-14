@@ -1,10 +1,12 @@
 import argparse
 import builtins
+import gc
 import importlib
 import os
 import sys
 import tempfile
 import unittest
+import weakref
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest import mock
@@ -503,6 +505,69 @@ class InstalledGPUSelectionTests(unittest.TestCase):
 
             cpu_parser.assert_not_called()
             fake_batch.close.assert_called_once_with()
+
+    def test_consumed_profile_tuple_is_released_before_next_database(self):
+        class Profile:
+            pass
+
+        with tempfile.TemporaryDirectory(prefix="astra-gpu-lifetime-") as temporary:
+            root = Path(temporary)
+            config = {"db_urls": []}
+            for name in ("GPU1", "GPU2"):
+                directory = root / name
+                directory.mkdir()
+                make_pressed_members(directory, name)
+                config["db_urls"].append(
+                    {
+                        "name": name,
+                        "installed": True,
+                        "installation_dir": os.fspath(directory),
+                        "molecule_type": "protein",
+                    }
+                )
+            args = search_args(
+                root / "out",
+                installed_hmms="GPU1,GPU2",
+                gpu_manifest=["GPU1=one.json", "GPU2=two.json"],
+            )
+            modules, api = synthetic_plan7_gpu()
+            api.SequenceBatch.return_value = mock.Mock(name="sequence_batch")
+            profile_refs = []
+            alive_at_search = {}
+
+            def load_profiles(*_args, **_kwargs):
+                profile = Profile()
+                profile_refs.append(weakref.ref(profile))
+                return (profile,)
+
+            def run_search(
+                _protein_dict, _hmms, _threads, _options, db_name, **_kwargs
+            ):
+                gc.collect()
+                alive_at_search[db_name] = tuple(
+                    reference() is not None for reference in profile_refs
+                )
+                return root / "tmp"
+
+            api.load_pressed_profiles.side_effect = load_profiles
+            with (
+                mock.patch.dict(sys.modules, modules),
+                mock.patch.object(
+                    search.initialize, "load_config", return_value=config
+                ),
+                mock.patch.object(
+                    search,
+                    "parse_protein_input",
+                    return_value={"proteins.faa": [object()]},
+                ),
+                mock.patch.object(search, "hmmsearch", new=run_search),
+                mock.patch.object(search, "combine_results"),
+                mock.patch.object(search, "cleanup_temp_files"),
+            ):
+                search.main(args)
+
+            self.assertEqual(alive_at_search["GPU1"], (True, True))
+            self.assertEqual(alive_at_search["GPU2"], (False, True))
 
     def test_second_profile_load_fails_before_first_search_or_publish(self):
         with tempfile.TemporaryDirectory(prefix="astra-gpu-preload-") as temporary:
