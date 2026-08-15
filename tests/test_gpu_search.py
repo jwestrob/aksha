@@ -596,7 +596,12 @@ class GPUProfileOverlapTests(unittest.TestCase):
 
         class Session:
             closed = False
-            statistics = {"worker_count": 0, "host_bytes": 1234}
+            statistics = {
+                "worker_count": 0,
+                "build_worker_count": 3,
+                "selection_worker_count": 0,
+                "host_bytes": 1234,
+            }
 
             def __len__(self):
                 return len(pairs)
@@ -708,6 +713,8 @@ class GPUProfileOverlapTests(unittest.TestCase):
         snapshot = metrics.snapshot()
         self.assertEqual(snapshot["requested_thread_count"], 3)
         self.assertEqual(snapshot["profile_worker_count"], 0)
+        self.assertEqual(snapshot["profile_build_worker_count"], 3)
+        self.assertEqual(snapshot["profile_selection_worker_count"], 0)
         self.assertEqual(snapshot["producer_slot_count"], 1)
         self.assertEqual(snapshot["continuation_worker_count"], 2)
         self.assertTrue(snapshot["profile_overlap_enabled"])
@@ -786,12 +793,17 @@ class GPUProfileOverlapTests(unittest.TestCase):
         self.assertEqual(snapshot["continuation_worker_count"], 1)
         self.assertFalse(snapshot["profile_overlap_enabled"])
 
-    def test_profile_pack_workers_cannot_exceed_cli_budget(self):
+    def test_profile_selection_workers_must_be_zero_during_search(self):
         pair = self.pair()
 
         class Session:
             closed = False
-            statistics = {"worker_count": 2, "host_bytes": 1234}
+            statistics = {
+                "worker_count": 1,
+                "build_worker_count": 3,
+                "selection_worker_count": 1,
+                "host_bytes": 1234,
+            }
 
             def __len__(self):
                 return 1
@@ -800,14 +812,17 @@ class GPUProfileOverlapTests(unittest.TestCase):
             def _postfilter_forward_selection(self, *_args):
                 raise AssertionError("generation reached")
 
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-pack-budget-") as temporary:
+        with tempfile.TemporaryDirectory(
+            prefix="astra-gpu-selection-budget-"
+        ) as temporary:
             with self.assertRaisesRegex(
-                search.GPUConfigurationError, "pack workers exceed"
+                search.GPUConfigurationError,
+                "require zero persistent selection workers",
             ):
                 search.hmmsearch(
                     {},
                     [pair],
-                    1,
+                    3,
                     search_options(temporary),
                     all_sequences=[object()],
                     gpu_sequence_batch=Batch(),
@@ -961,6 +976,8 @@ class GPUProfileOverlapTests(unittest.TestCase):
         snapshot = metrics.snapshot()
         self.assertEqual(snapshot["requested_thread_count"], 3)
         self.assertEqual(snapshot["profile_worker_count"], 0)
+        self.assertEqual(snapshot["profile_build_worker_count"], 0)
+        self.assertEqual(snapshot["profile_selection_worker_count"], 0)
         self.assertEqual(snapshot["producer_slot_count"], 1)
         self.assertEqual(snapshot["continuation_worker_count"], 2)
         self.assertFalse(snapshot["profile_overlap_enabled"])
@@ -1215,7 +1232,7 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
                         api.forward_scores_seam_available.assert_called_once_with()
                     if session_expected:
                         api.ProfileSession.assert_called_once_with(
-                            (pair,), pack_workers=0
+                            (pair,), build_workers=1, selection_workers=0
                         )
                     else:
                         api.ProfileSession.assert_not_called()
@@ -1260,7 +1277,7 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
             self.assertTrue(postfilter)
             api.ProfileSession.assert_not_called()
 
-    def test_session_path_uses_zero_pack_workers_with_small_budget(self):
+    def test_session_path_splits_build_and_selection_workers(self):
         with tempfile.TemporaryDirectory(prefix="astra-gpu-budget-") as temporary:
             root = Path(temporary)
             db_dir = root / "GPUDB"
@@ -1302,7 +1319,7 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
             )
             self.assertTrue(postfilter)
             api.ProfileSession.assert_called_once_with(
-                pairs, pack_workers=0
+                pairs, build_workers=2, selection_workers=0
             )
 
     def test_later_session_failure_closes_prior_session_and_target_batch(self):
@@ -1350,8 +1367,12 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
             self.assertEqual(
                 api.ProfileSession.call_args_list,
                 [
-                    mock.call((first_pair,), pack_workers=0),
-                    mock.call((second_pair,), pack_workers=0),
+                    mock.call(
+                        (first_pair,), build_workers=1, selection_workers=0
+                    ),
+                    mock.call(
+                        (second_pair,), build_workers=1, selection_workers=0
+                    ),
                 ],
             )
 
@@ -1893,7 +1914,9 @@ class GPUParityTests(unittest.TestCase):
                     )
                 metrics = search.GPUOverlapMetrics()
                 with ProfileSession(
-                    self.gpu_pairs, pack_workers=0
+                    self.gpu_pairs,
+                    build_workers=threads,
+                    selection_workers=0,
                 ) as raw_session:
                     session = RecordingSession(raw_session)
                     with SequenceBatch(self.targets) as batch:
@@ -1939,6 +1962,12 @@ class GPUParityTests(unittest.TestCase):
                 ))
                 snapshot = metrics.snapshot()
                 self.assertEqual(snapshot["profile_worker_count"], 0)
+                self.assertEqual(
+                    snapshot["profile_build_worker_count"], threads
+                )
+                self.assertEqual(
+                    snapshot["profile_selection_worker_count"], 0
+                )
                 self.assertEqual(snapshot["requested_thread_count"], threads)
                 self.assertEqual(
                     snapshot["continuation_worker_count"], 1

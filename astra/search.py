@@ -30,6 +30,8 @@ class GPUOverlapMetrics:
     def __init__(self):
         self.requested_thread_count = 0
         self.profile_worker_count = 0
+        self.profile_build_worker_count = 0
+        self.profile_selection_worker_count = 0
         self.producer_slot_count = 0
         self.continuation_worker_count = 0
         self.profile_overlap_enabled = False
@@ -55,6 +57,10 @@ class GPUOverlapMetrics:
         return {
             'requested_thread_count': self.requested_thread_count,
             'profile_worker_count': self.profile_worker_count,
+            'profile_build_worker_count': self.profile_build_worker_count,
+            'profile_selection_worker_count': (
+                self.profile_selection_worker_count
+            ),
             'producer_slot_count': self.producer_slot_count,
             'continuation_worker_count': self.continuation_worker_count,
             'profile_overlap_enabled': self.profile_overlap_enabled,
@@ -276,8 +282,9 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
         # A fresh producer thread begins on CUDA ordinal 0. Until plan7_gpu
         # exposes a scoped device bind, keep nonzero batches on the existing
         # same-thread path instead of creating an unusable ProfileSession.
-        # Zero pack workers keeps eager multi-database sessions threadless;
-        # selections copy synchronously before CPU continuation begins.
+        # Build workers retire before ProfileSession returns. Keeping the
+        # persistent selection pool at zero makes eager multi-database
+        # sessions threadless and selections synchronous before continuation.
         session_supported = (
             postfilter
             and gpu_profile_forward_available()
@@ -291,7 +298,11 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
                 if not pairs:
                     continue
                 session_started = time.perf_counter()
-                session = ProfileSession(pairs, pack_workers=0)
+                session = ProfileSession(
+                    pairs,
+                    build_workers=threads,
+                    selection_workers=0,
+                )
                 databases[db_name] = (
                     pressed_base,
                     pairs,
@@ -552,6 +563,12 @@ def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
         statistics = profile_session.statistics
         gpu_metrics.chunk_count += len(chunks)
         gpu_metrics.profile_worker_count = statistics['worker_count']
+        gpu_metrics.profile_build_worker_count = statistics.get(
+            'build_worker_count', statistics['worker_count']
+        )
+        gpu_metrics.profile_selection_worker_count = statistics.get(
+            'selection_worker_count', statistics['worker_count']
+        )
         gpu_metrics.profile_host_bytes = statistics['host_bytes']
     pipeline_started = time.perf_counter()
     try:
@@ -611,6 +628,12 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
         statistics = profile_session.statistics
         gpu_metrics.chunk_count += len(chunks)
         gpu_metrics.profile_worker_count = statistics['worker_count']
+        gpu_metrics.profile_build_worker_count = statistics.get(
+            'build_worker_count', statistics['worker_count']
+        )
+        gpu_metrics.profile_selection_worker_count = statistics.get(
+            'selection_worker_count', statistics['worker_count']
+        )
         gpu_metrics.profile_host_bytes = statistics['host_bytes']
 
     def generate(spec, selection):
@@ -783,10 +806,14 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
             producer_slots,
             continuation_threads,
         ) = gpu_profile_worker_allocation(threads, gpu_profile_overlap)
-        profile_workers = gpu_profile_session.statistics['worker_count']
-        if profile_workers > threads:
+        statistics = gpu_profile_session.statistics
+        selection_workers = statistics.get(
+            'selection_worker_count', statistics['worker_count']
+        )
+        if selection_workers:
             raise GPUConfigurationError(
-                "GPU profile pack workers exceed the requested compute-worker budget"
+                "GPU profile sessions require zero persistent selection "
+                "workers"
             )
         if gpu_metrics is not None:
             gpu_metrics.requested_thread_count = threads
@@ -1621,7 +1648,10 @@ def main(args):
                                 timing = db_metrics.snapshot()
                                 timing_line = (
                                     f"  GPU-through-Forward {scheduling} timing: "
-                                    f"worker-slots=pack:{timing['profile_worker_count']}"
+                                    f"phase-workers=build:"
+                                    f"{timing['profile_build_worker_count']}, "
+                                    f"search=selection:"
+                                    f"{timing['profile_selection_worker_count']}"
                                     f"/producer:{timing['producer_slot_count']}"
                                     f"/continuation:"
                                     f"{timing['continuation_worker_count']}"
