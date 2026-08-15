@@ -28,7 +28,11 @@ class GPUOverlapMetrics:
     """Opt-in counters for the bounded profile-generation pipeline."""
 
     def __init__(self):
+        self.requested_thread_count = 0
         self.profile_worker_count = 0
+        self.producer_slot_count = 0
+        self.continuation_worker_count = 0
+        self.profile_overlap_enabled = False
         self.profile_host_bytes = 0
         self.chunk_count = 0
         self.generated_chunk_count = 0
@@ -49,7 +53,11 @@ class GPUOverlapMetrics:
 
     def snapshot(self):
         return {
+            'requested_thread_count': self.requested_thread_count,
             'profile_worker_count': self.profile_worker_count,
+            'producer_slot_count': self.producer_slot_count,
+            'continuation_worker_count': self.continuation_worker_count,
+            'profile_overlap_enabled': self.profile_overlap_enabled,
             'profile_host_bytes': self.profile_host_bytes,
             'chunk_count': self.chunk_count,
             'generated_chunk_count': self.generated_chunk_count,
@@ -81,6 +89,24 @@ def gpu_hmm_chunk_size(sequence_count):
         HMM_CHUNK_SIZE,
         max(1, GPU_CELL_CAP // max(1, sequence_count)),
     )
+
+
+def gpu_profile_worker_allocation(threads, overlap_requested):
+    """Return overlap and compute-worker slots under Astra's CLI convention.
+
+    ``--threads`` counts compute/search workers, as in Astra's CPU path; the
+    common main writer is excluded. Serial control reserves the same producer
+    slot as overlap so the continuation width remains identical.
+    """
+    if isinstance(threads, bool) or not isinstance(threads, int) or threads <= 0:
+        raise GPUConfigurationError(
+            "GPU profile sessions require a positive integer compute-worker budget"
+        )
+    if type(overlap_requested) is not bool:
+        raise TypeError("overlap_requested must be bool")
+    producer_slots = int(threads >= 2)
+    overlap_enabled = overlap_requested and bool(producer_slots)
+    return overlap_enabled, producer_slots, threads - producer_slots
 
 
 def parse_gpu_manifest_mappings(entries):
@@ -250,16 +276,22 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
         # A fresh producer thread begins on CUDA ordinal 0. Until plan7_gpu
         # exposes a scoped device bind, keep nonzero batches on the existing
         # same-thread path instead of creating an unusable ProfileSession.
-        overlap_supported = (
+        # Zero pack workers keeps eager multi-database sessions threadless;
+        # selections copy synchronously before CPU continuation begins.
+        session_supported = (
             postfilter
+            and gpu_profile_forward_available()
             and batch.memory_snapshot['device_ordinal'] == 0
+            and callable(
+                getattr(batch, '_postfilter_forward_selection', None)
+            )
         )
-        if overlap_supported:
+        if session_supported:
             for db_name, (pressed_base, pairs, _) in tuple(databases.items()):
-                if not pairs or threads < min(16, len(pairs)):
+                if not pairs:
                     continue
                 session_started = time.perf_counter()
-                session = ProfileSession(pairs)
+                session = ProfileSession(pairs, pack_workers=0)
                 databases[db_name] = (
                     pressed_base,
                     pairs,
@@ -295,6 +327,20 @@ def gpu_postfilter_available():
 
     probe = getattr(_pipeline, '_filter_scores_seam_available', None)
     return callable(probe) and probe() is True
+
+
+def gpu_profile_forward_available():
+    """Return whether selection generation can include exact CUDA Forward."""
+    from plan7_gpu import SequenceBatch, _pipeline
+
+    probe = getattr(
+        _pipeline, '_filter_and_forward_scores_seam_available', None
+    )
+    return (
+        callable(probe)
+        and probe() is True
+        and hasattr(SequenceBatch, '_postfilter_forward_selection')
+    )
 
 
 def has_thresholds(x):
@@ -486,9 +532,20 @@ def _consume_gpu_candidate_chunk(spec, candidates, total_chunks, threads, fh,
     return started, finished
 
 
+def _generate_gpu_profile_candidates(sequence_batch, selection, kwargs):
+    """Run the same bounded CUDA stages as the live post-filter product path."""
+    return sequence_batch._postfilter_forward_selection(
+        selection,
+        kwargs.get('F1', 0.02),
+        kwargs.get('F2', 0.001),
+        kwargs.get('F3', 0.00001),
+        kwargs.get('bias_filter', True),
+    )
+
+
 def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
                             threads, fh, gpu_metrics=None):
-    """Run the ProfileSession stages serially as an overlap control."""
+    """Run sealed GPU-through-Forward generation as the serial control."""
     from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
 
     if gpu_metrics is not None:
@@ -507,9 +564,10 @@ def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
                 )
             generation_started = time.perf_counter()
             try:
-                candidates = sequence_batch.postfilter_selection(
+                candidates = _generate_gpu_profile_candidates(
+                    sequence_batch,
                     selection,
-                    F1=spec[3].get('F1', 0.02),
+                    spec[3],
                 )
             except BaseException:
                 try:
@@ -543,7 +601,7 @@ def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
 
 def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                               threads, fh, gpu_metrics=None):
-    """Overlap one generated CandidateBatch with one ordered CPU consumer."""
+    """Overlap one sealed GPU-through-Forward batch with one CPU consumer."""
     if not chunks:
         return
 
@@ -558,9 +616,10 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
     def generate(spec, selection):
         started = time.perf_counter()
         try:
-            candidates = sequence_batch.postfilter_selection(
+            candidates = _generate_gpu_profile_candidates(
+                sequence_batch,
                 selection,
-                F1=spec[3].get('F1', 0.02),
+                spec[3],
             )
         except BaseException:
             try:
@@ -571,6 +630,7 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
         selection.close()
         return candidates, started, time.perf_counter()
 
+    pipeline_started = time.perf_counter()
     executor = ThreadPoolExecutor(
         max_workers=1,
         thread_name_prefix='astra-gpu-generate',
@@ -578,8 +638,6 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
     pending_future = None
     pending_error = None
     pending_selection = None
-    pipeline_started = time.perf_counter()
-
     def start_generation(spec):
         selection_started = time.perf_counter()
         try:
@@ -640,8 +698,8 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                         0.0, overlap_finish - overlap_start
                     )
 
-            # Preselection happens before CPU continuation, so the session's
-            # native pack workers never contend with Astra's search workers.
+            # Preselection is synchronous and the session has zero pack
+            # workers, so its copy cannot contend with CPU continuation.
             # A prefetch failure is deferred until this ready chunk is emitted.
             if position + 1 < len(chunks):
                 (
@@ -717,6 +775,24 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
         raise TypeError("gpu_metrics must be GPUOverlapMetrics or None")
     if type(gpu_profile_overlap) is not bool:
         raise TypeError("gpu_profile_overlap must be bool")
+    profile_overlap_enabled = False
+    continuation_threads = threads
+    if gpu_profile_session is not None:
+        (
+            profile_overlap_enabled,
+            producer_slots,
+            continuation_threads,
+        ) = gpu_profile_worker_allocation(threads, gpu_profile_overlap)
+        profile_workers = gpu_profile_session.statistics['worker_count']
+        if profile_workers > threads:
+            raise GPUConfigurationError(
+                "GPU profile pack workers exceed the requested compute-worker budget"
+            )
+        if gpu_metrics is not None:
+            gpu_metrics.requested_thread_count = threads
+            gpu_metrics.producer_slot_count = producer_slots
+            gpu_metrics.continuation_worker_count = continuation_threads
+            gpu_metrics.profile_overlap_enabled = profile_overlap_enabled
 
     # Always write to temp files — bulk mode is faster and avoids
     # keeping huge result lists in memory.  The per-genome loop is
@@ -827,14 +903,14 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
             if gpu_profile_session is not None:
                 profile_runner = (
                     _run_gpu_profile_pipeline
-                    if gpu_profile_overlap
+                    if profile_overlap_enabled
                     else _run_gpu_profile_serial
                 )
                 profile_runner(
                     chunks,
                     gpu_profile_session,
                     gpu_sequence_batch,
-                    threads,
+                    continuation_threads,
                     fh,
                     gpu_metrics,
                 )
@@ -1489,19 +1565,27 @@ def main(args):
                             gpu_profile_session,
                         ) = gpu_databases[hmm_db]
                         try:
-                            gpu_profile_overlap = (
+                            gpu_profile_overlap_requested = (
                                 os.environ.get(GPU_SERIAL_ENV) != '1'
                             )
                             if gpu_profile_session is not None:
+                                gpu_profile_overlap, _, _ = (
+                                    gpu_profile_worker_allocation(
+                                        args.threads,
+                                        gpu_profile_overlap_requested,
+                                    )
+                                )
                                 scheduling = (
                                     "overlap" if gpu_profile_overlap else "serial"
                                 )
                                 gpu_mode = (
-                                    f"exact GPU-through-Viterbi {scheduling}"
+                                    f"exact GPU-through-Forward {scheduling}"
                                 )
                             elif gpu_postfilter:
+                                gpu_profile_overlap = False
                                 gpu_mode = "exact post-filter + Forward"
                             else:
+                                gpu_profile_overlap = False
                                 gpu_mode = "legacy SSV"
                             print(
                                 f"  GPU search for {hmm_db} ({gpu_mode}): "
@@ -1536,7 +1620,12 @@ def main(args):
                             ):
                                 timing = db_metrics.snapshot()
                                 timing_line = (
-                                    f"  GPU-through-Viterbi {scheduling} timing: "
+                                    f"  GPU-through-Forward {scheduling} timing: "
+                                    f"worker-slots=pack:{timing['profile_worker_count']}"
+                                    f"/producer:{timing['producer_slot_count']}"
+                                    f"/continuation:"
+                                    f"{timing['continuation_worker_count']}"
+                                    f"/{timing['requested_thread_count']}, "
                                     f"preflight={timing['preflight_seconds']:.3f}s, "
                                     f"selection={timing['selection_seconds']:.3f}s, "
                                     f"generation={timing['generation_seconds']:.3f}s, "
