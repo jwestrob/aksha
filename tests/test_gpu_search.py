@@ -5,6 +5,8 @@ import importlib
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import weakref
 from pathlib import Path
@@ -86,8 +88,11 @@ def synthetic_plan7_gpu(postfilter_available=None):
     manifest_module = ModuleType("plan7_gpu.pressed_manifest")
     pipeline_module = ModuleType("plan7_gpu._pipeline")
 
+    default_batch = mock.Mock(name="sequence_batch")
+    default_batch.memory_snapshot = {"device_ordinal": 0}
     api = SimpleNamespace(
-        SequenceBatch=mock.Mock(name="SequenceBatch"),
+        ProfileSession=mock.Mock(name="ProfileSession"),
+        SequenceBatch=mock.Mock(name="SequenceBatch", return_value=default_batch),
         load_pressed_profiles=mock.Mock(name="load_pressed_profiles"),
         validate_pressed_manifest=mock.Mock(name="validate_pressed_manifest"),
         gpu_hmmsearch=mock.Mock(name="gpu_hmmsearch"),
@@ -102,6 +107,7 @@ def synthetic_plan7_gpu(postfilter_available=None):
             api.filter_scores_seam_available
         )
     package.SequenceBatch = api.SequenceBatch
+    package.ProfileSession = api.ProfileSession
     package.load_pressed_profiles = api.load_pressed_profiles
     package.astra_search = astra_search_module
     package._pipeline = pipeline_module
@@ -528,6 +534,445 @@ class BulkDispatchTests(unittest.TestCase):
         )
 
 
+class GPUProfileOverlapTests(unittest.TestCase):
+    @staticmethod
+    def pair(cutoff=None):
+        cutoffs = {"gathering": None, "noise": None, "trusted": None}
+        if cutoff is not None:
+            cutoffs[cutoff] = (0.0, 0.0)
+        return SimpleNamespace(cutoffs=SimpleNamespace(**cutoffs))
+
+    def test_two_slots_overlap_in_order_with_noncontiguous_selection(self):
+        pairs = [self.pair("gathering"), self.pair(), self.pair("gathering")]
+        consumption_started = threading.Event()
+        second_generation_finished = threading.Event()
+        selection_calls = []
+        selections = []
+        generation_threads = []
+
+        class Selection:
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+                self.closed = False
+                self.close_count = 0
+
+            def close(self):
+                self.closed = True
+                self.close_count += 1
+
+        class Session:
+            closed = False
+            statistics = {"worker_count": 3, "host_bytes": 1234}
+
+            def __len__(self):
+                return len(pairs)
+
+            def select(self, indices):
+                self_outer.assertIs(
+                    threading.current_thread(), threading.main_thread()
+                )
+                self_outer.assertFalse(consumption_started.is_set())
+                selection_calls.append(tuple(indices))
+                selection = Selection(indices)
+                selections.append(selection)
+                return selection
+
+        class Batch:
+            def postfilter_selection(self, selection, F1):
+                generation_threads.append(threading.current_thread().name)
+                if selection.indices == (1,):
+                    self_outer.assertTrue(consumption_started.wait(2))
+                    time.sleep(0.03)
+                    second_generation_finished.set()
+                return SimpleNamespace(indices=selection.indices, F1=F1)
+
+        self_outer = self
+        modules, api = synthetic_plan7_gpu(True)
+        observed = []
+
+        def gpu_search(chunk, candidates, **kwargs):
+            def results():
+                if candidates.indices == (0, 2):
+                    consumption_started.set()
+                    self.assertTrue(second_generation_finished.wait(2))
+                for pair in chunk:
+                    yield (candidates.indices, pair, kwargs)
+
+            return results()
+
+        api.gpu_hmmsearch.side_effect = gpu_search
+        metrics = search.GPUOverlapMetrics()
+        pipeline_options = {
+            "bit_cutoffs": "gathering",
+            "F1": 0.03,
+            "F2": 0.004,
+            "F3": 0.00005,
+            "bias_filter": False,
+        }
+        with tempfile.TemporaryDirectory(prefix="astra-gpu-overlap-") as temporary:
+            with (
+                mock.patch.dict(sys.modules, modules),
+                mock.patch.object(search, "GPU_CELL_CAP", 4),
+                mock.patch.object(
+                    search, "define_kwargs", return_value=pipeline_options
+                ),
+                mock.patch.object(
+                    search,
+                    "process_hits_to_file",
+                    side_effect=lambda hits, _fh: observed.append(hits),
+                ),
+            ):
+                search.hmmsearch(
+                    {},
+                    pairs,
+                    3,
+                    search_options(temporary),
+                    all_sequences=[object(), object()],
+                    gpu_sequence_batch=Batch(),
+                    gpu_postfilter=True,
+                    gpu_profile_session=Session(),
+                    gpu_metrics=metrics,
+                )
+
+        self.assertEqual(selection_calls, [(0, 2), (1,)])
+        self.assertTrue(all(selection.closed for selection in selections))
+        self.assertTrue(all(selection.close_count == 1 for selection in selections))
+        self.assertEqual([item[0] for item in observed], [(0, 2), (0, 2), (1,)])
+        self.assertTrue(
+            all(name.startswith("astra-gpu-generate") for name in generation_threads)
+        )
+        self.assertEqual(
+            [call.args[0] for call in api.gpu_hmmsearch.call_args_list],
+            [[pairs[0], pairs[2]], [pairs[1]]],
+        )
+        for call in api.gpu_hmmsearch.call_args_list:
+            self.assertEqual(call.kwargs["F1"], 0.03)
+            self.assertEqual(call.kwargs["F2"], 0.004)
+            self.assertEqual(call.kwargs["F3"], 0.00005)
+            self.assertIs(call.kwargs["bias_filter"], False)
+            self.assertEqual(call.kwargs["cpus"], 3)
+            self.assertIs(call.kwargs["postfilter"], True)
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["profile_worker_count"], 3)
+        self.assertEqual(snapshot["chunk_count"], 2)
+        self.assertEqual(snapshot["generated_chunk_count"], 2)
+        self.assertEqual(snapshot["consumed_chunk_count"], 2)
+        self.assertGreater(snapshot["selection_seconds"], 0.0)
+        self.assertGreater(snapshot["overlap_seconds"], 0.01)
+        self.assertFalse(any(
+            thread.name.startswith("astra-gpu-generate")
+            for thread in threading.enumerate()
+        ))
+
+    def test_prefetch_selection_failure_is_deferred_until_ready_output(self):
+        pairs = [self.pair(), self.pair()]
+        emitted = []
+
+        class Selection:
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+
+            def close(self):
+                pass
+
+        class Session:
+            closed = False
+            statistics = {"worker_count": 2, "host_bytes": 1234}
+
+            def __len__(self):
+                return 2
+
+            def select(self, indices):
+                if tuple(indices) == (1,):
+                    raise RuntimeError("prefetch selection failed")
+                return Selection(indices)
+
+        class Batch:
+            def postfilter_selection(self, selection, F1):
+                return SimpleNamespace(indices=selection.indices)
+
+        modules, api = synthetic_plan7_gpu(True)
+        api.gpu_hmmsearch.side_effect = lambda *_args, **_kwargs: iter(("row-0",))
+        with tempfile.TemporaryDirectory(prefix="astra-gpu-order-") as temporary:
+            with (
+                mock.patch.dict(sys.modules, modules),
+                mock.patch.object(search, "GPU_CELL_CAP", 2),
+                mock.patch.object(
+                    search,
+                    "process_hits_to_file",
+                    side_effect=lambda hits, _fh: emitted.append(hits),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "prefetch selection failed"
+                ):
+                    search.hmmsearch(
+                        {}, pairs, 1, search_options(temporary),
+                        all_sequences=[object(), object()],
+                        gpu_sequence_batch=Batch(),
+                        gpu_postfilter=True,
+                        gpu_profile_session=Session(),
+                    )
+
+        self.assertEqual(emitted, ["row-0"])
+        self.assertEqual(api.gpu_hmmsearch.call_count, 1)
+        self.assertFalse(any(
+            thread.name.startswith("astra-gpu-generate")
+            for thread in threading.enumerate()
+        ))
+
+    def test_serial_control_uses_identical_gpu_through_viterbi_stages(self):
+        pairs = [self.pair("gathering"), self.pair(), self.pair("gathering")]
+        selection_calls = []
+        generation_calls = []
+        emitted = []
+
+        class Selection:
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+
+            def close(self):
+                pass
+
+        class Session:
+            closed = False
+            statistics = {"worker_count": 3, "host_bytes": 1234}
+
+            def __len__(self):
+                return 3
+
+            def select(self, indices):
+                selection_calls.append(tuple(indices))
+                return Selection(indices)
+
+        class Batch:
+            def postfilter_selection(self, selection, F1):
+                generation_calls.append((selection.indices, F1))
+                return SimpleNamespace(indices=selection.indices)
+
+        modules, api = synthetic_plan7_gpu(True)
+        api.gpu_hmmsearch.side_effect = (
+            lambda chunk, candidates, **kwargs: iter(
+                (candidates.indices, pair, kwargs) for pair in chunk
+            )
+        )
+        pipeline_options = {
+            "bit_cutoffs": "gathering",
+            "F1": 0.03,
+            "F2": 0.004,
+            "F3": 0.00005,
+            "bias_filter": False,
+        }
+        metrics = search.GPUOverlapMetrics()
+        with tempfile.TemporaryDirectory(prefix="astra-gpu-serial-") as temporary:
+            with (
+                mock.patch.dict(sys.modules, modules),
+                mock.patch.object(search, "GPU_CELL_CAP", 4),
+                mock.patch.object(
+                    search, "define_kwargs", return_value=pipeline_options
+                ),
+                mock.patch.object(
+                    search,
+                    "process_hits_to_file",
+                    side_effect=lambda hits, _fh: emitted.append(hits),
+                ),
+            ):
+                search.hmmsearch(
+                    {}, pairs, 3, search_options(temporary),
+                    all_sequences=[object(), object()],
+                    gpu_sequence_batch=Batch(),
+                    gpu_postfilter=True,
+                    gpu_profile_session=Session(),
+                    gpu_metrics=metrics,
+                    gpu_profile_overlap=False,
+                )
+
+        self.assertEqual(selection_calls, [(0, 2), (1,)])
+        self.assertEqual(generation_calls, [((0, 2), 0.03), ((1,), 0.03)])
+        self.assertEqual([item[0] for item in emitted], [(0, 2), (0, 2), (1,)])
+        for call in api.gpu_hmmsearch.call_args_list:
+            self.assertEqual(call.kwargs["F2"], 0.004)
+            self.assertEqual(call.kwargs["F3"], 0.00005)
+            self.assertIs(call.kwargs["bias_filter"], False)
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["generated_chunk_count"], 2)
+        self.assertEqual(snapshot["consumed_chunk_count"], 2)
+        self.assertEqual(snapshot["overlap_seconds"], 0.0)
+        self.assertEqual(snapshot["generation_wait_seconds"], 0.0)
+
+    def test_current_output_error_wins_and_closes_while_prefetch_fails(self):
+        pairs = [self.pair(), self.pair()]
+        consumption_started = threading.Event()
+        iterator_closed = []
+        selections = []
+
+        class Selection:
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+                self.closed = False
+                self.close_count = 0
+
+            def close(self):
+                self.closed = True
+                self.close_count += 1
+
+        class Session:
+            closed = False
+            statistics = {"worker_count": 2, "host_bytes": 1234}
+
+            def __len__(self):
+                return 2
+
+            def select(self, indices):
+                selection = Selection(indices)
+                selections.append(selection)
+                return selection
+
+        class Batch:
+            def postfilter_selection(self, selection, F1):
+                if selection.indices == (1,):
+                    if not consumption_started.wait(2):
+                        raise AssertionError("continuation never started")
+                    raise RuntimeError("prefetched generation failed")
+                return SimpleNamespace(indices=selection.indices)
+
+        def gpu_search(*_args, **_kwargs):
+            def results():
+                try:
+                    consumption_started.set()
+                    yield "current-row"
+                finally:
+                    iterator_closed.append(True)
+
+            return results()
+
+        modules, api = synthetic_plan7_gpu(True)
+        api.gpu_hmmsearch.side_effect = gpu_search
+        with tempfile.TemporaryDirectory(prefix="astra-gpu-cleanup-") as temporary:
+            with (
+                mock.patch.dict(sys.modules, modules),
+                mock.patch.object(search, "GPU_CELL_CAP", 2),
+                mock.patch.object(
+                    search,
+                    "process_hits_to_file",
+                    side_effect=ValueError("current write failed"),
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "current write failed"):
+                    search.hmmsearch(
+                        {}, pairs, 1, search_options(temporary),
+                        all_sequences=[object(), object()],
+                        gpu_sequence_batch=Batch(),
+                        gpu_postfilter=True,
+                        gpu_profile_session=Session(),
+                    )
+
+        self.assertEqual(iterator_closed, [True])
+        self.assertTrue(all(selection.closed for selection in selections))
+        self.assertTrue(all(selection.close_count == 1 for selection in selections))
+        self.assertEqual(api.gpu_hmmsearch.call_count, 1)
+        self.assertFalse(any(
+            thread.name.startswith("astra-gpu-generate")
+            for thread in threading.enumerate()
+        ))
+
+    def test_cancelled_queued_generation_closes_its_selection_once(self):
+        pairs = [self.pair(), self.pair()]
+        selections = []
+        queued_future = None
+
+        class Selection:
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+                self.close_count = 0
+
+            def close(self):
+                self.close_count += 1
+
+        class Session:
+            closed = False
+            statistics = {"worker_count": 2, "host_bytes": 1234}
+
+            def __len__(self):
+                return 2
+
+            def select(self, indices):
+                selection = Selection(indices)
+                selections.append(selection)
+                return selection
+
+        class Batch:
+            def postfilter_selection(self, selection, F1):
+                return SimpleNamespace(indices=selection.indices)
+
+        class ImmediateFuture:
+            def __init__(self, function, args):
+                self.function = function
+                self.args = args
+
+            def done(self):
+                return False
+
+            def result(self):
+                return self.function(*self.args)
+
+            def cancel(self):
+                return False
+
+        class QueuedFuture:
+            cancelled = False
+
+            def done(self):
+                return False
+
+            def cancel(self):
+                self.cancelled = True
+                return True
+
+        class Executor:
+            def __init__(self, **_kwargs):
+                self.submit_count = 0
+
+            def submit(self, function, *args):
+                nonlocal queued_future
+                self.submit_count += 1
+                if self.submit_count == 1:
+                    return ImmediateFuture(function, args)
+                queued_future = QueuedFuture()
+                return queued_future
+
+            def shutdown(self, **_kwargs):
+                pass
+
+        modules, api = synthetic_plan7_gpu(True)
+        api.gpu_hmmsearch.return_value = iter(("current-row",))
+        with tempfile.TemporaryDirectory(prefix="astra-gpu-cancel-") as temporary:
+            with (
+                mock.patch.dict(sys.modules, modules),
+                mock.patch.object(search, "GPU_CELL_CAP", 2),
+                mock.patch.object(search, "ThreadPoolExecutor", Executor),
+                mock.patch.object(
+                    search,
+                    "process_hits_to_file",
+                    side_effect=ValueError("current write failed"),
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "current write failed"):
+                    search.hmmsearch(
+                        {}, pairs, 1, search_options(temporary),
+                        all_sequences=[object(), object()],
+                        gpu_sequence_batch=Batch(),
+                        gpu_postfilter=True,
+                        gpu_profile_session=Session(),
+                    )
+
+        self.assertTrue(queued_future.cancelled)
+        self.assertEqual(
+            [selection.close_count for selection in selections],
+            [1, 1],
+        )
+
+
 class GPUPostfilterSelectionTests(unittest.TestCase):
     def test_preflight_selects_live_seam_and_safely_falls_back_when_absent(self):
         with tempfile.TemporaryDirectory(prefix="astra-gpu-mode-") as temporary:
@@ -554,7 +999,8 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
                 with self.subTest(seam_available=available):
                     modules, api = synthetic_plan7_gpu(available)
                     pair = object()
-                    batch = object()
+                    batch = mock.Mock(name="sequence_batch")
+                    batch.memory_snapshot = {"device_ordinal": 0}
                     api.load_pressed_profiles.return_value = (pair,)
                     api.SequenceBatch.return_value = batch
                     with mock.patch.dict(sys.modules, modules):
@@ -564,17 +1010,147 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
                                 ["GPUDB"],
                                 config,
                                 [object()],
+                                1,
                             )
                         )
 
                     self.assertEqual(
                         databases,
-                        {"GPUDB": (pressed_base.resolve(), (pair,))},
+                        {
+                            "GPUDB": (
+                                pressed_base.resolve(),
+                                (pair,),
+                                (
+                                    api.ProfileSession.return_value
+                                    if expected
+                                    else None
+                                ),
+                            )
+                        },
                     )
                     self.assertIs(observed_batch, batch)
                     self.assertIs(postfilter, expected)
                     if available is not None:
                         api.filter_scores_seam_available.assert_called_once_with()
+                    if expected:
+                        api.ProfileSession.assert_called_once_with((pair,))
+                    else:
+                        api.ProfileSession.assert_not_called()
+
+    def test_nonzero_cuda_device_retains_same_thread_forward_path(self):
+        with tempfile.TemporaryDirectory(prefix="astra-gpu-device-") as temporary:
+            root = Path(temporary)
+            db_dir = root / "GPUDB"
+            db_dir.mkdir()
+            pressed_base = make_pressed_members(db_dir, "profiles")
+            config = {
+                "db_urls": [{
+                    "name": "GPUDB",
+                    "installed": True,
+                    "installation_dir": os.fspath(db_dir),
+                    "molecule_type": "protein",
+                }]
+            }
+            modules, api = synthetic_plan7_gpu(True)
+            pair = object()
+            batch = mock.Mock(name="sequence_batch")
+            batch.memory_snapshot = {"device_ordinal": 2}
+            api.load_pressed_profiles.return_value = (pair,)
+            api.SequenceBatch.return_value = batch
+
+            with mock.patch.dict(sys.modules, modules):
+                databases, observed_batch, postfilter = (
+                    search.preflight_gpu_databases(
+                        {"GPUDB": "manifest.json"},
+                        ["GPUDB"],
+                        config,
+                        [object()],
+                        1,
+                    )
+                )
+
+            self.assertEqual(
+                databases,
+                {"GPUDB": (pressed_base.resolve(), (pair,), None)},
+            )
+            self.assertIs(observed_batch, batch)
+            self.assertTrue(postfilter)
+            api.ProfileSession.assert_not_called()
+
+    def test_session_path_does_not_exceed_requested_cpu_budget(self):
+        with tempfile.TemporaryDirectory(prefix="astra-gpu-budget-") as temporary:
+            root = Path(temporary)
+            db_dir = root / "GPUDB"
+            db_dir.mkdir()
+            pressed_base = make_pressed_members(db_dir, "profiles")
+            config = {
+                "db_urls": [{
+                    "name": "GPUDB",
+                    "installed": True,
+                    "installation_dir": os.fspath(db_dir),
+                    "molecule_type": "protein",
+                }]
+            }
+            modules, api = synthetic_plan7_gpu(True)
+            pairs = (object(), object(), object())
+            batch = mock.Mock(name="sequence_batch")
+            batch.memory_snapshot = {"device_ordinal": 0}
+            api.load_pressed_profiles.return_value = pairs
+            api.SequenceBatch.return_value = batch
+
+            with mock.patch.dict(sys.modules, modules):
+                databases, _, postfilter = search.preflight_gpu_databases(
+                    {"GPUDB": "manifest.json"},
+                    ["GPUDB"],
+                    config,
+                    [object()],
+                    2,
+                )
+
+            self.assertEqual(
+                databases,
+                {"GPUDB": (pressed_base.resolve(), pairs, None)},
+            )
+            self.assertTrue(postfilter)
+            api.ProfileSession.assert_not_called()
+
+    def test_later_session_failure_closes_prior_session_and_target_batch(self):
+        with tempfile.TemporaryDirectory(prefix="astra-gpu-session-") as temporary:
+            root = Path(temporary)
+            config = {"db_urls": []}
+            for name in ("GPU1", "GPU2"):
+                db_dir = root / name
+                db_dir.mkdir()
+                make_pressed_members(db_dir, name)
+                config["db_urls"].append({
+                    "name": name,
+                    "installed": True,
+                    "installation_dir": os.fspath(db_dir),
+                    "molecule_type": "protein",
+                })
+            modules, api = synthetic_plan7_gpu(True)
+            batch = mock.Mock(name="sequence_batch")
+            batch.memory_snapshot = {"device_ordinal": 0}
+            first_session = mock.Mock(name="first_session")
+            api.SequenceBatch.return_value = batch
+            api.load_pressed_profiles.side_effect = [(object(),), (object(),)]
+            api.ProfileSession.side_effect = [
+                first_session,
+                RuntimeError("session build failed"),
+            ]
+
+            with mock.patch.dict(sys.modules, modules):
+                with self.assertRaisesRegex(RuntimeError, "session build failed"):
+                    search.preflight_gpu_databases(
+                        {"GPU1": "one.json", "GPU2": "two.json"},
+                        ["GPU1", "GPU2"],
+                        config,
+                        [object()],
+                        1,
+                    )
+
+            first_session.close.assert_called_once_with()
+            batch.close.assert_called_once_with()
 
 
 class InstalledGPUSelectionTests(unittest.TestCase):
@@ -610,6 +1186,7 @@ class InstalledGPUSelectionTests(unittest.TestCase):
                 gpu_manifest=["GPU1=one.json", "GPU2=two.json"],
             )
             fake_batch = mock.Mock(name="shared_sequence_batch")
+            fake_batch.memory_snapshot = {"device_ordinal": 0}
             pair_one = object()
             pair_two = object()
             modules, api = synthetic_plan7_gpu(True)
@@ -718,6 +1295,57 @@ class InstalledGPUSelectionTests(unittest.TestCase):
 
             cpu_parser.assert_not_called()
             fake_batch.close.assert_called_once_with()
+
+    def test_presearch_failure_closes_popped_profile_session(self):
+        with tempfile.TemporaryDirectory(prefix="astra-gpu-presearch-") as temporary:
+            root = Path(temporary)
+            gpu_dir = root / "GPUDB"
+            gpu_dir.mkdir()
+            make_pressed_members(gpu_dir, "only")
+            config = {
+                "db_urls": [{
+                    "name": "GPUDB",
+                    "installed": True,
+                    "installation_dir": os.fspath(gpu_dir),
+                    "molecule_type": "protein",
+                }]
+            }
+            args = search_args(
+                root / "out",
+                installed_hmms="GPUDB",
+                gpu_manifest=["GPUDB=manifest.json"],
+            )
+            modules, api = synthetic_plan7_gpu(True)
+            batch = mock.Mock(name="sequence_batch")
+            batch.memory_snapshot = {"device_ordinal": 0}
+            session = mock.Mock(name="profile_session")
+            api.SequenceBatch.return_value = batch
+            api.ProfileSession.return_value = session
+            api.load_pressed_profiles.return_value = (object(),)
+
+            def log(message):
+                if str(message).startswith("GPU search for GPUDB"):
+                    raise BrokenPipeError("log sink failed")
+
+            with (
+                mock.patch.dict(sys.modules, modules),
+                mock.patch.object(
+                    search.initialize, "load_config", return_value=config
+                ),
+                mock.patch.object(
+                    search,
+                    "parse_protein_input",
+                    return_value={"proteins.faa": [object()]},
+                ),
+                mock.patch.object(search.logging, "info", side_effect=log),
+                mock.patch.object(search, "hmmsearch") as run_search,
+            ):
+                with self.assertRaisesRegex(BrokenPipeError, "log sink failed"):
+                    search.main(args)
+
+            run_search.assert_not_called()
+            session.close.assert_called_once_with()
+            batch.close.assert_called_once_with()
 
     def test_consumed_profile_tuple_is_released_before_next_database(self):
         class Profile:
@@ -981,6 +1609,66 @@ class GPUParityTests(unittest.TestCase):
                         all_sequences=self.targets,
                         gpu_sequence_batch=batch,
                     )
+                cpu_tsv = cpu_out / "tmp_results" / "bulk_results.tsv"
+                gpu_tsv = gpu_out / "tmp_results" / "bulk_results.tsv"
+                self.assertEqual(gpu_tsv.read_bytes(), cpu_tsv.read_bytes())
+
+    def test_profile_session_pipeline_is_byte_exact_across_ordered_chunks(self):
+        if not search.gpu_postfilter_available():
+            self.skipTest("private post-filter continuation seam unavailable")
+
+        from plan7_gpu import ProfileSession, SequenceBatch
+
+        class RecordingSession:
+            def __init__(self, session):
+                self.session = session
+                self.selections = []
+
+            def __len__(self):
+                return len(self.session)
+
+            @property
+            def closed(self):
+                return self.session.closed
+
+            @property
+            def statistics(self):
+                return self.session.statistics
+
+            def select(self, indices):
+                self.selections.append(tuple(indices))
+                return self.session.select(indices)
+
+        root = Path(self.temporary.name)
+        expected_selections = [(0,), (3,), (1,), (2,)]
+        for threads in (1, 2):
+            with self.subTest(threads=threads):
+                cpu_out = root / f"session-cpu-{threads}"
+                gpu_out = root / f"session-gpu-{threads}"
+                search.hmmsearch(
+                    {},
+                    self.cpu_hmms,
+                    threads,
+                    search_options(cpu_out, cascade=True),
+                    all_sequences=self.targets,
+                )
+                with ProfileSession(self.gpu_pairs) as raw_session:
+                    session = RecordingSession(raw_session)
+                    with SequenceBatch(self.targets) as batch:
+                        with mock.patch.object(
+                            search, "GPU_CELL_CAP", len(self.targets)
+                        ):
+                            search.hmmsearch(
+                                {},
+                                self.gpu_pairs,
+                                threads,
+                                search_options(gpu_out, cascade=True),
+                                all_sequences=self.targets,
+                                gpu_sequence_batch=batch,
+                                gpu_postfilter=True,
+                                gpu_profile_session=session,
+                            )
+                self.assertEqual(session.selections, expected_selections)
                 cpu_tsv = cpu_out / "tmp_results" / "bulk_results.tsv"
                 gpu_tsv = gpu_out / "tmp_results" / "bulk_results.tsv"
                 self.assertEqual(gpu_tsv.read_bytes(), cpu_tsv.read_bytes())

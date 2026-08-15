@@ -16,10 +16,58 @@ from astra import rp16 as rp16_module
 PRESSED_SUFFIXES = ('h3m', 'h3i', 'h3f', 'h3p')
 HMM_CHUNK_SIZE = 2000
 GPU_CELL_CAP = 100_000_000
+GPU_TIMING_ENV = 'ASTRA_GPU_OVERLAP_TIMING'
+GPU_SERIAL_ENV = 'ASTRA_GPU_PROFILE_SERIAL'
 
 
 class GPUConfigurationError(ValueError):
     """Raised when an explicit installed-database GPU request is invalid."""
+
+
+class GPUOverlapMetrics:
+    """Opt-in counters for the bounded profile-generation pipeline."""
+
+    def __init__(self):
+        self.profile_worker_count = 0
+        self.profile_host_bytes = 0
+        self.chunk_count = 0
+        self.generated_chunk_count = 0
+        self.consumed_chunk_count = 0
+        self.ready_without_wait_count = 0
+        self.profile_load_seconds = 0.0
+        self.session_build_seconds = 0.0
+        self.target_batch_seconds = 0.0
+        self.preflight_seconds = 0.0
+        self.generation_seconds = 0.0
+        self.selection_seconds = 0.0
+        self.generation_wait_seconds = 0.0
+        self.initial_generation_wait_seconds = 0.0
+        self.pipeline_stall_seconds = 0.0
+        self.continuation_seconds = 0.0
+        self.overlap_seconds = 0.0
+        self.pipeline_wall_seconds = 0.0
+
+    def snapshot(self):
+        return {
+            'profile_worker_count': self.profile_worker_count,
+            'profile_host_bytes': self.profile_host_bytes,
+            'chunk_count': self.chunk_count,
+            'generated_chunk_count': self.generated_chunk_count,
+            'consumed_chunk_count': self.consumed_chunk_count,
+            'ready_without_wait_count': self.ready_without_wait_count,
+            'profile_load_seconds': self.profile_load_seconds,
+            'session_build_seconds': self.session_build_seconds,
+            'target_batch_seconds': self.target_batch_seconds,
+            'preflight_seconds': self.preflight_seconds,
+            'generation_seconds': self.generation_seconds,
+            'selection_seconds': self.selection_seconds,
+            'generation_wait_seconds': self.generation_wait_seconds,
+            'initial_generation_wait_seconds': self.initial_generation_wait_seconds,
+            'pipeline_stall_seconds': self.pipeline_stall_seconds,
+            'continuation_seconds': self.continuation_seconds,
+            'overlap_seconds': self.overlap_seconds,
+            'pipeline_wall_seconds': self.pipeline_wall_seconds,
+        }
 
 
 def gpu_hmm_chunk_size(sequence_count):
@@ -152,12 +200,13 @@ def validate_gpu_configuration(mappings, installed_hmm_names, parsed_json,
 
 
 def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
-                            all_sequences):
+                            all_sequences, threads, gpu_metrics=None):
     """Load every attested mapped database and initialize one target batch."""
     if not mappings:
         return {}, None, False
 
-    from plan7_gpu import SequenceBatch, load_pressed_profiles
+    preflight_started = time.perf_counter()
+    from plan7_gpu import ProfileSession, SequenceBatch, load_pressed_profiles
     from plan7_gpu.pressed_manifest import validate_pressed_manifest
 
     database_specs = {}
@@ -174,17 +223,70 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
 
     databases = {}
     for db_name, (pressed_base, manifest_path) in database_specs.items():
+        load_started = time.perf_counter()
+        pairs = load_pressed_profiles(pressed_base, manifest=manifest_path)
+        if gpu_metrics is not None:
+            gpu_metrics[db_name].profile_load_seconds += (
+                time.perf_counter() - load_started
+            )
         databases[db_name] = (
             pressed_base,
-            load_pressed_profiles(pressed_base, manifest=manifest_path),
+            pairs,
+            None,
         )
 
     postfilter = gpu_postfilter_available()
-    batch = SequenceBatch(
-        all_sequences,
-        alphabet=pyhmmer.easel.Alphabet.amino(),
-    )
-    return databases, batch, postfilter
+    batch = None
+    try:
+        batch_started = time.perf_counter()
+        batch = SequenceBatch(
+            all_sequences,
+            alphabet=pyhmmer.easel.Alphabet.amino(),
+        )
+        batch_seconds = time.perf_counter() - batch_started
+        if gpu_metrics is not None:
+            for metrics in gpu_metrics.values():
+                metrics.target_batch_seconds = batch_seconds
+        # A fresh producer thread begins on CUDA ordinal 0. Until plan7_gpu
+        # exposes a scoped device bind, keep nonzero batches on the existing
+        # same-thread path instead of creating an unusable ProfileSession.
+        overlap_supported = (
+            postfilter
+            and batch.memory_snapshot['device_ordinal'] == 0
+        )
+        if overlap_supported:
+            for db_name, (pressed_base, pairs, _) in tuple(databases.items()):
+                if not pairs or threads < min(16, len(pairs)):
+                    continue
+                session_started = time.perf_counter()
+                session = ProfileSession(pairs)
+                databases[db_name] = (
+                    pressed_base,
+                    pairs,
+                    session,
+                )
+                if gpu_metrics is not None:
+                    gpu_metrics[db_name].session_build_seconds += (
+                        time.perf_counter() - session_started
+                    )
+        if gpu_metrics is not None:
+            preflight_seconds = time.perf_counter() - preflight_started
+            for metrics in gpu_metrics.values():
+                metrics.preflight_seconds = preflight_seconds
+        return databases, batch, postfilter
+    except BaseException:
+        for _, _, session in databases.values():
+            if session is not None:
+                try:
+                    session.close()
+                except BaseException:
+                    pass
+        if batch is not None:
+            try:
+                batch.close()
+            except BaseException:
+                pass
+        raise
 
 
 def gpu_postfilter_available():
@@ -345,11 +447,245 @@ def extract_sequences(results_or_ids, protein_dict_or_outdir, outdir=None):
                     fh.write(f">{text_seq.name}\n{text_seq.sequence}\n")
 
 
+def _consume_gpu_candidate_chunk(spec, candidates, total_chunks, threads, fh,
+                                 gpu_hmmsearch, gpu_metrics):
+    chunk_index, hmm_chunk, _, kwargs = spec
+    print(f"  Chunk {chunk_index}/{total_chunks} "
+          f"({len(hmm_chunk)} HMMs)...", end="", flush=True)
+    hit_iterator = None
+    hits = None
+    started = time.perf_counter()
+    try:
+        hit_iterator = gpu_hmmsearch(
+            hmm_chunk,
+            candidates,
+            cpus=threads,
+            postfilter=True,
+            **kwargs,
+        )
+        for hits in hit_iterator:
+            process_hits_to_file(hits, fh)
+    except BaseException:
+        if hit_iterator is not None:
+            close = getattr(hit_iterator, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except BaseException:
+                    pass
+        raise
+    finally:
+        finished = time.perf_counter()
+        if gpu_metrics is not None:
+            gpu_metrics.continuation_seconds += finished - started
+        hit_iterator = None
+        hits = None
+    if gpu_metrics is not None:
+        gpu_metrics.consumed_chunk_count += 1
+    print(" done")
+    return started, finished
+
+
+def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
+                            threads, fh, gpu_metrics=None):
+    """Run the ProfileSession stages serially as an overlap control."""
+    from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
+
+    if gpu_metrics is not None:
+        statistics = profile_session.statistics
+        gpu_metrics.chunk_count += len(chunks)
+        gpu_metrics.profile_worker_count = statistics['worker_count']
+        gpu_metrics.profile_host_bytes = statistics['host_bytes']
+    pipeline_started = time.perf_counter()
+    try:
+        for spec in chunks:
+            selection_started = time.perf_counter()
+            selection = profile_session.select(spec[2])
+            if gpu_metrics is not None:
+                gpu_metrics.selection_seconds += (
+                    time.perf_counter() - selection_started
+                )
+            generation_started = time.perf_counter()
+            try:
+                candidates = sequence_batch.postfilter_selection(
+                    selection,
+                    F1=spec[3].get('F1', 0.02),
+                )
+            except BaseException:
+                try:
+                    selection.close()
+                except BaseException:
+                    pass
+                raise
+            selection.close()
+            generation_finished = time.perf_counter()
+            if gpu_metrics is not None:
+                gpu_metrics.generated_chunk_count += 1
+                gpu_metrics.generation_seconds += (
+                    generation_finished - generation_started
+                )
+            _consume_gpu_candidate_chunk(
+                spec,
+                candidates,
+                len(chunks),
+                threads,
+                fh,
+                gpu_hmmsearch,
+                gpu_metrics,
+            )
+            candidates = None
+    finally:
+        if gpu_metrics is not None:
+            gpu_metrics.pipeline_wall_seconds += (
+                time.perf_counter() - pipeline_started
+            )
+
+
+def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
+                              threads, fh, gpu_metrics=None):
+    """Overlap one generated CandidateBatch with one ordered CPU consumer."""
+    if not chunks:
+        return
+
+    from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
+
+    if gpu_metrics is not None:
+        statistics = profile_session.statistics
+        gpu_metrics.chunk_count += len(chunks)
+        gpu_metrics.profile_worker_count = statistics['worker_count']
+        gpu_metrics.profile_host_bytes = statistics['host_bytes']
+
+    def generate(spec, selection):
+        started = time.perf_counter()
+        try:
+            candidates = sequence_batch.postfilter_selection(
+                selection,
+                F1=spec[3].get('F1', 0.02),
+            )
+        except BaseException:
+            try:
+                selection.close()
+            except BaseException:
+                pass
+            raise
+        selection.close()
+        return candidates, started, time.perf_counter()
+
+    executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix='astra-gpu-generate',
+    )
+    pending_future = None
+    pending_error = None
+    pending_selection = None
+    pipeline_started = time.perf_counter()
+
+    def start_generation(spec):
+        selection_started = time.perf_counter()
+        try:
+            selection = profile_session.select(spec[2])
+        except BaseException as error:
+            if gpu_metrics is not None:
+                gpu_metrics.selection_seconds += (
+                    time.perf_counter() - selection_started
+                )
+            return None, error, None
+        if gpu_metrics is not None:
+            gpu_metrics.selection_seconds += (
+                time.perf_counter() - selection_started
+            )
+        try:
+            return executor.submit(generate, spec, selection), None, selection
+        except BaseException as error:
+            try:
+                selection.close()
+            except BaseException:
+                pass
+            return None, error, None
+
+    pending_future, pending_error, pending_selection = start_generation(chunks[0])
+    previous_consumption = None
+    try:
+        for position, spec in enumerate(chunks):
+            if pending_error is not None:
+                raise pending_error
+            completed_future = pending_future
+            pending_future = None
+            pending_selection = None
+            ready_without_wait = completed_future.done()
+            wait_started = time.perf_counter()
+            candidates, generation_started, generation_finished = (
+                completed_future.result()
+            )
+            wait_seconds = time.perf_counter() - wait_started
+            if gpu_metrics is not None:
+                gpu_metrics.generated_chunk_count += 1
+                gpu_metrics.ready_without_wait_count += int(ready_without_wait)
+                gpu_metrics.generation_seconds += (
+                    generation_finished - generation_started
+                )
+                gpu_metrics.generation_wait_seconds += wait_seconds
+                if position == 0:
+                    gpu_metrics.initial_generation_wait_seconds += wait_seconds
+                else:
+                    gpu_metrics.pipeline_stall_seconds += wait_seconds
+                if previous_consumption is not None:
+                    overlap_start = max(
+                        generation_started, previous_consumption[0]
+                    )
+                    overlap_finish = min(
+                        generation_finished, previous_consumption[1]
+                    )
+                    gpu_metrics.overlap_seconds += max(
+                        0.0, overlap_finish - overlap_start
+                    )
+
+            # Preselection happens before CPU continuation, so the session's
+            # native pack workers never contend with Astra's search workers.
+            # A prefetch failure is deferred until this ready chunk is emitted.
+            if position + 1 < len(chunks):
+                (
+                    pending_future,
+                    pending_error,
+                    pending_selection,
+                ) = start_generation(chunks[position + 1])
+
+            previous_consumption = _consume_gpu_candidate_chunk(
+                spec,
+                candidates,
+                len(chunks),
+                threads,
+                fh,
+                gpu_hmmsearch,
+                gpu_metrics,
+            )
+            candidates = None
+    finally:
+        if pending_future is not None:
+            cancelled = pending_future.cancel()
+            if cancelled and pending_selection is not None:
+                try:
+                    pending_selection.close()
+                except BaseException:
+                    pass
+        active_error = sys.exc_info()[0] is not None
+        try:
+            executor.shutdown(wait=True, cancel_futures=True)
+        except BaseException:
+            if not active_error:
+                raise
+        if gpu_metrics is not None:
+            gpu_metrics.pipeline_wall_seconds += (
+                time.perf_counter() - pipeline_started
+            )
+
+
 
 def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
               macsyfinder_dir=None, hmm_name_to_filename=None,
               all_sequences=None, gpu_sequence_batch=None,
-              gpu_postfilter=None):
+              gpu_postfilter=None, gpu_profile_session=None,
+              gpu_metrics=None, gpu_profile_overlap=True):
     hmmsearch_kwargs = define_kwargs(options)
 
     if gpu_sequence_batch is not None and macsyfinder_dir is not None:
@@ -366,6 +702,21 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
         raise GPUConfigurationError(
             "exact GPU post-filter mode requires a GPU sequence batch"
         )
+    if gpu_profile_session is not None:
+        if gpu_sequence_batch is None or not gpu_postfilter:
+            raise GPUConfigurationError(
+                "GPU profile sessions require exact post-filter mode"
+            )
+        if gpu_profile_session.closed:
+            raise GPUConfigurationError("GPU profile session is closed")
+        if len(gpu_profile_session) != len(hmms):
+            raise GPUConfigurationError(
+                "GPU profile session does not cover the supplied profiles"
+            )
+    if gpu_metrics is not None and not isinstance(gpu_metrics, GPUOverlapMetrics):
+        raise TypeError("gpu_metrics must be GPUOverlapMetrics or None")
+    if type(gpu_profile_overlap) is not bool:
+        raise TypeError("gpu_profile_overlap must be bool")
 
     # Always write to temp files — bulk mode is faster and avoids
     # keeping huge result lists in memory.  The per-genome loop is
@@ -398,13 +749,13 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
     # availability, not on per-genome data.  Previously this was inside the
     # per-genome loop, wasting len(hmms) * len(protein_dict) iterations.
     hmm_groups = {}
-    for hmm in hmms:
+    for hmm_index, hmm in enumerate(hmms):
         best_cutoff = get_best_cutoff(hmm)
-        hmm_groups.setdefault(best_cutoff, []).append(hmm)
+        hmm_groups.setdefault(best_cutoff, []).append((hmm_index, hmm))
 
     # Build per-group kwargs once (avoids re-copying per genome)
     group_kwargs_list = []
-    for cutoff, hmm_group in hmm_groups.items():
+    for cutoff, indexed_hmm_group in hmm_groups.items():
         kwargs = hmmsearch_kwargs.copy()
         if cutoff:
             kwargs['bit_cutoffs'] = cutoff
@@ -419,7 +770,11 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
 
         # Remove internal-only keys before passing to pyhmmer
         kwargs.pop('preferred_cutoff', None)
-        group_kwargs_list.append((hmm_group, kwargs))
+        group_kwargs_list.append((
+            [hmm for _, hmm in indexed_hmm_group],
+            tuple(index for index, _ in indexed_hmm_group),
+            kwargs,
+        ))
 
     # For large datasets without MacSyFinder output, flatten all sequences
     # and search once against the full pool.  This turns N_genomes * N_chunks
@@ -437,7 +792,7 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
             for sequences in protein_dict.values():
                 all_sequences.extend(sequences)
         print(f"Bulk search: {len(all_sequences)} sequences × {len(hmms)} HMMs "
-              f"({sum(len(g) for g, _ in group_kwargs_list)} grouped)")
+              f"({sum(len(g) for g, _, _ in group_kwargs_list)} grouped)")
 
         hmm_chunk_size = HMM_CHUNK_SIZE
         if gpu_sequence_batch is not None:
@@ -447,16 +802,45 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
         out_file = os.path.join(tmp_dir, "bulk_results.tsv")
         total_chunks = sum(
             (len(g) + hmm_chunk_size - 1) // hmm_chunk_size
-            for g, _ in group_kwargs_list
+            for g, _, _ in group_kwargs_list
         )
         chunk_idx = 0
         with open(out_file, 'w') as fh:
             fh.write(HEADER)
-            for hmm_group, kwargs in group_kwargs_list:
+            chunks = []
+            for hmm_group, group_indices, kwargs in group_kwargs_list:
                 for chunk_start in range(0, len(hmm_group), hmm_chunk_size):
-                    hmm_chunk = hmm_group[chunk_start:chunk_start + hmm_chunk_size]
+                    hmm_chunk = hmm_group[
+                        chunk_start:chunk_start + hmm_chunk_size
+                    ]
+                    chunk_indices = group_indices[
+                        chunk_start:chunk_start + hmm_chunk_size
+                    ]
                     chunk_idx += 1
-                    print(f"  Chunk {chunk_idx}/{total_chunks} "
+                    chunks.append((
+                        chunk_idx,
+                        hmm_chunk,
+                        chunk_indices,
+                        kwargs,
+                    ))
+
+            if gpu_profile_session is not None:
+                profile_runner = (
+                    _run_gpu_profile_pipeline
+                    if gpu_profile_overlap
+                    else _run_gpu_profile_serial
+                )
+                profile_runner(
+                    chunks,
+                    gpu_profile_session,
+                    gpu_sequence_batch,
+                    threads,
+                    fh,
+                    gpu_metrics,
+                )
+            else:
+                for chunk_index, hmm_chunk, _, kwargs in chunks:
+                    print(f"  Chunk {chunk_index}/{total_chunks} "
                           f"({len(hmm_chunk)} HMMs)...", end="", flush=True)
                     if gpu_sequence_batch is None:
                         hit_iterator = pyhmmer.hmmsearch(
@@ -503,7 +887,7 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
             tmp_file = os.path.join(tmp_dir, f"{safe_filename}_results.tsv")
             with open(tmp_file, 'w') as fh:
                 fh.write(HEADER)
-                for hmm_group, kwargs in group_kwargs_list:
+                for hmm_group, _, kwargs in group_kwargs_list:
                     for chunk_start in range(0, len(hmm_group), HMM_CHUNK_SIZE):
                         hmm_chunk = hmm_group[chunk_start:chunk_start + HMM_CHUNK_SIZE]
                         for hits in pyhmmer.hmmsearch(hmm_chunk, sequences,
@@ -996,16 +1380,25 @@ def main(args):
     gpu_databases = {}
     gpu_sequence_batch = None
     gpu_postfilter = False
+    gpu_metrics_by_db = None
     if gpu_manifests:
         # This check must happen before constructing a CUDA SequenceBatch or
         # creating any result path. With one HMM, a larger target set already
         # exceeds the bounded profile-by-target candidate matrix.
         gpu_hmm_chunk_size(len(all_sequences))
+        if os.environ.get(GPU_TIMING_ENV) == '1':
+            gpu_metrics_by_db = {
+                db_name: GPUOverlapMetrics()
+                for db_name in gpu_installed_hmm_names
+                if db_name in gpu_manifests
+            }
         gpu_databases, gpu_sequence_batch, gpu_postfilter = preflight_gpu_databases(
             gpu_manifests,
             gpu_installed_hmm_names,
             gpu_parsed_json,
             all_sequences,
+            args.threads,
+            gpu_metrics_by_db,
         )
 
     try:
@@ -1023,6 +1416,12 @@ def main(args):
                             format='%(asctime)s %(levelname)s: %(message)s',
                             datefmt='%Y-%m-%d %H:%M:%S')
     except BaseException:
+        for _, _, session in gpu_databases.values():
+            if session is not None:
+                try:
+                    session.close()
+                except BaseException:
+                    pass
         if gpu_sequence_batch is not None:
             gpu_sequence_batch.close()
         raise
@@ -1084,22 +1483,83 @@ def main(args):
                             all_sequences=all_sequences,
                         )
                     else:
-                        pressed_base, db_hmms = gpu_databases.pop(hmm_db)
-                        gpu_mode = (
-                            "exact post-filter" if gpu_postfilter else "legacy SSV"
-                        )
-                        print(
-                            f"  GPU search for {hmm_db} ({gpu_mode}): {pressed_base}"
-                        )
-                        logging.info(
-                            f"GPU search for {hmm_db} ({gpu_mode}): {pressed_base}"
-                        )
-                        tmp_dir = hmmsearch(
-                            protein_dict, db_hmms, args.threads, hmmsearch_options,
-                            hmm_db, all_sequences=all_sequences,
-                            gpu_sequence_batch=gpu_sequence_batch,
-                            gpu_postfilter=gpu_postfilter,
-                        )
+                        (
+                            pressed_base,
+                            db_hmms,
+                            gpu_profile_session,
+                        ) = gpu_databases[hmm_db]
+                        try:
+                            gpu_profile_overlap = (
+                                os.environ.get(GPU_SERIAL_ENV) != '1'
+                            )
+                            if gpu_profile_session is not None:
+                                scheduling = (
+                                    "overlap" if gpu_profile_overlap else "serial"
+                                )
+                                gpu_mode = (
+                                    f"exact GPU-through-Viterbi {scheduling}"
+                                )
+                            elif gpu_postfilter:
+                                gpu_mode = "exact post-filter + Forward"
+                            else:
+                                gpu_mode = "legacy SSV"
+                            print(
+                                f"  GPU search for {hmm_db} ({gpu_mode}): "
+                                f"{pressed_base}"
+                            )
+                            logging.info(
+                                f"GPU search for {hmm_db} ({gpu_mode}): "
+                                f"{pressed_base}"
+                            )
+                            db_metrics = (
+                                gpu_metrics_by_db[hmm_db]
+                                if gpu_metrics_by_db is not None
+                                else None
+                            )
+                            tmp_dir = hmmsearch(
+                                protein_dict, db_hmms, args.threads,
+                                hmmsearch_options, hmm_db,
+                                all_sequences=all_sequences,
+                                gpu_sequence_batch=gpu_sequence_batch,
+                                gpu_postfilter=gpu_postfilter,
+                                gpu_profile_session=gpu_profile_session,
+                                gpu_metrics=(
+                                    db_metrics
+                                    if gpu_profile_session is not None
+                                    else None
+                                ),
+                                gpu_profile_overlap=gpu_profile_overlap,
+                            )
+                            if (
+                                db_metrics is not None
+                                and gpu_profile_session is not None
+                            ):
+                                timing = db_metrics.snapshot()
+                                timing_line = (
+                                    f"  GPU-through-Viterbi {scheduling} timing: "
+                                    f"preflight={timing['preflight_seconds']:.3f}s, "
+                                    f"selection={timing['selection_seconds']:.3f}s, "
+                                    f"generation={timing['generation_seconds']:.3f}s, "
+                                    f"wait={timing['generation_wait_seconds']:.3f}s, "
+                                    f"CPU/output={timing['continuation_seconds']:.3f}s, "
+                                    f"measured-overlap={timing['overlap_seconds']:.3f}s"
+                                )
+                                print(timing_line)
+                                logging.info(timing_line.strip())
+                        finally:
+                            active_gpu_error = sys.exc_info()[0] is not None
+                            session_close_error = None
+                            if gpu_profile_session is not None:
+                                try:
+                                    gpu_profile_session.close()
+                                except BaseException as error:
+                                    session_close_error = error
+                            gpu_databases.pop(hmm_db, None)
+                            if (
+                                session_close_error is not None
+                                and not active_gpu_error
+                            ):
+                                raise session_close_error
                     if args.write_seqs:
                         extract_sequences_from_tmp(tmp_dir, protein_dict, outdir)
                     combine_results(tmp_dir, os.path.join(outdir, f'{hmm_db}_hits_df.tsv'))
@@ -1109,8 +1569,23 @@ def main(args):
                     print(f"No installation_dir specified for db {hmm_db}")
                     logging.info(f"No installation_dir specified for db {hmm_db}")
     finally:
+        active_error = sys.exc_info()[0] is not None
+        cleanup_error = None
+        for _, _, session in gpu_databases.values():
+            if session is not None:
+                try:
+                    session.close()
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
         if gpu_sequence_batch is not None:
-            gpu_sequence_batch.close()
+            try:
+                gpu_sequence_batch.close()
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        if cleanup_error is not None and not active_error:
+            raise cleanup_error
 
     # Write MacSyFinder config file and finalize hmmsearch output if enabled
     if macsyfinder_dir:
