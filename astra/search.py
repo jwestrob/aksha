@@ -18,6 +18,7 @@ HMM_CHUNK_SIZE = 2000
 GPU_CELL_CAP = 100_000_000
 GPU_TIMING_ENV = 'ASTRA_GPU_OVERLAP_TIMING'
 GPU_SERIAL_ENV = 'ASTRA_GPU_PROFILE_SERIAL'
+GPU_DOMAIN_GUARD = 2.0e-4
 
 
 class GPUConfigurationError(ValueError):
@@ -354,6 +355,40 @@ def gpu_profile_forward_available():
     )
 
 
+def gpu_profile_domain_available():
+    """Return whether a session selection can carry a domain journal."""
+    from plan7_gpu import SequenceBatch, _native, _pipeline
+
+    # The simple-region symbol existed before the opaque ProfileSession
+    # adapter. Requiring its bound sealing factory keeps Astra compatible with
+    # that intermediate ABI instead of guessing from the Python signature.
+    filter_probe = getattr(_pipeline, '_filter_scores_seam_available', None)
+    forward_probe = getattr(
+        _pipeline, '_filter_and_forward_scores_seam_available', None
+    )
+    seam_probe = getattr(_pipeline, '_simple_regions_seam_available', None)
+    seal = getattr(
+        _pipeline, '_seal_profile_selection_continuation_bound', None
+    )
+    return (
+        callable(getattr(
+            SequenceBatch, '_postfilter_forward_domain_selection', None
+        ))
+        and callable(getattr(
+            _native.SequenceBatch,
+            '_postfilter_forward_domain_selection_sealed',
+            None,
+        ))
+        and callable(seal)
+        and callable(filter_probe)
+        and filter_probe() is True
+        and callable(forward_probe)
+        and forward_probe() is True
+        and callable(seam_probe)
+        and seam_probe() is True
+    )
+
+
 def has_thresholds(x):
     """Check if an HMM has any bitscore cutoffs available."""
     return (x.cutoffs.gathering_available() or
@@ -543,19 +578,38 @@ def _consume_gpu_candidate_chunk(spec, candidates, total_chunks, threads, fh,
     return started, finished
 
 
-def _generate_gpu_profile_candidates(sequence_batch, selection, kwargs):
+def _generate_gpu_profile_candidates(sequence_batch, selection, kwargs,
+                                     domain_continuation=False):
     """Run the same bounded CUDA stages as the live post-filter product path."""
+    F1 = kwargs.get('F1', 0.02)
+    F2 = kwargs.get('F2', 0.001)
+    F3 = kwargs.get('F3', 0.00001)
+    bias_filter = kwargs.get('bias_filter', True)
+    if domain_continuation and bias_filter is True:
+        # This configuration-only pipeline is private to the producer call.
+        # CPU continuation workers still create and exclusively own their
+        # search pipelines lazily inside plan7_gpu.astra_search.
+        generation_pipeline = pyhmmer.plan7.Pipeline(
+            sequence_batch.alphabet,
+            **kwargs,
+        )
+        return sequence_batch._postfilter_forward_selection(
+            selection,
+            F1,
+            F2,
+            F3,
+            bias_filter,
+            pipeline=generation_pipeline,
+            domain_guard=GPU_DOMAIN_GUARD,
+        )
     return sequence_batch._postfilter_forward_selection(
-        selection,
-        kwargs.get('F1', 0.02),
-        kwargs.get('F2', 0.001),
-        kwargs.get('F3', 0.00001),
-        kwargs.get('bias_filter', True),
+        selection, F1, F2, F3, bias_filter
     )
 
 
 def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
-                            threads, fh, gpu_metrics=None):
+                            threads, fh, gpu_metrics=None,
+                            domain_continuation=False):
     """Run sealed GPU-through-Forward generation as the serial control."""
     from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
 
@@ -585,6 +639,7 @@ def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
                     sequence_batch,
                     selection,
                     spec[3],
+                    domain_continuation,
                 )
             except BaseException:
                 try:
@@ -617,7 +672,8 @@ def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
 
 
 def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
-                              threads, fh, gpu_metrics=None):
+                              threads, fh, gpu_metrics=None,
+                              domain_continuation=False):
     """Overlap one sealed GPU-through-Forward batch with one CPU consumer."""
     if not chunks:
         return
@@ -643,6 +699,7 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                 sequence_batch,
                 selection,
                 spec[3],
+                domain_continuation,
             )
         except BaseException:
             try:
@@ -799,6 +856,7 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
     if type(gpu_profile_overlap) is not bool:
         raise TypeError("gpu_profile_overlap must be bool")
     profile_overlap_enabled = False
+    profile_domain_continuation = False
     continuation_threads = threads
     if gpu_profile_session is not None:
         (
@@ -815,6 +873,7 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                 "GPU profile sessions require zero persistent selection "
                 "workers"
             )
+        profile_domain_continuation = gpu_profile_domain_available()
         if gpu_metrics is not None:
             gpu_metrics.requested_thread_count = threads
             gpu_metrics.producer_slot_count = producer_slots
@@ -940,6 +999,7 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                     continuation_threads,
                     fh,
                     gpu_metrics,
+                    profile_domain_continuation,
                 )
             else:
                 for chunk_index, hmm_chunk, _, kwargs in chunks:
