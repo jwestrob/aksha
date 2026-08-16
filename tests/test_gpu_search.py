@@ -427,6 +427,43 @@ class GPUConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "overlap_requested"):
             search.gpu_profile_worker_allocation(2, 1)
 
+    def test_legacy_scheduler_selector_is_exact_and_overlap_only(self):
+        environment = search.GPU_LEGACY_OVERLAP_ENV
+        previous = os.environ.pop(environment, None)
+        try:
+            self.assertEqual(
+                search.gpu_profile_scheduler_mode(None, False), "serial"
+            )
+            self.assertEqual(
+                search.gpu_profile_scheduler_mode(object(), True),
+                "bounded-ready-queue",
+            )
+            with mock.patch.dict(os.environ, {environment: "1"}):
+                with self.assertRaisesRegex(
+                    search.GPUConfigurationError, "accepts only"
+                ):
+                    search.gpu_profile_scheduler_mode(object(), True)
+            with mock.patch.dict(
+                os.environ,
+                {environment: search.GPU_LEGACY_OVERLAP_VALUE},
+            ):
+                self.assertEqual(
+                    search.gpu_profile_scheduler_mode(object(), True),
+                    "single-prefetch",
+                )
+                for session, overlap in ((None, False), (object(), False)):
+                    with self.subTest(session=session, overlap=overlap):
+                        with self.assertRaisesRegex(
+                            search.GPUConfigurationError,
+                            "requires an active overlapping",
+                        ):
+                            search.gpu_profile_scheduler_mode(session, overlap)
+        finally:
+            if previous is not None:
+                os.environ[environment] = previous
+            else:
+                os.environ.pop(environment, None)
+
     def test_oversized_gpu_target_set_is_rejected_before_preflight_or_output(self):
         with tempfile.TemporaryDirectory(prefix="astra-gpu-cap-") as temporary:
             root = Path(temporary)
@@ -825,14 +862,25 @@ class GPUProfileOverlapTests(unittest.TestCase):
             [(("selection", 0.03, 0.004, 0.00005, False), {})],
         )
 
-    def test_two_slots_overlap_in_order_with_noncontiguous_selection(self):
-        pairs = [self.pair("gathering"), self.pair(), self.pair("gathering")]
-        consumption_started = threading.Event()
-        second_generation_finished = threading.Event()
+    def test_bounded_queue_runs_two_ahead_in_canonical_order(self):
+        pairs = [
+            self.pair("gathering"),
+            self.pair(),
+            self.pair("gathering"),
+            self.pair(),
+        ]
+        first_consumption_started = threading.Event()
+        third_generation_started = threading.Event()
+        release_third_generation = threading.Event()
+        third_generation_finished = threading.Event()
         selection_calls = []
         selections = []
+        selection_threads = []
         generation_threads = []
         generation_calls = []
+        search_calls = []
+        candidate_refs = []
+        live_candidate_counts = []
 
         class Selection:
             def __init__(self, indices):
@@ -857,10 +905,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
                 return len(pairs)
 
             def select(self, indices):
-                self_outer.assertIs(
-                    threading.current_thread(), threading.main_thread()
-                )
-                self_outer.assertFalse(consumption_started.is_set())
+                selection_threads.append(threading.current_thread().name)
                 selection_calls.append(tuple(indices))
                 selection = Selection(indices)
                 selections.append(selection)
@@ -875,10 +920,12 @@ class GPUProfileOverlapTests(unittest.TestCase):
                     (selection.indices, F1, F2, F3, bias_filter)
                 )
                 if selection.indices == (1,):
-                    self_outer.assertTrue(consumption_started.wait(2))
+                    self_outer.assertTrue(first_consumption_started.wait(2))
+                    third_generation_started.set()
+                    self_outer.assertTrue(release_third_generation.wait(2))
                     time.sleep(0.03)
-                    second_generation_finished.set()
-                return SimpleNamespace(
+                    third_generation_finished.set()
+                candidates = SimpleNamespace(
                     indices=selection.indices,
                     F1=F1,
                     F2=F2,
@@ -886,22 +933,41 @@ class GPUProfileOverlapTests(unittest.TestCase):
                     bias_filter=bias_filter,
                     sealed=True,
                 )
+                # SimpleNamespace is not weak-referenceable; use a tiny bound
+                # wrapper so the test can prove the three-live-batch ceiling.
+                class Candidate:
+                    pass
+
+                candidate = Candidate()
+                candidate.__dict__.update(vars(candidates))
+                candidate_refs.append(weakref.ref(candidate))
+                live_candidate_counts.append(sum(
+                    reference() is not None for reference in candidate_refs
+                ))
+                return candidate
 
         self_outer = self
         modules, api = synthetic_plan7_gpu(True)
         observed = []
 
         def gpu_search(chunk, candidates, **kwargs):
+            search_calls.append((list(chunk), candidates.indices, kwargs))
+
             def results():
-                if candidates.indices == (0, 2):
-                    consumption_started.set()
-                    self.assertTrue(second_generation_finished.wait(2))
+                if candidates.indices == (0,):
+                    first_consumption_started.set()
+                    self.assertTrue(third_generation_started.wait(2))
+                    release_third_generation.set()
+                    self.assertTrue(third_generation_finished.wait(2))
+                    # Let the producer reach its bounded put while chunk 2 is
+                    # still resident in the sole ready slot.
+                    time.sleep(0.03)
                 for pair in chunk:
                     yield (candidates.indices, pair, kwargs)
 
             return results()
 
-        api.gpu_hmmsearch.side_effect = gpu_search
+        modules["plan7_gpu.astra_search"].hmmsearch = gpu_search
         metrics = search.GPUOverlapMetrics()
         pipeline_options = {
             "bit_cutoffs": "gathering",
@@ -913,7 +979,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="astra-gpu-overlap-") as temporary:
             with (
                 mock.patch.dict(sys.modules, modules),
-                mock.patch.object(search, "GPU_CELL_CAP", 4),
+                mock.patch.object(search, "GPU_CELL_CAP", 2),
                 mock.patch.object(
                     search, "define_kwargs", return_value=pipeline_options
                 ),
@@ -935,31 +1001,40 @@ class GPUProfileOverlapTests(unittest.TestCase):
                     gpu_metrics=metrics,
                 )
 
-        self.assertEqual(selection_calls, [(0, 2), (1,)])
+        self.assertEqual(selection_calls, [(0,), (2,), (1,), (3,)])
         self.assertTrue(all(selection.closed for selection in selections))
         self.assertTrue(all(selection.close_count == 1 for selection in selections))
+        self.assertTrue(all(
+            name.startswith("astra-gpu-generate")
+            for name in selection_threads
+        ))
         self.assertEqual(
             generation_calls,
             [
-                ((0, 2), 0.03, 0.004, 0.00005, False),
+                ((0,), 0.03, 0.004, 0.00005, False),
+                ((2,), 0.03, 0.004, 0.00005, False),
                 ((1,), 0.03, 0.004, 0.00005, False),
+                ((3,), 0.03, 0.004, 0.00005, False),
             ],
         )
-        self.assertEqual([item[0] for item in observed], [(0, 2), (0, 2), (1,)])
+        self.assertEqual(
+            [item[0] for item in observed],
+            [(0,), (2,), (1,), (3,)],
+        )
         self.assertTrue(
             all(name.startswith("astra-gpu-generate") for name in generation_threads)
         )
         self.assertEqual(
-            [call.args[0] for call in api.gpu_hmmsearch.call_args_list],
-            [[pairs[0], pairs[2]], [pairs[1]]],
+            [call[0] for call in search_calls],
+            [[pairs[0]], [pairs[2]], [pairs[1]], [pairs[3]]],
         )
-        for call in api.gpu_hmmsearch.call_args_list:
-            self.assertEqual(call.kwargs["F1"], 0.03)
-            self.assertEqual(call.kwargs["F2"], 0.004)
-            self.assertEqual(call.kwargs["F3"], 0.00005)
-            self.assertIs(call.kwargs["bias_filter"], False)
-            self.assertEqual(call.kwargs["cpus"], 2)
-            self.assertIs(call.kwargs["postfilter"], True)
+        for _, _, kwargs in search_calls:
+            self.assertEqual(kwargs["F1"], 0.03)
+            self.assertEqual(kwargs["F2"], 0.004)
+            self.assertEqual(kwargs["F3"], 0.00005)
+            self.assertIs(kwargs["bias_filter"], False)
+            self.assertEqual(kwargs["cpus"], 2)
+            self.assertIs(kwargs["postfilter"], True)
         snapshot = metrics.snapshot()
         self.assertEqual(snapshot["requested_thread_count"], 3)
         self.assertEqual(snapshot["profile_worker_count"], 0)
@@ -968,15 +1043,160 @@ class GPUProfileOverlapTests(unittest.TestCase):
         self.assertEqual(snapshot["producer_slot_count"], 1)
         self.assertEqual(snapshot["continuation_worker_count"], 2)
         self.assertTrue(snapshot["profile_overlap_enabled"])
-        self.assertEqual(snapshot["chunk_count"], 2)
-        self.assertEqual(snapshot["generated_chunk_count"], 2)
-        self.assertEqual(snapshot["consumed_chunk_count"], 2)
+        self.assertEqual(snapshot["scheduler_mode"], "bounded-ready-queue")
+        self.assertEqual(snapshot["chunk_count"], 4)
+        self.assertEqual(snapshot["generated_chunk_count"], 4)
+        self.assertEqual(snapshot["consumed_chunk_count"], 4)
+        self.assertEqual(snapshot["ready_queue_capacity"], 1)
+        self.assertEqual(snapshot["ready_queue_high_water"], 1)
+        self.assertEqual(snapshot["producer_lookahead_capacity"], 2)
+        self.assertEqual(snapshot["producer_lookahead_high_water"], 2)
+        self.assertGreaterEqual(snapshot["producer_lookahead_start_count"], 1)
+        self.assertEqual(snapshot["live_candidate_capacity"], 3)
+        self.assertGreaterEqual(snapshot["producer_idle_count"], 1)
+        self.assertGreater(snapshot["producer_idle_seconds"], 0.01)
         self.assertGreater(snapshot["selection_seconds"], 0.0)
         self.assertGreater(snapshot["overlap_seconds"], 0.01)
+        self.assertEqual(max(live_candidate_counts), 3)
+        gc.collect()
+        self.assertTrue(all(reference() is None for reference in candidate_refs))
         self.assertFalse(any(
             thread.name.startswith("astra-gpu-generate")
             for thread in threading.enumerate()
         ))
+
+    def test_legacy_single_prefetch_control_retains_old_scheduler(self):
+        pairs = [self.pair(), self.pair()]
+        selection_threads = []
+        generation_threads = []
+        emitted = []
+
+        class Selection:
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+
+            def close(self):
+                pass
+
+        class Session:
+            closed = False
+            statistics = {"worker_count": 0, "host_bytes": 1234}
+
+            def __len__(self):
+                return 2
+
+            def select(self, indices):
+                selection_threads.append(threading.current_thread().name)
+                return Selection(indices)
+
+        class Batch:
+            def _postfilter_forward_selection(
+                self, selection, F1, F2, F3, bias_filter
+            ):
+                generation_threads.append(threading.current_thread().name)
+                return SimpleNamespace(indices=selection.indices)
+
+        modules, api = synthetic_plan7_gpu(True)
+        api.gpu_hmmsearch.side_effect = (
+            lambda _chunk, candidates, **_kwargs: iter((candidates.indices,))
+        )
+        metrics = search.GPUOverlapMetrics()
+        with tempfile.TemporaryDirectory(
+            prefix="astra-gpu-legacy-overlap-"
+        ) as temporary:
+            with (
+                mock.patch.dict(sys.modules, modules),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        search.GPU_LEGACY_OVERLAP_ENV:
+                            search.GPU_LEGACY_OVERLAP_VALUE,
+                    },
+                ),
+                mock.patch.object(search, "GPU_CELL_CAP", 1),
+                mock.patch.object(
+                    search,
+                    "process_hits_to_file",
+                    side_effect=lambda hits, _fh: emitted.append(hits),
+                ),
+            ):
+                search.hmmsearch(
+                    {}, pairs, 2, search_options(temporary),
+                    all_sequences=[object()],
+                    gpu_sequence_batch=Batch(),
+                    gpu_postfilter=True,
+                    gpu_profile_session=Session(),
+                    gpu_metrics=metrics,
+                )
+
+        self.assertEqual(emitted, [(0,), (1,)])
+        self.assertTrue(all(
+            name == threading.main_thread().name
+            for name in selection_threads
+        ))
+        self.assertTrue(all(
+            name.startswith("astra-gpu-generate")
+            for name in generation_threads
+        ))
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["scheduler_mode"], "single-prefetch")
+        self.assertEqual(snapshot["ready_queue_capacity"], 0)
+        self.assertEqual(snapshot["producer_lookahead_high_water"], 0)
+
+    def test_legacy_selector_rejects_serial_and_sessionless_fallback(self):
+        pair = self.pair()
+
+        class Session:
+            closed = False
+            statistics = {"worker_count": 0, "host_bytes": 1234}
+            select_count = 0
+
+            def __len__(self):
+                return 1
+
+            def select(self, _indices):
+                self.select_count += 1
+                raise AssertionError("selection reached")
+
+        class Batch:
+            def _postfilter_forward_selection(self, *_args):
+                raise AssertionError("generation reached")
+
+        modules, _ = synthetic_plan7_gpu(True)
+        with tempfile.TemporaryDirectory(
+            prefix="astra-gpu-legacy-selector-"
+        ) as temporary:
+            root = Path(temporary)
+            with (
+                mock.patch.dict(sys.modules, modules),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        search.GPU_LEGACY_OVERLAP_ENV:
+                            search.GPU_LEGACY_OVERLAP_VALUE,
+                    },
+                ),
+            ):
+                for label, session in (
+                    ("serial", Session()),
+                    ("sessionless", None),
+                ):
+                    outdir = root / label
+                    with self.subTest(label=label):
+                        with self.assertRaisesRegex(
+                            search.GPUConfigurationError,
+                            "requires an active overlapping",
+                        ):
+                            search.hmmsearch(
+                                {}, [pair], 1, search_options(outdir),
+                                all_sequences=[object()],
+                                gpu_sequence_batch=Batch(),
+                                gpu_postfilter=True,
+                                gpu_profile_session=session,
+                            )
+                        self.assertFalse(outdir.exists())
+                        if session is not None:
+                            self.assertEqual(session.select_count, 0)
 
     def test_one_thread_budget_uses_serial_full_forward_session(self):
         pair = self.pair()
@@ -1133,6 +1353,82 @@ class GPUProfileOverlapTests(unittest.TestCase):
                     )
 
         self.assertEqual(emitted, ["row-0"])
+        self.assertEqual(api.gpu_hmmsearch.call_count, 1)
+        self.assertFalse(any(
+            thread.name.startswith("astra-gpu-generate")
+            for thread in threading.enumerate()
+        ))
+
+    def test_generation_failure_is_fifo_and_stops_later_selection(self):
+        pairs = [self.pair(), self.pair(), self.pair()]
+        selection_calls = []
+        generation_calls = []
+        selections = []
+        emitted = []
+
+        class Selection:
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+                self.close_count = 0
+
+            def close(self):
+                self.close_count += 1
+
+        class Session:
+            closed = False
+            statistics = {"worker_count": 0, "host_bytes": 1234}
+
+            def __len__(self):
+                return 3
+
+            def select(self, indices):
+                selection_calls.append(tuple(indices))
+                selection = Selection(indices)
+                selections.append(selection)
+                return selection
+
+        class Batch:
+            def _postfilter_forward_selection(
+                self, selection, F1, F2, F3, bias_filter
+            ):
+                generation_calls.append(selection.indices)
+                if selection.indices == (1,):
+                    raise RuntimeError("future generation failed")
+                return SimpleNamespace(indices=selection.indices)
+
+        modules, api = synthetic_plan7_gpu(True)
+        api.gpu_hmmsearch.side_effect = (
+            lambda _chunk, candidates, **_kwargs: iter((candidates.indices,))
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="astra-gpu-generation-order-"
+        ) as temporary:
+            with (
+                mock.patch.dict(sys.modules, modules),
+                mock.patch.object(search, "GPU_CELL_CAP", 1),
+                mock.patch.object(
+                    search,
+                    "process_hits_to_file",
+                    side_effect=lambda hits, _fh: emitted.append(hits),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "future generation failed"
+                ):
+                    search.hmmsearch(
+                        {}, pairs, 2, search_options(temporary),
+                        all_sequences=[object()],
+                        gpu_sequence_batch=Batch(),
+                        gpu_postfilter=True,
+                        gpu_profile_session=Session(),
+                    )
+
+        self.assertEqual(emitted, [(0,)])
+        self.assertEqual(selection_calls, [(0,), (1,)])
+        self.assertEqual(generation_calls, [(0,), (1,)])
+        self.assertEqual(
+            [selection.close_count for selection in selections], [1, 1]
+        )
         self.assertEqual(api.gpu_hmmsearch.call_count, 1)
         self.assertFalse(any(
             thread.name.startswith("astra-gpu-generate")
@@ -1314,10 +1610,99 @@ class GPUProfileOverlapTests(unittest.TestCase):
             for thread in threading.enumerate()
         ))
 
-    def test_cancelled_queued_generation_closes_its_selection_once(self):
-        pairs = [self.pair(), self.pair()]
+    def test_current_error_drains_ready_and_inflight_candidates(self):
+        pairs = [self.pair(), self.pair(), self.pair()]
         selections = []
-        queued_future = None
+        candidate_refs = []
+        third_generation_started = threading.Event()
+        release_third_generation = threading.Event()
+
+        class Selection:
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+                self.close_count = 0
+
+            def close(self):
+                self.close_count += 1
+
+        class Session:
+            closed = False
+            statistics = {"worker_count": 0, "host_bytes": 1234}
+
+            def __len__(self):
+                return 3
+
+            def select(self, indices):
+                selection = Selection(indices)
+                selections.append(selection)
+                return selection
+
+        class Candidate:
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+
+        class Batch:
+            def _postfilter_forward_selection(
+                self, selection, F1, F2, F3, bias_filter
+            ):
+                if selection.indices == (2,):
+                    third_generation_started.set()
+                    self_outer.assertTrue(release_third_generation.wait(2))
+                candidate = Candidate(selection.indices)
+                candidate_refs.append(weakref.ref(candidate))
+                return candidate
+
+        def gpu_search(_chunk, candidates, **_kwargs):
+            def results():
+                yield (candidates.indices, "current-row")
+
+            return results()
+
+        def fail_current_output(_hits, _fh):
+            self.assertTrue(third_generation_started.wait(2))
+            release_third_generation.set()
+            raise ValueError("current write failed")
+
+        self_outer = self
+        modules, api = synthetic_plan7_gpu(True)
+        modules["plan7_gpu.astra_search"].hmmsearch = gpu_search
+        with tempfile.TemporaryDirectory(prefix="astra-gpu-cancel-") as temporary:
+            with (
+                mock.patch.dict(sys.modules, modules),
+                mock.patch.object(search, "GPU_CELL_CAP", 1),
+                mock.patch.object(
+                    search,
+                    "process_hits_to_file",
+                    side_effect=fail_current_output,
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "current write failed"):
+                    search.hmmsearch(
+                        {}, pairs, 2, search_options(temporary),
+                        all_sequences=[object()],
+                        gpu_sequence_batch=Batch(),
+                        gpu_postfilter=True,
+                        gpu_profile_session=Session(),
+                    )
+
+        self.assertEqual(
+            [selection.close_count for selection in selections],
+            [1, 1, 1],
+        )
+        gc.collect()
+        self.assertEqual(len(candidate_refs), 3)
+        self.assertTrue(all(reference() is None for reference in candidate_refs))
+        self.assertFalse(any(
+            thread.name.startswith("astra-gpu-generate")
+            for thread in threading.enumerate()
+        ))
+
+    def test_current_error_wins_join_interrupt_and_join_retries_to_exit(self):
+        pairs = [self.pair(), self.pair()]
+        second_generation_started = threading.Event()
+        second_generation_finished = threading.Event()
+        selections = []
+        outer_resource_closed = threading.Event()
 
         class Selection:
             def __init__(self, indices):
@@ -1343,73 +1728,83 @@ class GPUProfileOverlapTests(unittest.TestCase):
             def _postfilter_forward_selection(
                 self, selection, F1, F2, F3, bias_filter
             ):
+                if selection.indices == (1,):
+                    second_generation_started.set()
+                    time.sleep(0.05)
+                    self_outer.assertFalse(outer_resource_closed.is_set())
+                    second_generation_finished.set()
                 return SimpleNamespace(indices=selection.indices)
 
-        class ImmediateFuture:
-            def __init__(self, function, args):
-                self.function = function
-                self.args = args
+        class InterruptingJoinThread(threading.Thread):
+            instances = []
 
-            def done(self):
-                return False
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.join_calls = 0
+                self._misreport_dead = False
+                self.premature_join = None
+                self.instances.append(self)
 
-            def result(self):
-                return self.function(*self.args)
+            def join(self, *args, **kwargs):
+                self.join_calls += 1
+                if self.join_calls == 1:
+                    self.premature_join = not second_generation_finished.is_set()
+                    self._misreport_dead = True
+                    raise RuntimeError("join interrupted")
+                result = super().join(*args, **kwargs)
+                self._misreport_dead = False
+                return result
 
-            def cancel(self):
-                return False
+            def is_alive(self):
+                if self._misreport_dead:
+                    return False
+                return super().is_alive()
 
-        class QueuedFuture:
-            cancelled = False
+        def gpu_search(_chunk, candidates, **_kwargs):
+            return iter(((candidates.indices, "current-row"),))
 
-            def done(self):
-                return False
+        def fail_current_output(_hits, _fh):
+            self.assertTrue(second_generation_started.wait(2))
+            raise ValueError("current write failed")
 
-            def cancel(self):
-                self.cancelled = True
-                return True
-
-        class Executor:
-            def __init__(self, **_kwargs):
-                self.submit_count = 0
-
-            def submit(self, function, *args):
-                nonlocal queued_future
-                self.submit_count += 1
-                if self.submit_count == 1:
-                    return ImmediateFuture(function, args)
-                queued_future = QueuedFuture()
-                return queued_future
-
-            def shutdown(self, **_kwargs):
-                pass
-
-        modules, api = synthetic_plan7_gpu(True)
-        api.gpu_hmmsearch.return_value = iter(("current-row",))
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-cancel-") as temporary:
+        self_outer = self
+        modules, _ = synthetic_plan7_gpu(True)
+        modules["plan7_gpu.astra_search"].hmmsearch = gpu_search
+        with tempfile.TemporaryDirectory(
+            prefix="astra-gpu-join-interrupt-"
+        ) as temporary:
             with (
                 mock.patch.dict(sys.modules, modules),
-                mock.patch.object(search, "GPU_CELL_CAP", 2),
-                mock.patch.object(search, "ThreadPoolExecutor", Executor),
+                mock.patch.object(search, "GPU_CELL_CAP", 1),
+                mock.patch.object(search, "Thread", InterruptingJoinThread),
                 mock.patch.object(
                     search,
                     "process_hits_to_file",
-                    side_effect=ValueError("current write failed"),
+                    side_effect=fail_current_output,
                 ),
             ):
-                with self.assertRaisesRegex(ValueError, "current write failed"):
-                    search.hmmsearch(
-                        {}, pairs, 2, search_options(temporary),
-                        all_sequences=[object(), object()],
-                        gpu_sequence_batch=Batch(),
-                        gpu_postfilter=True,
-                        gpu_profile_session=Session(),
-                    )
+                try:
+                    with self.assertRaisesRegex(
+                        ValueError, "current write failed"
+                    ):
+                        search.hmmsearch(
+                            {}, pairs, 2, search_options(temporary),
+                            all_sequences=[object()],
+                            gpu_sequence_batch=Batch(),
+                            gpu_postfilter=True,
+                            gpu_profile_session=Session(),
+                        )
+                finally:
+                    outer_resource_closed.set()
 
-        self.assertTrue(queued_future.cancelled)
+        self.assertTrue(second_generation_finished.is_set())
+        self.assertEqual(len(InterruptingJoinThread.instances), 1)
+        producer = InterruptingJoinThread.instances[0]
+        self.assertIs(producer.premature_join, False)
+        self.assertEqual(producer.join_calls, 2)
+        self.assertFalse(producer.is_alive())
         self.assertEqual(
-            [selection.close_count for selection in selections],
-            [1, 1],
+            [selection.close_count for selection in selections], [1, 1]
         )
 
 

@@ -7,6 +7,8 @@ import time
 import logging
 import shutil
 from pathlib import Path
+from queue import Empty, Full, Queue
+from threading import Event, Thread
 from tqdm import tqdm
 import pyhmmer
 from concurrent.futures import ThreadPoolExecutor
@@ -19,7 +21,12 @@ HMM_CHUNK_SIZE = 2000
 GPU_CELL_CAP = 100_000_000
 GPU_TIMING_ENV = 'ASTRA_GPU_OVERLAP_TIMING'
 GPU_SERIAL_ENV = 'ASTRA_GPU_PROFILE_SERIAL'
+GPU_LEGACY_OVERLAP_ENV = 'ASTRA_GPU_PROFILE_LEGACY_OVERLAP'
+GPU_LEGACY_OVERLAP_VALUE = 'single-prefetch'
 GPU_DOMAIN_GUARD = 2.0e-4
+GPU_READY_QUEUE_CAPACITY = 1
+GPU_PRODUCER_LOOKAHEAD_CAPACITY = GPU_READY_QUEUE_CAPACITY + 1
+GPU_LIVE_CANDIDATE_CAPACITY = GPU_READY_QUEUE_CAPACITY + 2
 
 
 class GPUConfigurationError(ValueError):
@@ -37,11 +44,20 @@ class GPUOverlapMetrics:
         self.producer_slot_count = 0
         self.continuation_worker_count = 0
         self.profile_overlap_enabled = False
+        self.scheduler_mode = 'none'
         self.profile_host_bytes = 0
         self.chunk_count = 0
         self.generated_chunk_count = 0
         self.consumed_chunk_count = 0
         self.ready_without_wait_count = 0
+        self.ready_queue_capacity = 0
+        self.ready_queue_high_water = 0
+        self.producer_lookahead_capacity = 0
+        self.producer_idle_count = 0
+        self.producer_idle_seconds = 0.0
+        self.producer_lookahead_high_water = 0
+        self.producer_lookahead_start_count = 0
+        self.live_candidate_capacity = 0
         self.profile_load_seconds = 0.0
         self.session_build_seconds = 0.0
         self.target_batch_seconds = 0.0
@@ -66,11 +82,24 @@ class GPUOverlapMetrics:
             'producer_slot_count': self.producer_slot_count,
             'continuation_worker_count': self.continuation_worker_count,
             'profile_overlap_enabled': self.profile_overlap_enabled,
+            'scheduler_mode': self.scheduler_mode,
             'profile_host_bytes': self.profile_host_bytes,
             'chunk_count': self.chunk_count,
             'generated_chunk_count': self.generated_chunk_count,
             'consumed_chunk_count': self.consumed_chunk_count,
             'ready_without_wait_count': self.ready_without_wait_count,
+            'ready_queue_capacity': self.ready_queue_capacity,
+            'ready_queue_high_water': self.ready_queue_high_water,
+            'producer_lookahead_capacity': self.producer_lookahead_capacity,
+            'producer_idle_count': self.producer_idle_count,
+            'producer_idle_seconds': self.producer_idle_seconds,
+            'producer_lookahead_high_water': (
+                self.producer_lookahead_high_water
+            ),
+            'producer_lookahead_start_count': (
+                self.producer_lookahead_start_count
+            ),
+            'live_candidate_capacity': self.live_candidate_capacity,
             'profile_load_seconds': self.profile_load_seconds,
             'session_build_seconds': self.session_build_seconds,
             'target_batch_seconds': self.target_batch_seconds,
@@ -115,6 +144,24 @@ def gpu_profile_worker_allocation(threads, overlap_requested):
     producer_slots = int(threads >= 2)
     overlap_enabled = overlap_requested and bool(producer_slots)
     return overlap_enabled, producer_slots, threads - producer_slots
+
+
+def gpu_profile_scheduler_mode(profile_session, overlap_enabled):
+    """Select the production queue or the exact benchmark control."""
+    value = os.environ.get(GPU_LEGACY_OVERLAP_ENV)
+    if value is None:
+        return 'bounded-ready-queue' if overlap_enabled else 'serial'
+    if value != GPU_LEGACY_OVERLAP_VALUE:
+        raise GPUConfigurationError(
+            f"{GPU_LEGACY_OVERLAP_ENV} accepts only "
+            f"{GPU_LEGACY_OVERLAP_VALUE!r}"
+        )
+    if profile_session is None or not overlap_enabled:
+        raise GPUConfigurationError(
+            f"{GPU_LEGACY_OVERLAP_ENV} requires an active overlapping "
+            "GPU profile session"
+        )
+    return 'single-prefetch'
 
 
 def parse_gpu_manifest_mappings(entries):
@@ -747,6 +794,7 @@ def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
 
     if gpu_metrics is not None:
         statistics = profile_session.statistics
+        gpu_metrics.scheduler_mode = 'serial'
         gpu_metrics.chunk_count += len(chunks)
         gpu_metrics.profile_worker_count = statistics['worker_count']
         gpu_metrics.profile_build_worker_count = statistics.get(
@@ -803,10 +851,10 @@ def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
             )
 
 
-def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
-                              threads, fh, gpu_metrics=None,
-                              domain_continuation=False):
-    """Overlap one sealed GPU-through-Forward batch with one CPU consumer."""
+def _run_gpu_profile_single_prefetch(chunks, profile_session, sequence_batch,
+                                     threads, fh, gpu_metrics=None,
+                                     domain_continuation=False):
+    """Retain the original one-future overlap scheduler as a control."""
     if not chunks:
         return
 
@@ -814,6 +862,7 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
 
     if gpu_metrics is not None:
         statistics = profile_session.statistics
+        gpu_metrics.scheduler_mode = 'single-prefetch'
         gpu_metrics.chunk_count += len(chunks)
         gpu_metrics.profile_worker_count = statistics['worker_count']
         gpu_metrics.profile_build_worker_count = statistics.get(
@@ -950,6 +999,309 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
             )
 
 
+def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
+                              threads, fh, gpu_metrics=None,
+                              domain_continuation=False):
+    """Continuously produce ordered GPU batches into one bounded ready slot.
+
+    The producer owns selection and CUDA generation.  While the caller consumes
+    chunk ``i``, the ready queue may retain ``i + 1`` and the producer may work
+    on ``i + 2``.  The single ready slot is the only additional completed-batch
+    storage relative to the original one-future scheduler.
+    """
+    if not chunks:
+        return
+
+    from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
+
+    if gpu_metrics is not None:
+        statistics = profile_session.statistics
+        gpu_metrics.scheduler_mode = 'bounded-ready-queue'
+        gpu_metrics.ready_queue_capacity = GPU_READY_QUEUE_CAPACITY
+        gpu_metrics.producer_lookahead_capacity = (
+            GPU_PRODUCER_LOOKAHEAD_CAPACITY
+        )
+        gpu_metrics.live_candidate_capacity = GPU_LIVE_CANDIDATE_CAPACITY
+        gpu_metrics.chunk_count += len(chunks)
+        gpu_metrics.profile_worker_count = statistics['worker_count']
+        gpu_metrics.profile_build_worker_count = statistics.get(
+            'build_worker_count', statistics['worker_count']
+        )
+        gpu_metrics.profile_selection_worker_count = statistics.get(
+            'selection_worker_count', statistics['worker_count']
+        )
+        gpu_metrics.profile_host_bytes = statistics['host_bytes']
+
+    ready = Queue(maxsize=GPU_READY_QUEUE_CAPACITY)
+    stop = Event()
+    producer_done = Event()
+    producer_state = {
+        'idle_count': 0,
+        'idle_seconds': 0.0,
+        'ready_high_water': 0,
+        'terminal_error': None,
+    }
+
+    def publish(item):
+        if stop.is_set():
+            return False
+        try:
+            ready.put_nowait(item)
+        except Full:
+            producer_state['idle_count'] += 1
+            idle_started = time.perf_counter()
+            while not stop.is_set():
+                try:
+                    ready.put(item, timeout=0.05)
+                    producer_state['idle_seconds'] += (
+                        time.perf_counter() - idle_started
+                    )
+                    producer_state['ready_high_water'] = max(
+                        producer_state['ready_high_water'], 1
+                    )
+                    return True
+                except Full:
+                    pass
+            producer_state['idle_seconds'] += (
+                time.perf_counter() - idle_started
+            )
+            return False
+        producer_state['ready_high_water'] = max(
+            producer_state['ready_high_water'], 1
+        )
+        return True
+
+    def produce():
+        try:
+            for position, spec in enumerate(chunks):
+                if stop.is_set():
+                    return
+                selection = None
+                candidates = None
+                selection_started = time.perf_counter()
+                try:
+                    selection = profile_session.select(spec[2])
+                except BaseException as error:
+                    selection_finished = time.perf_counter()
+                    item = (
+                        position, spec, None, error,
+                        selection_started, selection_finished, None, None,
+                    )
+                    publish(item)
+                    item = None
+                    return
+                selection_finished = time.perf_counter()
+                generation_started = time.perf_counter()
+                try:
+                    candidates = _generate_gpu_profile_candidates(
+                        sequence_batch,
+                        selection,
+                        spec[3],
+                        domain_continuation,
+                    )
+                except BaseException as error:
+                    try:
+                        selection.close()
+                    except BaseException:
+                        pass
+                    selection = None
+                    item = (
+                        position, spec, None, error,
+                        selection_started, selection_finished,
+                        generation_started, None,
+                    )
+                    publish(item)
+                    item = None
+                    return
+                try:
+                    selection.close()
+                except BaseException as error:
+                    selection = None
+                    candidates = None
+                    item = (
+                        position, spec, None, error,
+                        selection_started, selection_finished,
+                        generation_started, None,
+                    )
+                    publish(item)
+                    item = None
+                    return
+                selection = None
+                generation_finished = time.perf_counter()
+                item = (
+                    position, spec, candidates, None,
+                    selection_started, selection_finished,
+                    generation_started, generation_finished,
+                )
+                if not publish(item):
+                    item = None
+                    candidates = None
+                    return
+                item = None
+                candidates = None
+        except BaseException as error:
+            producer_state['terminal_error'] = error
+        finally:
+            producer_done.set()
+
+    def next_ready():
+        try:
+            return ready.get_nowait(), True
+        except Empty:
+            pass
+        while True:
+            try:
+                return ready.get(timeout=0.05), False
+            except Empty:
+                if producer_done.is_set():
+                    error = producer_state['terminal_error']
+                    if error is not None:
+                        raise error
+                    raise RuntimeError(
+                        "GPU profile producer stopped before publishing "
+                        "every ordered chunk"
+                    )
+
+    def discard_ready():
+        while True:
+            try:
+                item = ready.get_nowait()
+            except Empty:
+                return
+            item = None
+
+    pipeline_started = time.perf_counter()
+    producer = Thread(
+        target=produce,
+        name='astra-gpu-generate_0',
+        daemon=False,
+    )
+    producer_started = False
+    consumption_intervals = []
+    try:
+        producer.start()
+        producer_started = True
+        for position, spec in enumerate(chunks):
+            wait_started = time.perf_counter()
+            item, ready_without_wait = next_ready()
+            wait_seconds = time.perf_counter() - wait_started
+            (
+                produced_position,
+                produced_spec,
+                candidates,
+                producer_error,
+                selection_started,
+                selection_finished,
+                generation_started,
+                generation_finished,
+            ) = item
+            item = None
+            if produced_position != position or produced_spec is not spec:
+                candidates = None
+                raise RuntimeError("GPU profile producer changed chunk order")
+            if gpu_metrics is not None:
+                gpu_metrics.selection_seconds += (
+                    selection_finished - selection_started
+                )
+            if producer_error is not None:
+                raise producer_error
+            if generation_started is None or generation_finished is None:
+                candidates = None
+                raise RuntimeError("GPU profile producer omitted generation timing")
+            if gpu_metrics is not None:
+                gpu_metrics.generated_chunk_count += 1
+                gpu_metrics.ready_without_wait_count += int(ready_without_wait)
+                gpu_metrics.generation_seconds += (
+                    generation_finished - generation_started
+                )
+                gpu_metrics.generation_wait_seconds += wait_seconds
+                if position == 0:
+                    gpu_metrics.initial_generation_wait_seconds += wait_seconds
+                else:
+                    gpu_metrics.pipeline_stall_seconds += wait_seconds
+                generation_lookahead = 0
+                for consumed_position, (
+                    consumption_started,
+                    consumption_finished,
+                ) in enumerate(consumption_intervals):
+                    overlap_start = max(
+                        generation_started, consumption_started
+                    )
+                    overlap_finish = min(
+                        generation_finished, consumption_finished
+                    )
+                    gpu_metrics.overlap_seconds += max(
+                        0.0, overlap_finish - overlap_start
+                    )
+                    # A generation may begin in the narrow handoff before
+                    # continuation records its start.  It is still useful
+                    # lookahead when it began before that older chunk finished.
+                    if generation_started < consumption_finished:
+                        generation_lookahead = max(
+                            generation_lookahead,
+                            position - consumed_position,
+                        )
+                gpu_metrics.producer_lookahead_high_water = max(
+                    gpu_metrics.producer_lookahead_high_water,
+                    generation_lookahead,
+                )
+                gpu_metrics.producer_lookahead_start_count += int(
+                    generation_lookahead >= 2
+                )
+
+            consumption_interval = _consume_gpu_candidate_chunk(
+                spec,
+                candidates,
+                len(chunks),
+                threads,
+                fh,
+                gpu_hmmsearch,
+                gpu_metrics,
+            )
+            candidates = None
+            consumption_intervals.append(consumption_interval)
+    finally:
+        active_error = sys.exc_info()[1]
+        stop.set()
+        discard_ready()
+        join_error = None
+        if producer_started:
+            # Thread.is_alive() cannot prove target termination after an
+            # interrupted join: CPython may mark the Thread stopped while its
+            # target is still running.  The target-owned event is its final
+            # action and therefore seals all session and CandidateBatch use.
+            while not producer_done.is_set():
+                try:
+                    producer_done.wait(timeout=0.05)
+                except BaseException as error:
+                    if join_error is None:
+                        join_error = error
+            # Retire the Python thread too.  A transient join interruption is
+            # recorded, but cleanup is retried to completion before the outer
+            # scope may close the session or target batch.
+            while True:
+                try:
+                    producer.join()
+                except BaseException as error:
+                    if join_error is None:
+                        join_error = error
+                    continue
+                break
+        discard_ready()
+        if gpu_metrics is not None:
+            gpu_metrics.ready_queue_high_water = max(
+                gpu_metrics.ready_queue_high_water,
+                producer_state['ready_high_water'],
+            )
+            gpu_metrics.producer_idle_count += producer_state['idle_count']
+            gpu_metrics.producer_idle_seconds += producer_state['idle_seconds']
+            gpu_metrics.pipeline_wall_seconds += (
+                time.perf_counter() - pipeline_started
+            )
+        if join_error is not None and active_error is None:
+            raise join_error
+
+
 
 def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
               macsyfinder_dir=None, hmm_name_to_filename=None,
@@ -1011,6 +1363,9 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
             gpu_metrics.producer_slot_count = producer_slots
             gpu_metrics.continuation_worker_count = continuation_threads
             gpu_metrics.profile_overlap_enabled = profile_overlap_enabled
+    profile_scheduler_mode = gpu_profile_scheduler_mode(
+        gpu_profile_session, profile_overlap_enabled
+    )
 
     # Always write to temp files — bulk mode is faster and avoids
     # keeping huge result lists in memory.  The per-genome loop is
@@ -1119,11 +1474,12 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                     ))
 
             if gpu_profile_session is not None:
-                profile_runner = (
-                    _run_gpu_profile_pipeline
-                    if profile_overlap_enabled
-                    else _run_gpu_profile_serial
-                )
+                if profile_scheduler_mode == 'bounded-ready-queue':
+                    profile_runner = _run_gpu_profile_pipeline
+                elif profile_scheduler_mode == 'single-prefetch':
+                    profile_runner = _run_gpu_profile_single_prefetch
+                else:
+                    profile_runner = _run_gpu_profile_serial
                 profile_runner(
                     chunks,
                     gpu_profile_session,
