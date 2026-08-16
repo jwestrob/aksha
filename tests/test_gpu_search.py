@@ -2,6 +2,7 @@ import argparse
 import builtins
 import gc
 import importlib
+import inspect
 import io
 import os
 import sys
@@ -84,7 +85,11 @@ def make_pressed_members(directory, base_name):
 def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
                         simple_available=None, domain_adapter_available=True,
                         domain_method_available=None,
-                        domain_native_available=None):
+                        domain_native_available=None,
+                        compact_adapter_available=False,
+                        compact_native_available=False,
+                        compact_seam_available=None,
+                        compact_tail_available=None):
     """Return optional-package modules suitable for CPU-only wiring tests."""
     package = ModuleType("plan7_gpu")
     package.__path__ = []
@@ -99,19 +104,71 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
         domain_native_available = domain_adapter_available
 
     class LegacySequenceBatch:
-        def _postfilter_forward_selection(self):
+        def _postfilter_forward_selection(
+            self, selection, F1, F2, F3, bias_filter, *,
+            pipeline=None, domain_guard=2.0e-4,
+        ):
             pass
 
     class DomainSequenceBatch(LegacySequenceBatch):
-        def _postfilter_forward_domain_selection(self):
+        def _postfilter_forward_domain_selection(
+            self, selection, F1, f2, f3, bias_filter,
+            pipeline, domain_guard,
+        ):
+            pass
+
+    class CompactSequenceBatch:
+        def _postfilter_forward_selection(
+            self, selection, F1, F2, F3, bias_filter, *,
+            pipeline=None, domain_guard=2.0e-4,
+            _rescore_compact_byte_budget=0,
+            _rescore_matrix_byte_budget=0,
+            _rescore_trace_byte_budget=0,
+            _rescore_test_fault=0,
+        ):
+            pass
+
+    class CompactDomainSequenceBatch(CompactSequenceBatch):
+        def _postfilter_forward_domain_selection(
+            self, selection, F1, f2, f3, bias_filter,
+            pipeline, domain_guard, rescore_compact_byte_budget,
+            rescore_matrix_byte_budget, rescore_trace_byte_budget,
+            rescore_test_fault,
+        ):
             pass
 
     class LegacyNativeSequenceBatch:
+        def _postfilter_forward_domain_selection_sealed(
+            self, selection, f1, f2, f3, guard_band=2.0e-4,
+            gathered_byte_budget=0,
+        ):
+            pass
+
+    class CompactNativeSequenceBatch:
+        def _postfilter_forward_domain_selection_sealed(
+            self, selection, f1, f2, f3, guard_band=2.0e-4,
+            gathered_byte_budget=0, rescore_simple_diagnostic=False,
+            rescore_matrix_byte_budget=0, rescore_trace_byte_budget=0,
+            rescore_compact_byte_budget=0, _rescore_test_fault=0,
+            generation_tail_fingerprint=0,
+        ):
+            pass
+
+    class NoDomainNativeSequenceBatch:
         pass
 
-    class DomainNativeSequenceBatch:
-        def _postfilter_forward_domain_selection_sealed(self):
-            pass
+    if compact_adapter_available:
+        sequence_batch_spec = (
+            CompactDomainSequenceBatch
+            if domain_method_available
+            else CompactSequenceBatch
+        )
+    else:
+        sequence_batch_spec = (
+            DomainSequenceBatch
+            if domain_method_available
+            else LegacySequenceBatch
+        )
 
     default_batch = mock.Mock(name="sequence_batch")
     default_batch.memory_snapshot = {"device_ordinal": 0}
@@ -119,11 +176,7 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
         ProfileSession=mock.Mock(name="ProfileSession"),
         SequenceBatch=mock.Mock(
             name="SequenceBatch",
-            spec=(
-                DomainSequenceBatch
-                if domain_method_available
-                else LegacySequenceBatch
-            ),
+            spec=sequence_batch_spec,
             return_value=default_batch,
         ),
         load_pressed_profiles=mock.Mock(name="load_pressed_profiles"),
@@ -132,8 +185,17 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
         filter_scores_seam_available=None,
         forward_scores_seam_available=None,
         simple_regions_seam_available=None,
+        compact_domains_seam_available=None,
+        compact_tail_fingerprint=None,
         seal_profile_selection_continuation=None,
     )
+    api.SequenceBatch._postfilter_forward_selection = (
+        sequence_batch_spec._postfilter_forward_selection
+    )
+    if domain_method_available:
+        api.SequenceBatch._postfilter_forward_domain_selection = (
+            sequence_batch_spec._postfilter_forward_domain_selection
+        )
     if postfilter_available is not None:
         api.filter_scores_seam_available = mock.Mock(
             name="filter_scores_seam_available",
@@ -167,17 +229,35 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
             pipeline_module._seal_profile_selection_continuation_bound = (
                 api.seal_profile_selection_continuation
             )
+    if compact_seam_available is not None:
+        api.compact_domains_seam_available = mock.Mock(
+            name="compact_domains_seam_available",
+            return_value=compact_seam_available,
+        )
+        pipeline_module._compact_domains_seam_available = (
+            api.compact_domains_seam_available
+        )
+    if compact_tail_available is None:
+        compact_tail_available = compact_seam_available is not None
+    if compact_tail_available:
+        api.compact_tail_fingerprint = mock.Mock(
+            name="compact_tail_fingerprint"
+        )
+        pipeline_module._compact_tail_fingerprint_bound = (
+            api.compact_tail_fingerprint
+        )
     package.SequenceBatch = api.SequenceBatch
     package.ProfileSession = api.ProfileSession
     package.load_pressed_profiles = api.load_pressed_profiles
     package.astra_search = astra_search_module
     package._native = native_module
     package._pipeline = pipeline_module
-    native_module.SequenceBatch = (
-        DomainNativeSequenceBatch
-        if domain_native_available
-        else LegacyNativeSequenceBatch
-    )
+    if not domain_native_available:
+        native_module.SequenceBatch = NoDomainNativeSequenceBatch
+    elif compact_native_available:
+        native_module.SequenceBatch = CompactNativeSequenceBatch
+    else:
+        native_module.SequenceBatch = LegacyNativeSequenceBatch
     astra_search_module.hmmsearch = api.gpu_hmmsearch
     manifest_module.validate_pressed_manifest = api.validate_pressed_manifest
     return (
@@ -1374,6 +1454,71 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
                         search.gpu_profile_domain_available(), expected
                     )
 
+    def test_compact_probe_requires_a_coherent_v2_journal_abi(self):
+        complete_v2 = {
+            "postfilter_available": True,
+            "forward_available": True,
+            "simple_available": True,
+            "compact_adapter_available": True,
+            "compact_native_available": True,
+            "compact_seam_available": True,
+        }
+        cases = (
+            ("guarded-v1", {
+                "postfilter_available": True,
+                "forward_available": True,
+                "simple_available": True,
+            }, True, False),
+            ("compact-v2", complete_v2, True, True),
+            ("v2-seam-absent", {
+                **complete_v2, "compact_seam_available": False,
+            }, True, False),
+            ("v1-adapter-v2-journal", {
+                **complete_v2, "compact_adapter_available": False,
+            }, True, False),
+            ("v2-adapter-v1-native", {
+                **complete_v2, "compact_native_available": False,
+            }, False, False),
+            ("v2-adapter-native-v1-pipeline", {
+                **complete_v2, "compact_seam_available": None,
+            }, False, False),
+            ("v2-probe-without-tail", {
+                **complete_v2, "compact_tail_available": False,
+            }, False, False),
+            ("v2-tail-without-probe", {
+                **complete_v2,
+                "compact_seam_available": None,
+                "compact_tail_available": True,
+            }, False, False),
+            ("non-bool-v2-probe", {
+                **complete_v2, "compact_seam_available": 1,
+            }, False, False),
+            ("v1-journal-v2-pipeline", {
+                "postfilter_available": True,
+                "forward_available": True,
+                "simple_available": True,
+                "compact_seam_available": True,
+            }, False, False),
+            ("v2-journal-v1-pipeline", {
+                "postfilter_available": True,
+                "forward_available": True,
+                "simple_available": True,
+                "compact_native_available": True,
+            }, False, False),
+        )
+        for label, arguments, domain_expected, compact_expected in cases:
+            with self.subTest(label=label):
+                modules, _ = synthetic_plan7_gpu(**arguments)
+                with mock.patch.dict(sys.modules, modules):
+                    self.assertIs(
+                        search.gpu_profile_domain_available(),
+                        domain_expected,
+                    )
+                    self.assertIs(
+                        search.gpu_profile_compact_available(),
+                        compact_expected,
+                    )
+
     def test_preflight_selects_live_seam_and_safely_falls_back_when_absent(self):
         with tempfile.TemporaryDirectory(prefix="astra-gpu-mode-") as temporary:
             root = Path(temporary)
@@ -2122,6 +2267,10 @@ class GPUParityTests(unittest.TestCase):
                     )
                     return candidates
 
+                record_generate.__signature__ = inspect.signature(
+                    original_generate
+                )
+
                 with mock.patch.object(
                     search, "define_kwargs", return_value=generation_options
                 ):
@@ -2205,6 +2354,7 @@ class GPUParityTests(unittest.TestCase):
     def test_profile_session_domain_journal_has_both_routes_and_exact_counters(self):
         if not search.gpu_profile_domain_available():
             self.skipTest("opaque simple-region continuation ABI unavailable")
+        compact_available = search.gpu_profile_compact_available()
 
         from plan7_gpu import ProfileSession, SequenceBatch, _pipeline
         from plan7_gpu import load_pressed_profiles
@@ -2309,6 +2459,26 @@ class GPUParityTests(unittest.TestCase):
             gpu_states.append(semantic_state(hits))
             return original_process(hits, fh)
 
+        class RecordingSession:
+            def __init__(self, session):
+                self.session = session
+                self.selections = []
+
+            def __len__(self):
+                return len(self.session)
+
+            @property
+            def closed(self):
+                return self.session.closed
+
+            @property
+            def statistics(self):
+                return self.session.statistics
+
+            def select(self, indices):
+                self.selections.append(tuple(indices))
+                return self.session.select(indices)
+
         cpu_out = root / "domain-cpu"
         with (
             mock.patch.object(search, "define_kwargs", return_value=options),
@@ -2345,11 +2515,14 @@ class GPUParityTests(unittest.TestCase):
             )
             return candidates
 
+        record_generate.__signature__ = inspect.signature(original_generate)
+
         gpu_out = root / "domain-gpu"
         metrics = search.GPUOverlapMetrics()
         with ProfileSession(
             pairs, build_workers=2, selection_workers=0
-        ) as session:
+        ) as raw_session:
+            session = RecordingSession(raw_session)
             with SequenceBatch(targets) as batch:
                 with (
                     mock.patch.object(search, "GPU_CELL_CAP", 12),
@@ -2377,6 +2550,7 @@ class GPUParityTests(unittest.TestCase):
                         gpu_metrics=metrics,
                     )
 
+        self.assertEqual(session.selections, [(0, 1), (2,)])
         totals = {
             key: sum(item[key] for item in route_statistics)
             for key in (
@@ -2394,6 +2568,18 @@ class GPUParityTests(unittest.TestCase):
         )
         self.assertGreater(totals["cpu_required_count"], 0)
         self.assertGreater(totals["simple_count"], 0)
+        if compact_available:
+            self.assertTrue(all(
+                item["compact_enabled"] for item in route_statistics
+            ))
+            self.assertGreater(sum(
+                item["compact_simple_row_count"]
+                for item in route_statistics
+            ), 0)
+            self.assertGreater(sum(
+                item["compact_device_result_count"]
+                for item in route_statistics
+            ), 0)
         self.assertEqual(gpu_states, cpu_states)
         gpu_tsv = gpu_out / "tmp_results" / "bulk_results.tsv"
         cpu_tsv = cpu_out / "tmp_results" / "bulk_results.tsv"
@@ -2406,6 +2592,190 @@ class GPUParityTests(unittest.TestCase):
         self.assertEqual(snapshot["consumed_chunk_count"], 2)
         self.assertEqual(snapshot["continuation_worker_count"], 1)
         self.assertTrue(snapshot["profile_overlap_enabled"])
+
+    def test_profile_session_compact_threshold_fallback_is_byte_exact(self):
+        if not search.gpu_profile_compact_available():
+            self.skipTest("compact-domain continuation ABI unavailable")
+
+        from plan7_gpu import ProfileSession, SequenceBatch, _pipeline
+        from plan7_gpu import load_pressed_profiles
+        from plan7_gpu.adapter import _candidate_state
+        from plan7_gpu.pressed_manifest import create_pressed_manifest
+
+        data = (
+            Path(pyhmmer.__file__).parent / "tests" / "data" / "hmms" / "txt"
+        )
+        names = ("RREFam.hmm", "Thioesterase.hmm")
+        if not all((data / name).is_file() for name in names):
+            self.skipTest("PyHMMER compact-domain fixtures unavailable")
+
+        root = Path(self.temporary.name)
+        base = root / "compact-threshold.hmm"
+        hmms = []
+        for name in names:
+            with pyhmmer.plan7.HMMFile(data / name) as hmm_file:
+                hmms.append(hmm_file.read())
+        pyhmmer.hmmer.hmmpress(hmms, base)
+        manifest = root / "compact-threshold.manifest.json"
+        create_pressed_manifest(base, manifest)
+        with pyhmmer.plan7.HMMFile(base) as hmm_file:
+            pressed_hmms = tuple(hmm_file)
+        pressed_pairs = load_pressed_profiles(base, manifest=manifest)
+
+        consensus = hmms[1].consensus
+        if isinstance(consensus, bytes):
+            consensus = consensus.decode()
+        consensus = consensus.replace("-", "")
+        target = pyhmmer.easel.TextSequence(
+            name=b"two-domain-probe",
+            sequence=consensus + "X" * 100 + consensus,
+        ).digitize(self.alphabet)
+        targets = pyhmmer.easel.DigitalSequenceBlock(
+            self.alphabet, [target]
+        )
+        base_options = {"F1": 0.99, "F2": 1.0, "F3": 1.0}
+        baseline = pyhmmer.plan7.Pipeline(
+            self.alphabet, **base_options
+        ).search_hmm(pressed_hmms[0], targets)
+        self.assertEqual([hit.name for hit in baseline], ["two-domain-probe"])
+        self.assertGreaterEqual(len(baseline[0].domains), 2)
+        options = {
+            **base_options,
+            "bias_filter": True,
+            "T": baseline[0].score,
+            "incT": -1000.0,
+            "incdomT": -1000.0,
+        }
+
+        def semantic_state(hits):
+            pipeline_fields = (
+                "Z_setby",
+                "domZ_setby",
+                "n_past_msv",
+                "n_past_bias",
+                "n_past_vit",
+                "n_past_fwd",
+                "pos_past_msv",
+                "pos_past_bias",
+                "pos_past_vit",
+                "pos_past_fwd",
+                "mode",
+                "W",
+            )
+            top_fields = (
+                "Z",
+                "domZ",
+                "searched_models",
+                "searched_nodes",
+                "searched_residues",
+                "searched_sequences",
+            )
+            pipeline = hits.__getstate__()["pipeline"]
+            tables = io.BytesIO()
+            hits.write(tables, format="targets", header=True)
+            hits.write(tables, format="domains", header=True)
+            return (
+                tuple(pipeline[field] for field in pipeline_fields),
+                tuple(getattr(hits, field) for field in top_fields),
+                tables.getvalue(),
+            )
+
+        original_process = search.process_hits_to_file
+        cpu_states = []
+        gpu_states = []
+
+        def record_cpu(hits, fh):
+            cpu_states.append(semantic_state(hits))
+            return original_process(hits, fh)
+
+        def record_gpu(hits, fh):
+            gpu_states.append(semantic_state(hits))
+            return original_process(hits, fh)
+
+        cpu_out = root / "compact-threshold-cpu"
+        with (
+            mock.patch.object(search, "define_kwargs", return_value=options),
+            mock.patch.object(search, "process_hits_to_file", new=record_cpu),
+        ):
+            search.hmmsearch(
+                {},
+                (pressed_hmms[0],),
+                2,
+                search_options(cpu_out),
+                all_sequences=targets,
+            )
+
+        continuation_statistics = []
+        original_generate = SequenceBatch._postfilter_forward_selection
+
+        def record_generate(
+            batch, selection, F1, F2, F3, bias_filter, **domain_options
+        ):
+            self.assertIsNotNone(domain_options.get("pipeline"))
+            candidates = original_generate(
+                batch,
+                selection,
+                F1,
+                F2,
+                F3,
+                bias_filter,
+                **domain_options,
+            )
+            continuation_statistics.append(
+                _pipeline._sealed_continuation_statistics_bound(
+                    _candidate_state(candidates).sealed_postfilter
+                )
+            )
+            return candidates
+
+        record_generate.__signature__ = inspect.signature(original_generate)
+
+        gpu_out = root / "compact-threshold-gpu"
+        metrics = search.GPUOverlapMetrics()
+        with ProfileSession(
+            (pressed_pairs[0],), build_workers=2, selection_workers=0
+        ) as session:
+            with SequenceBatch(targets) as batch:
+                with (
+                    mock.patch.object(
+                        search, "define_kwargs", return_value=options
+                    ),
+                    mock.patch.object(
+                        search, "process_hits_to_file", new=record_gpu
+                    ),
+                    mock.patch.object(
+                        SequenceBatch,
+                        "_postfilter_forward_selection",
+                        new=record_generate,
+                    ),
+                ):
+                    search.hmmsearch(
+                        {},
+                        (pressed_pairs[0],),
+                        2,
+                        search_options(gpu_out),
+                        all_sequences=targets,
+                        gpu_sequence_batch=batch,
+                        gpu_postfilter=True,
+                        gpu_profile_session=session,
+                        gpu_metrics=metrics,
+                    )
+
+        self.assertEqual(len(continuation_statistics), 1)
+        statistics = continuation_statistics[0]
+        self.assertTrue(statistics["compact_enabled"])
+        self.assertGreater(statistics["compact_device_result_count"], 0)
+        self.assertEqual(gpu_states, cpu_states)
+        self.assertEqual(len(cpu_states), 1)
+        cpu_tsv = cpu_out / "tmp_results" / "bulk_results.tsv"
+        gpu_tsv = gpu_out / "tmp_results" / "bulk_results.tsv"
+        self.assertEqual(gpu_tsv.read_bytes(), cpu_tsv.read_bytes())
+        data_rows = cpu_tsv.read_text().splitlines()[1:]
+        self.assertGreater(len(data_rows), 0)
+        self.assertTrue(all(len(row.split("\t")) == 13 for row in data_rows))
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["generated_chunk_count"], 1)
+        self.assertEqual(snapshot["consumed_chunk_count"], 1)
 
 
 if __name__ == "__main__":

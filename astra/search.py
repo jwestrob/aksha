@@ -1,5 +1,6 @@
 
 import gc
+import inspect
 import os
 import sys
 import time
@@ -355,13 +356,34 @@ def gpu_profile_forward_available():
     )
 
 
-def gpu_profile_domain_available():
-    """Return whether a session selection can carry a domain journal."""
+def _signature_matches(method, names, *, keyword_only=(), defaulted=()):
+    """Match the callable layout used by one sealed continuation ABI."""
+    try:
+        parameters = tuple(inspect.signature(method).parameters.values())
+    except (TypeError, ValueError):
+        return False
+    if tuple(parameter.name for parameter in parameters) != tuple(names):
+        return False
+    keyword_only = frozenset(keyword_only)
+    defaulted = frozenset(defaulted)
+    for parameter in parameters:
+        expected_kind = (
+            inspect.Parameter.KEYWORD_ONLY
+            if parameter.name in keyword_only
+            else inspect.Parameter.POSITIONAL_OR_KEYWORD
+        )
+        if parameter.kind is not expected_kind:
+            return False
+        has_default = parameter.default is not inspect.Parameter.empty
+        if has_default != (parameter.name in defaulted):
+            return False
+    return True
+
+
+def _profile_continuation_capabilities():
+    """Return the safe guarded-domain and compact-domain capabilities."""
     from plan7_gpu import SequenceBatch, _native, _pipeline
 
-    # The simple-region symbol existed before the opaque ProfileSession
-    # adapter. Requiring its bound sealing factory keeps Astra compatible with
-    # that intermediate ABI instead of guessing from the Python signature.
     filter_probe = getattr(_pipeline, '_filter_scores_seam_available', None)
     forward_probe = getattr(
         _pipeline, '_filter_and_forward_scores_seam_available', None
@@ -370,15 +392,21 @@ def gpu_profile_domain_available():
     seal = getattr(
         _pipeline, '_seal_profile_selection_continuation_bound', None
     )
-    return (
-        callable(getattr(
-            SequenceBatch, '_postfilter_forward_domain_selection', None
-        ))
-        and callable(getattr(
-            _native.SequenceBatch,
-            '_postfilter_forward_domain_selection_sealed',
-            None,
-        ))
+    selection_method = getattr(
+        SequenceBatch, '_postfilter_forward_selection', None
+    )
+    domain_method = getattr(
+        SequenceBatch, '_postfilter_forward_domain_selection', None
+    )
+    native_method = getattr(
+        _native.SequenceBatch,
+        '_postfilter_forward_domain_selection_sealed',
+        None,
+    )
+    if not (
+        callable(selection_method)
+        and callable(domain_method)
+        and callable(native_method)
         and callable(seal)
         and callable(filter_probe)
         and filter_probe() is True
@@ -386,7 +414,111 @@ def gpu_profile_domain_available():
         and forward_probe() is True
         and callable(seam_probe)
         and seam_probe() is True
+    ):
+        return False, False
+
+    selection_prefix = (
+        'self', 'selection', 'F1', 'F2', 'F3', 'bias_filter',
+        'pipeline', 'domain_guard',
     )
+    domain_prefix = (
+        'self', 'selection', 'F1', 'f2', 'f3', 'bias_filter',
+        'pipeline', 'domain_guard',
+    )
+    native_prefix = (
+        'self', 'selection', 'f1', 'f2', 'f3', 'guard_band',
+        'gathered_byte_budget',
+    )
+    selection_options = ('pipeline', 'domain_guard')
+    legacy_adapter = (
+        _signature_matches(
+            selection_method,
+            selection_prefix,
+            keyword_only=selection_options,
+            defaulted=selection_options,
+        )
+        and _signature_matches(domain_method, domain_prefix)
+    )
+    compact_selection_suffix = (
+        '_rescore_compact_byte_budget',
+        '_rescore_matrix_byte_budget',
+        '_rescore_trace_byte_budget',
+        '_rescore_test_fault',
+    )
+    compact_domain_suffix = (
+        'rescore_compact_byte_budget',
+        'rescore_matrix_byte_budget',
+        'rescore_trace_byte_budget',
+        'rescore_test_fault',
+    )
+    compact_adapter = (
+        _signature_matches(
+            selection_method,
+            selection_prefix + compact_selection_suffix,
+            keyword_only=selection_options + compact_selection_suffix,
+            defaulted=selection_options + compact_selection_suffix,
+        )
+        and _signature_matches(
+            domain_method, domain_prefix + compact_domain_suffix
+        )
+    )
+    legacy_native = _signature_matches(
+        native_method,
+        native_prefix,
+        defaulted=('guard_band', 'gathered_byte_budget'),
+    )
+    compact_native_suffix = (
+        'rescore_simple_diagnostic',
+        'rescore_matrix_byte_budget',
+        'rescore_trace_byte_budget',
+        'rescore_compact_byte_budget',
+        '_rescore_test_fault',
+        'generation_tail_fingerprint',
+    )
+    compact_native = _signature_matches(
+        native_method,
+        native_prefix + compact_native_suffix,
+        defaulted=(
+            'guard_band',
+            'gathered_byte_budget',
+        ) + compact_native_suffix,
+    )
+
+    compact_probe = getattr(
+        _pipeline, '_compact_domains_seam_available', None
+    )
+    compact_tail = getattr(
+        _pipeline, '_compact_tail_fingerprint_bound', None
+    )
+    legacy_pipeline = compact_probe is None and compact_tail is None
+    compact_pipeline = callable(compact_probe) and callable(compact_tail)
+
+    # V1 producers and consumers must remain paired. A V1 Python adapter is
+    # also backward-compatible with the complete V2 native/pipeline pair: it
+    # omits the optional compact fingerprint and therefore generates the same
+    # guarded journal it did before V2 existed.
+    if legacy_adapter and legacy_native and legacy_pipeline:
+        return True, False
+    if not compact_pipeline or not compact_native:
+        return False, False
+    compact_seam = compact_probe()
+    if compact_seam is not True and compact_seam is not False:
+        return False, False
+    if legacy_adapter:
+        return True, False
+    if not compact_adapter:
+        return False, False
+    return True, compact_seam
+
+
+def gpu_profile_domain_available():
+    """Return whether a session selection can carry a domain journal."""
+    return _profile_continuation_capabilities()[0]
+
+
+def gpu_profile_compact_available():
+    """Return whether a session selection can carry compact DEVICE domains."""
+    return _profile_continuation_capabilities()[1]
 
 
 def has_thresholds(x):
