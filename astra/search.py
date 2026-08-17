@@ -60,6 +60,11 @@ class GPUOverlapMetrics:
         self.live_candidate_capacity = 0
         self.profile_load_seconds = 0.0
         self.session_build_seconds = 0.0
+        self.profile_cache_enabled = False
+        self.profile_cache_hit = False
+        self.profile_cache_validation_seconds = 0.0
+        self.profile_session_id = 0
+        self.profile_session_selection_count_start = 0
         self.target_batch_seconds = 0.0
         self.preflight_seconds = 0.0
         self.generation_seconds = 0.0
@@ -102,6 +107,15 @@ class GPUOverlapMetrics:
             'live_candidate_capacity': self.live_candidate_capacity,
             'profile_load_seconds': self.profile_load_seconds,
             'session_build_seconds': self.session_build_seconds,
+            'profile_cache_enabled': self.profile_cache_enabled,
+            'profile_cache_hit': self.profile_cache_hit,
+            'profile_cache_validation_seconds': (
+                self.profile_cache_validation_seconds
+            ),
+            'profile_session_id': self.profile_session_id,
+            'profile_session_selection_count_start': (
+                self.profile_session_selection_count_start
+            ),
             'target_batch_seconds': self.target_batch_seconds,
             'preflight_seconds': self.preflight_seconds,
             'generation_seconds': self.generation_seconds,
@@ -281,7 +295,8 @@ def validate_gpu_configuration(mappings, installed_hmm_names, parsed_json,
 
 
 def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
-                            all_sequences, threads, gpu_metrics=None):
+                            all_sequences, threads, gpu_metrics=None,
+                            profile_session_cache=None):
     """Load every attested mapped database and initialize one target batch."""
     if not mappings:
         return {}, None, False
@@ -289,6 +304,14 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
     preflight_started = time.perf_counter()
     from plan7_gpu import ProfileSession, SequenceBatch, load_pressed_profiles
     from plan7_gpu.pressed_manifest import validate_pressed_manifest
+
+    if profile_session_cache is not None:
+        from astra.gpu_profile_cache import GPUProfileSessionCache
+
+        if not isinstance(profile_session_cache, GPUProfileSessionCache):
+            raise TypeError(
+                "profile_session_cache must be GPUProfileSessionCache or None"
+            )
 
     database_specs = {}
     for db_name in installed_hmm_names:
@@ -302,19 +325,29 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
         validate_pressed_manifest(pressed_base, manifest_path)
         database_specs[db_name] = (pressed_base, manifest_path)
 
-    databases = {}
-    for db_name, (pressed_base, manifest_path) in database_specs.items():
-        load_started = time.perf_counter()
-        pairs = load_pressed_profiles(pressed_base, manifest=manifest_path)
-        if gpu_metrics is not None:
-            gpu_metrics[db_name].profile_load_seconds += (
-                time.perf_counter() - load_started
-            )
-        databases[db_name] = (
-            pressed_base,
-            pairs,
-            None,
+    if profile_session_cache is not None and len(database_specs) != 1:
+        raise GPUConfigurationError(
+            "persistent GPU profile caching currently requires exactly one "
+            "mapped database"
         )
+
+    databases = {}
+    if profile_session_cache is None:
+        for db_name, (pressed_base, manifest_path) in database_specs.items():
+            load_started = time.perf_counter()
+            pairs = load_pressed_profiles(pressed_base, manifest=manifest_path)
+            if gpu_metrics is not None:
+                gpu_metrics[db_name].profile_load_seconds += (
+                    time.perf_counter() - load_started
+                )
+            databases[db_name] = (
+                pressed_base,
+                pairs,
+                None,
+            )
+    else:
+        for db_name, (pressed_base, _) in database_specs.items():
+            databases[db_name] = (pressed_base, (), None)
 
     postfilter = gpu_postfilter_available()
     batch = None
@@ -344,22 +377,63 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
         )
         if session_supported:
             for db_name, (pressed_base, pairs, _) in tuple(databases.items()):
-                if not pairs:
-                    continue
-                session_started = time.perf_counter()
-                session = ProfileSession(
-                    pairs,
-                    build_workers=threads,
-                    selection_workers=0,
-                )
+                if profile_session_cache is None:
+                    if not pairs:
+                        continue
+                    session_started = time.perf_counter()
+                    session = ProfileSession(
+                        pairs,
+                        build_workers=threads,
+                        selection_workers=0,
+                    )
+                    session_build_seconds = time.perf_counter() - session_started
+                else:
+                    manifest_path = database_specs[db_name][1]
+                    session = profile_session_cache.acquire(
+                        pressed_base,
+                        manifest_path,
+                        device_key=(
+                            'cuda-ordinal',
+                            batch.memory_snapshot['device_ordinal'],
+                        ),
+                        build_workers=threads,
+                        selection_workers=0,
+                    )
+                    pairs = session.profile_pairs
+                    session_build_seconds = session.session_build_seconds
                 databases[db_name] = (
                     pressed_base,
                     pairs,
                     session,
                 )
                 if gpu_metrics is not None:
-                    gpu_metrics[db_name].session_build_seconds += (
-                        time.perf_counter() - session_started
+                    metrics = gpu_metrics[db_name]
+                    metrics.session_build_seconds += session_build_seconds
+                    session_statistics = session.statistics
+                    metrics.profile_session_id = session_statistics['session_id']
+                    metrics.profile_session_selection_count_start = (
+                        session_statistics['selection_count']
+                    )
+                    if profile_session_cache is not None:
+                        metrics.profile_cache_enabled = True
+                        metrics.profile_cache_hit = session.reused
+                        metrics.profile_cache_validation_seconds += (
+                            session.validation_seconds
+                        )
+                        metrics.profile_load_seconds += (
+                            session.profile_load_seconds
+                        )
+        elif profile_session_cache is not None:
+            for db_name, (pressed_base, _, _) in tuple(databases.items()):
+                manifest_path = database_specs[db_name][1]
+                load_started = time.perf_counter()
+                pairs = load_pressed_profiles(
+                    pressed_base, manifest=manifest_path
+                )
+                databases[db_name] = (pressed_base, pairs, None)
+                if gpu_metrics is not None:
+                    gpu_metrics[db_name].profile_load_seconds += (
+                        time.perf_counter() - load_started
                     )
         if gpu_metrics is not None:
             preflight_seconds = time.perf_counter() - preflight_started
@@ -1923,7 +1997,7 @@ def _write_macsyfinder_conf(macsyfinder_dir, prot_in):
     print(f"MacSyFinder config written to {conf_path}")
 
 
-def main(args):
+def main(args, *, gpu_profile_session_cache=None):
     t1 = time.time()
     hmm_in = args.hmm_in
     prot_in = args.prot_in
@@ -2050,6 +2124,7 @@ def main(args):
             all_sequences,
             args.threads,
             gpu_metrics_by_db,
+            gpu_profile_session_cache,
         )
 
     try:

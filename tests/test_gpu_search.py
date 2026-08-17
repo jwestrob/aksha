@@ -18,6 +18,10 @@ from unittest import mock
 import pyhmmer
 
 from astra import search
+from astra.gpu_profile_cache import (
+    GPUProfileSessionCache,
+    Plan7RuntimeIdentity,
+)
 
 astra_main = importlib.import_module("astra.main")
 
@@ -2071,6 +2075,160 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
             api.ProfileSession.assert_called_once_with(
                 pairs, build_workers=2, selection_workers=0
             )
+
+    def test_profile_cache_reuses_one_attested_session_across_preflights(self):
+        with tempfile.TemporaryDirectory(prefix="astra-gpu-cache-") as temporary:
+            root = Path(temporary)
+            db_dir = root / "GPUDB"
+            db_dir.mkdir()
+            pressed_base = make_pressed_members(db_dir, "profiles")
+            config = {
+                "db_urls": [{
+                    "name": "GPUDB",
+                    "installed": True,
+                    "installation_dir": os.fspath(db_dir),
+                    "molecule_type": "protein",
+                }]
+            }
+            modules, api = synthetic_plan7_gpu(True)
+            pairs = (object(), object())
+            underlying = mock.MagicMock(name="cached_profile_session")
+            underlying.closed = False
+            underlying.__len__.return_value = len(pairs)
+            underlying.statistics = {
+                "session_id": 41,
+                "profile_count": len(pairs),
+                "worker_count": 0,
+                "build_worker_count": 2,
+                "selection_worker_count": 0,
+                "selection_count": 0,
+                "host_bytes": 123,
+            }
+            api.load_pressed_profiles.return_value = pairs
+            api.ProfileSession.return_value = underlying
+            api.validate_pressed_manifest.return_value = SimpleNamespace(
+                canonical_base=pressed_base.resolve(),
+                manifest_sha256="a" * 64,
+                stat_token=("stable",),
+                model_count=len(pairs),
+            )
+            first_batch = mock.Mock(name="first_sequence_batch")
+            first_batch.memory_snapshot = {"device_ordinal": 0}
+            second_batch = mock.Mock(name="second_sequence_batch")
+            second_batch.memory_snapshot = {"device_ordinal": 0}
+            api.SequenceBatch.side_effect = [first_batch, second_batch]
+            runtime = Plan7RuntimeIdentity(
+                pyhmmer_version="test",
+                pyhmmer_private_abi_sha256="1" * 64,
+                adapter_sha256="2" * 64,
+                native_extension_sha256="3" * 64,
+                pipeline_extension_sha256="4" * 64,
+            )
+            cache = GPUProfileSessionCache(
+                runtime_identity=runtime,
+                validator=api.validate_pressed_manifest,
+                loader=api.load_pressed_profiles,
+                session_factory=api.ProfileSession,
+            )
+
+            observed = []
+            with mock.patch.dict(sys.modules, modules):
+                for expected_batch, expected_hit in (
+                    (first_batch, False),
+                    (second_batch, True),
+                ):
+                    metrics = {"GPUDB": search.GPUOverlapMetrics()}
+                    databases, batch, postfilter = search.preflight_gpu_databases(
+                        {"GPUDB": "manifest.json"},
+                        ["GPUDB"],
+                        config,
+                        [object()],
+                        2,
+                        metrics,
+                        cache,
+                    )
+                    _, observed_pairs, lease = databases["GPUDB"]
+                    observed.append(lease)
+                    self.assertIs(batch, expected_batch)
+                    self.assertTrue(postfilter)
+                    self.assertIs(observed_pairs, pairs)
+                    self.assertIs(lease._entry.session, underlying)
+                    self.assertIs(lease.reused, expected_hit)
+                    self.assertTrue(metrics["GPUDB"].profile_cache_enabled)
+                    self.assertIs(
+                        metrics["GPUDB"].profile_cache_hit, expected_hit
+                    )
+                    self.assertEqual(metrics["GPUDB"].profile_session_id, 41)
+                    self.assertEqual(
+                        metrics["GPUDB"].profile_session_selection_count_start,
+                        0,
+                    )
+                    if expected_hit:
+                        self.assertEqual(
+                            metrics["GPUDB"].profile_load_seconds, 0.0
+                        )
+                        self.assertEqual(
+                            metrics["GPUDB"].session_build_seconds, 0.0
+                        )
+                    lease.close()
+                    batch.close()
+
+            self.assertEqual(api.validate_pressed_manifest.call_count, 4)
+            api.load_pressed_profiles.assert_called_once_with(
+                pressed_base.resolve(), manifest="manifest.json"
+            )
+            api.ProfileSession.assert_called_once_with(
+                pairs, build_workers=2, selection_workers=0
+            )
+            self.assertIsNot(observed[0], observed[1])
+            underlying.close.assert_not_called()
+            cache.close()
+            underlying.close.assert_called_once_with()
+
+    def test_profile_cache_rejects_multi_database_preflight_before_batch(self):
+        with tempfile.TemporaryDirectory(prefix="astra-gpu-cache-multi-") as temporary:
+            root = Path(temporary)
+            config = {"db_urls": []}
+            mappings = {}
+            for name in ("GPU1", "GPU2"):
+                db_dir = root / name
+                db_dir.mkdir()
+                make_pressed_members(db_dir, name)
+                config["db_urls"].append({
+                    "name": name,
+                    "installed": True,
+                    "installation_dir": os.fspath(db_dir),
+                    "molecule_type": "protein",
+                })
+                mappings[name] = f"{name}.json"
+            modules, api = synthetic_plan7_gpu(True)
+            runtime = Plan7RuntimeIdentity(
+                pyhmmer_version="test",
+                pyhmmer_private_abi_sha256="1" * 64,
+                adapter_sha256="2" * 64,
+                native_extension_sha256="3" * 64,
+                pipeline_extension_sha256="4" * 64,
+            )
+            cache = GPUProfileSessionCache(
+                runtime_identity=runtime,
+                validator=mock.Mock(),
+                loader=mock.Mock(),
+                session_factory=mock.Mock(),
+            )
+            with mock.patch.dict(sys.modules, modules):
+                with self.assertRaisesRegex(
+                    search.GPUConfigurationError, "exactly one mapped database"
+                ):
+                    search.preflight_gpu_databases(
+                        mappings,
+                        ["GPU1", "GPU2"],
+                        config,
+                        [object()],
+                        2,
+                        profile_session_cache=cache,
+                    )
+            api.SequenceBatch.assert_not_called()
+            cache.close()
 
     def test_later_session_failure_closes_prior_session_and_target_batch(self):
         with tempfile.TemporaryDirectory(prefix="astra-gpu-session-") as temporary:
