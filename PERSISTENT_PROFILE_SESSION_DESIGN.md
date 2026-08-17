@@ -40,7 +40,14 @@ a lease is active, destruction is deferred until that lease returns.  A second
 concurrent lease fails rather than silently doubling PFAM memory or changing
 queue ordering.  Astra first takes a lightweight reservation before constructing
 the per-search CUDA target batch, so a concurrent request fails while still
-host-only instead of transiently doubling target memory.
+host-only instead of transiently doubling target memory.  That reservation is
+held as the cache lease through search, result combination, and target-batch
+destruction; only then can the next request allocate its target batch.  A
+released lease severs its references to both the cache and the large resident
+entry so stale caller objects cannot extend the profile snapshot lifetime after
+cache shutdown.  If target-batch destruction raises, Astra closes the cache
+before returning the lease; the worker is thereby retired and cannot admit a
+second target allocation beside a possibly live failed batch.
 
 The cache has exactly one entry.  Replacing an idle key closes the old session
 before allocating the new one, so the cache never retains two 1.15 GB profile

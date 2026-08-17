@@ -265,6 +265,7 @@ class GPUProfileSessionCacheTests(CacheFixture, unittest.TestCase):
             reservation = cache.reserve()
             cache.close()
             self.assertFalse(reservation.active)
+            self.assertIsNone(reservation._cache)
             reservation.close()
 
     def test_released_lease_cannot_access_reused_session(self):
@@ -279,8 +280,12 @@ class GPUProfileSessionCacheTests(CacheFixture, unittest.TestCase):
             )
             lease.close()
             self.assertTrue(lease.closed)
+            self.assertIsNone(lease._cache)
+            self.assertIsNone(lease._entry)
             with self.assertRaisesRegex(RuntimeError, "lease is closed"):
                 lease.select([0])
+            with self.assertRaisesRegex(RuntimeError, "lease is closed"):
+                _ = lease.cache_key
             cache.close()
 
     def test_externally_closed_idle_session_is_rebuilt(self):

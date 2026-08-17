@@ -24,7 +24,7 @@ class GPUProfileCacheBusyError(RuntimeError):
     """Raised when a cache entry already has an active search lease."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class Plan7RuntimeIdentity:
     """Code and private-ABI identity for one loaded plan7 runtime."""
 
@@ -35,7 +35,7 @@ class Plan7RuntimeIdentity:
     pipeline_extension_sha256: str
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class GPUProfileCacheKey:
     """Every input that can change or invalidate a cached profile session."""
 
@@ -49,7 +49,7 @@ class GPUProfileCacheKey:
     profile_semantics: str
 
 
-@dataclass(slots=True)
+@dataclass
 class _CacheEntry:
     key: GPUProfileCacheKey
     pairs: tuple[Any, ...]
@@ -124,7 +124,7 @@ class GPUProfileSessionLease:
         self.session_build_seconds = session_build_seconds
 
     def _require_open(self) -> _CacheEntry:
-        if self._released:
+        if self._released or self._entry is None:
             raise RuntimeError("GPU profile-session lease is closed")
         return self._entry
 
@@ -134,11 +134,12 @@ class GPUProfileSessionLease:
 
     @property
     def cache_key(self) -> GPUProfileCacheKey:
-        return self._entry.key
+        return self._require_open().key
 
     @property
     def closed(self) -> bool:
-        return self._released or bool(self._entry.session.closed)
+        entry = self._entry
+        return self._released or entry is None or bool(entry.session.closed)
 
     @property
     def statistics(self) -> dict[str, int]:
@@ -152,8 +153,16 @@ class GPUProfileSessionLease:
 
     def close(self) -> None:
         if not self._released:
-            self._cache._release(self._entry)
-            self._released = True
+            cache = self._cache
+            entry = self._entry
+            try:
+                cache._release(entry)
+            finally:
+                # A retired lease must not keep the cache, its 1.15 GB profile
+                # tuple, or its native session alive through stale references.
+                self._released = True
+                self._cache = None
+                self._entry = None
 
     def __enter__(self) -> GPUProfileSessionLease:
         self._require_open()
@@ -178,7 +187,12 @@ class GPUProfileSessionReservation:
 
     def close(self) -> None:
         if self._active:
-            self._cache._cancel_reservation(self)
+            cache = self._cache
+            try:
+                cache._cancel_reservation(self)
+            finally:
+                if not self._active:
+                    self._cache = None
 
     def __enter__(self) -> GPUProfileSessionReservation:
         if not self._active:
@@ -393,6 +407,7 @@ class GPUProfileSessionCache:
                 raise RuntimeError("GPU profile-session cache reservation is invalid")
             self._reservation = None
             reservation._active = False
+            reservation._cache = None
 
     def _cancel_reservation(
         self, reservation: GPUProfileSessionReservation
@@ -401,6 +416,7 @@ class GPUProfileSessionCache:
             if self._reservation is reservation and reservation._active:
                 self._reservation = None
                 reservation._active = False
+                reservation._cache = None
                 return
             if reservation._active:
                 raise RuntimeError("GPU profile-session cache reservation is invalid")
@@ -423,6 +439,7 @@ class GPUProfileSessionCache:
             if reservation is not None:
                 self._reservation = None
                 reservation._active = False
+                reservation._cache = None
             entry = self._entry
             if entry is not None and not entry.leased:
                 self._entry = None

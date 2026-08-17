@@ -451,9 +451,18 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
                 metrics.preflight_seconds = preflight_seconds
         return databases, batch, postfilter
     except BaseException:
-        if cache_reservation is not None:
+        batch_close_failed = False
+        if batch is not None:
             try:
-                cache_reservation.close()
+                batch.close()
+            except BaseException:
+                batch_close_failed = True
+        if batch_close_failed and profile_session_cache is not None:
+            # A target batch whose close failed may still own device memory.
+            # Retire the cache before returning its lease so no next request
+            # can allocate another target batch in this process.
+            try:
+                profile_session_cache.close()
             except BaseException:
                 pass
         for _, _, session in databases.values():
@@ -462,9 +471,9 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
                     session.close()
                 except BaseException:
                     pass
-        if batch is not None:
+        if cache_reservation is not None:
             try:
-                batch.close()
+                cache_reservation.close()
             except BaseException:
                 pass
         raise
@@ -2157,14 +2166,23 @@ def main(args, *, gpu_profile_session_cache=None):
                             format='%(asctime)s %(levelname)s: %(message)s',
                             datefmt='%Y-%m-%d %H:%M:%S')
     except BaseException:
+        batch_close_failed = False
+        if gpu_sequence_batch is not None:
+            try:
+                gpu_sequence_batch.close()
+            except BaseException:
+                batch_close_failed = True
+        if batch_close_failed and gpu_profile_session_cache is not None:
+            try:
+                gpu_profile_session_cache.close()
+            except BaseException:
+                pass
         for _, _, session in gpu_databases.values():
             if session is not None:
                 try:
                     session.close()
                 except BaseException:
                     pass
-        if gpu_sequence_batch is not None:
-            gpu_sequence_batch.close()
         raise
 
     # MacSyFinder-compatible output directory (per-HMM hmmsearch text files)
@@ -2306,12 +2324,20 @@ def main(args, *, gpu_profile_session_cache=None):
                         finally:
                             active_gpu_error = sys.exc_info()[0] is not None
                             session_close_error = None
-                            if gpu_profile_session is not None:
+                            cached_profile_lease = (
+                                gpu_profile_session_cache is not None
+                                and gpu_profile_session is not None
+                            )
+                            if (
+                                gpu_profile_session is not None
+                                and not cached_profile_lease
+                            ):
                                 try:
                                     gpu_profile_session.close()
                                 except BaseException as error:
                                     session_close_error = error
-                            gpu_databases.pop(hmm_db, None)
+                            if not cached_profile_lease:
+                                gpu_databases.pop(hmm_db, None)
                             if (
                                 session_close_error is not None
                                 and not active_gpu_error
@@ -2328,6 +2354,20 @@ def main(args, *, gpu_profile_session_cache=None):
     finally:
         active_error = sys.exc_info()[0] is not None
         cleanup_error = None
+        batch_close_failed = False
+        if gpu_sequence_batch is not None:
+            try:
+                gpu_sequence_batch.close()
+            except BaseException as error:
+                batch_close_failed = True
+                if cleanup_error is None:
+                    cleanup_error = error
+        if batch_close_failed and gpu_profile_session_cache is not None:
+            try:
+                gpu_profile_session_cache.close()
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
         for _, _, session in gpu_databases.values():
             if session is not None:
                 try:
@@ -2335,12 +2375,6 @@ def main(args, *, gpu_profile_session_cache=None):
                 except BaseException as error:
                     if cleanup_error is None:
                         cleanup_error = error
-        if gpu_sequence_batch is not None:
-            try:
-                gpu_sequence_batch.close()
-            except BaseException as error:
-                if cleanup_error is None:
-                    cleanup_error = error
         if cleanup_error is not None and not active_error:
             raise cleanup_error
 

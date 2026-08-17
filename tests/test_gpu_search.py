@@ -19,6 +19,7 @@ import pyhmmer
 
 from astra import search
 from astra.gpu_profile_cache import (
+    GPUProfileCacheBusyError,
     GPUProfileSessionCache,
     Plan7RuntimeIdentity,
 )
@@ -2286,6 +2287,148 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
 
 
 class InstalledGPUSelectionTests(unittest.TestCase):
+    def test_cached_lease_excludes_until_batch_close_on_success_and_failure(self):
+        for combine_failure, batch_close_failure in (
+            (False, False),
+            (True, False),
+            (False, True),
+        ):
+            with self.subTest(
+                combine_failure=combine_failure,
+                batch_close_failure=batch_close_failure,
+            ), tempfile.TemporaryDirectory(
+                prefix="astra-cache-request-lifetime-"
+            ) as temporary:
+                root = Path(temporary)
+                gpu_dir = root / "GPUDB"
+                gpu_dir.mkdir()
+                pressed_base = make_pressed_members(gpu_dir, "profiles")
+                config = {
+                    "db_urls": [{
+                        "name": "GPUDB",
+                        "installed": True,
+                        "installation_dir": os.fspath(gpu_dir),
+                        "molecule_type": "protein",
+                    }]
+                }
+                args = search_args(
+                    root / "out",
+                    installed_hmms="GPUDB",
+                    gpu_manifest=["GPUDB=manifest.json"],
+                    threads=2,
+                )
+                modules, api = synthetic_plan7_gpu(True)
+                pairs = (object(), object())
+                underlying = mock.MagicMock(name="cached_profile_session")
+                underlying.closed = False
+                underlying.__len__.return_value = len(pairs)
+                underlying.statistics = {
+                    "session_id": 17,
+                    "selection_count": 0,
+                }
+                api.ProfileSession.return_value = underlying
+                api.load_pressed_profiles.return_value = pairs
+                api.validate_pressed_manifest.return_value = SimpleNamespace(
+                    canonical_base=pressed_base.resolve(),
+                    manifest_sha256="a" * 64,
+                    stat_token=("stable",),
+                    model_count=len(pairs),
+                )
+                batch = mock.Mock(name="sequence_batch")
+                batch.memory_snapshot = {"device_ordinal": 0}
+                api.SequenceBatch.return_value = batch
+                cache = GPUProfileSessionCache(
+                    runtime_identity=Plan7RuntimeIdentity(
+                        pyhmmer_version="test",
+                        pyhmmer_private_abi_sha256="1" * 64,
+                        adapter_sha256="2" * 64,
+                        native_extension_sha256="3" * 64,
+                        pipeline_extension_sha256="4" * 64,
+                    ),
+                    validator=api.validate_pressed_manifest,
+                    loader=api.load_pressed_profiles,
+                    session_factory=api.ProfileSession,
+                )
+                events = []
+
+                def close_batch():
+                    events.append("batch-close")
+                    if batch_close_failure:
+                        raise RuntimeError("batch close failed")
+
+                batch.close.side_effect = close_batch
+                original_release = cache._release
+
+                def release_after_batch(entry):
+                    self.assertTrue(batch.close.called)
+                    events.append("lease-release")
+                    return original_release(entry)
+
+                def combine_while_exclusive(*_args):
+                    self.assertFalse(batch.close.called)
+                    events.append("combine")
+                    with self.assertRaises(GPUProfileCacheBusyError):
+                        cache.reserve()
+                    if combine_failure:
+                        raise RuntimeError("combine failed")
+
+                with (
+                    mock.patch.dict(sys.modules, modules),
+                    mock.patch.object(
+                        search.initialize, "load_config", return_value=config
+                    ),
+                    mock.patch.object(
+                        search,
+                        "parse_protein_input",
+                        return_value={"proteins.faa": [object()]},
+                    ),
+                    mock.patch.object(
+                        search, "hmmsearch", return_value=root / "tmp"
+                    ),
+                    mock.patch.object(
+                        search, "combine_results", new=combine_while_exclusive
+                    ),
+                    mock.patch.object(search, "cleanup_temp_files"),
+                    mock.patch.object(
+                        cache, "_release", side_effect=release_after_batch
+                    ),
+                ):
+                    if combine_failure:
+                        with self.assertRaisesRegex(
+                            RuntimeError, "combine failed"
+                        ):
+                            search.main(
+                                args, gpu_profile_session_cache=cache
+                            )
+                    elif batch_close_failure:
+                        with self.assertRaisesRegex(
+                            RuntimeError, "batch close failed"
+                        ):
+                            search.main(
+                                args, gpu_profile_session_cache=cache
+                            )
+                    else:
+                        search.main(args, gpu_profile_session_cache=cache)
+
+                self.assertEqual(
+                    events, ["combine", "batch-close", "lease-release"]
+                )
+                if batch_close_failure:
+                    self.assertTrue(cache.closed)
+                    self.assertFalse(cache.resident)
+                    with self.assertRaisesRegex(
+                        RuntimeError, "cache is closed"
+                    ):
+                        cache.reserve()
+                    underlying.close.assert_called_once_with()
+                else:
+                    next_request = cache.reserve()
+                    next_request.close()
+                    self.assertTrue(cache.resident)
+                    underlying.close.assert_not_called()
+                    cache.close()
+                    underlying.close.assert_called_once_with()
+
     def test_only_mapped_installed_databases_use_one_reused_gpu_batch(self):
         with tempfile.TemporaryDirectory(prefix="astra-selection-") as temporary:
             root = Path(temporary)
