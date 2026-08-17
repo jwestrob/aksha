@@ -199,6 +199,74 @@ class GPUProfileSessionCacheTests(CacheFixture, unittest.TestCase):
                     build_workers=4,
                 )
 
+    def test_reservation_excludes_work_before_lease_and_can_be_cancelled(self):
+        with tempfile.TemporaryDirectory(prefix="astra-profile-cache-") as temporary:
+            base = Path(temporary) / "PFAM"
+            cache, _, _, _, validator, _, _ = self.make_cache(base)
+            reservation = cache.reserve()
+            self.assertTrue(reservation.active)
+            with self.assertRaisesRegex(
+                GPUProfileCacheBusyError, "active search lease"
+            ):
+                cache.acquire(
+                    base,
+                    "manifest.json",
+                    device_key=0,
+                    build_workers=1,
+                )
+            validator.assert_not_called()
+            reservation.close()
+            self.assertFalse(reservation.active)
+
+            lease = cache.acquire(
+                base,
+                "manifest.json",
+                device_key=0,
+                build_workers=1,
+            )
+            lease.close()
+            cache.close()
+
+    def test_reservation_is_consumed_only_after_successful_acquire(self):
+        with tempfile.TemporaryDirectory(prefix="astra-profile-cache-") as temporary:
+            base = Path(temporary) / "PFAM"
+            cache, _, _, _, _, loader, _ = self.make_cache(base)
+            reservation = cache.reserve()
+            loader.side_effect = RuntimeError("load failed")
+            with self.assertRaisesRegex(RuntimeError, "load failed"):
+                cache.acquire(
+                    base,
+                    "manifest.json",
+                    device_key=0,
+                    build_workers=1,
+                    reservation=reservation,
+                )
+            self.assertTrue(reservation.active)
+            reservation.close()
+
+            loader.side_effect = None
+            loader.return_value = (object(), object())
+            reservation = cache.reserve()
+            lease = cache.acquire(
+                base,
+                "manifest.json",
+                device_key=0,
+                build_workers=1,
+                reservation=reservation,
+            )
+            self.assertFalse(reservation.active)
+            lease.close()
+            cache.close()
+
+    def test_cache_close_cancels_an_unconsumed_reservation(self):
+        with tempfile.TemporaryDirectory(prefix="astra-profile-cache-") as temporary:
+            base = Path(temporary) / "PFAM"
+            cache, *_ = self.make_cache(base)
+            reservation = cache.reserve()
+            cache.close()
+            self.assertFalse(reservation.active)
+            reservation.close()
+
     def test_released_lease_cannot_access_reused_session(self):
         with tempfile.TemporaryDirectory(prefix="astra-profile-cache-") as temporary:
             base = Path(temporary) / "PFAM"

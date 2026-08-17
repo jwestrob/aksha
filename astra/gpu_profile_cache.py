@@ -163,6 +163,32 @@ class GPUProfileSessionLease:
         self.close()
 
 
+class GPUProfileSessionReservation:
+    """An exclusive pre-allocation claim for one upcoming cache lease."""
+
+    __slots__ = ("_cache", "_active")
+
+    def __init__(self, cache: GPUProfileSessionCache) -> None:
+        self._cache = cache
+        self._active = True
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def close(self) -> None:
+        if self._active:
+            self._cache._cancel_reservation(self)
+
+    def __enter__(self) -> GPUProfileSessionReservation:
+        if not self._active:
+            raise RuntimeError("GPU profile-session reservation is closed")
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+
 class GPUProfileSessionCache:
     """A one-entry, exclusive-lease cache for very large profile sessions.
 
@@ -196,6 +222,7 @@ class GPUProfileSessionCache:
         self._session_factory = session_factory
         self._lock = RLock()
         self._entry: Optional[_CacheEntry] = None
+        self._reservation: Optional[GPUProfileSessionReservation] = None
         self._closed = False
 
     @property
@@ -213,6 +240,22 @@ class GPUProfileSessionCache:
         with self._lock:
             return None if self._entry is None else self._entry.key
 
+    def reserve(self) -> GPUProfileSessionReservation:
+        """Claim the cache before allocating a per-search target batch."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("GPU profile-session cache is closed")
+            if (
+                self._reservation is not None
+                or (self._entry is not None and self._entry.leased)
+            ):
+                raise GPUProfileCacheBusyError(
+                    "GPU profile-session cache already has an active search lease"
+                )
+            reservation = GPUProfileSessionReservation(self)
+            self._reservation = reservation
+            return reservation
+
     def acquire(
         self,
         pressed_base: Union[str, os.PathLike[str]],
@@ -222,6 +265,7 @@ class GPUProfileSessionCache:
         build_workers: int,
         selection_workers: int = 0,
         profile_semantics: str = PROFILE_SEMANTICS,
+        reservation: Optional[GPUProfileSessionReservation] = None,
     ) -> GPUProfileSessionLease:
         if isinstance(build_workers, bool) or not isinstance(build_workers, int):
             raise TypeError("build_workers must be a positive integer")
@@ -245,10 +289,20 @@ class GPUProfileSessionCache:
         with self._lock:
             if self._closed:
                 raise RuntimeError("GPU profile-session cache is closed")
-            if self._entry is not None and self._entry.leased:
-                raise GPUProfileCacheBusyError(
-                    "GPU profile-session cache already has an active search lease"
-                )
+            if reservation is None:
+                if (
+                    self._reservation is not None
+                    or (self._entry is not None and self._entry.leased)
+                ):
+                    raise GPUProfileCacheBusyError(
+                        "GPU profile-session cache already has an active search lease"
+                    )
+            elif (
+                reservation._cache is not self
+                or not reservation._active
+                or self._reservation is not reservation
+            ):
+                raise RuntimeError("GPU profile-session cache reservation is invalid")
 
             validation_started = time.perf_counter()
             validation = self._validator(canonical_base, manifest_path)
@@ -280,6 +334,7 @@ class GPUProfileSessionCache:
             entry = self._entry
             if entry is not None and entry.key == key and not entry.session.closed:
                 entry.leased = True
+                self._consume_reservation(reservation)
                 return GPUProfileSessionLease(
                     self,
                     entry,
@@ -319,6 +374,7 @@ class GPUProfileSessionCache:
                 raise
             entry = _CacheEntry(key=key, pairs=pairs, session=session, leased=True)
             self._entry = entry
+            self._consume_reservation(reservation)
             return GPUProfileSessionLease(
                 self,
                 entry,
@@ -327,6 +383,27 @@ class GPUProfileSessionCache:
                 profile_load_seconds=profile_load_seconds,
                 session_build_seconds=session_build_seconds,
             )
+
+    def _consume_reservation(
+        self,
+        reservation: Optional[GPUProfileSessionReservation],
+    ) -> None:
+        if reservation is not None:
+            if self._reservation is not reservation or not reservation._active:
+                raise RuntimeError("GPU profile-session cache reservation is invalid")
+            self._reservation = None
+            reservation._active = False
+
+    def _cancel_reservation(
+        self, reservation: GPUProfileSessionReservation
+    ) -> None:
+        with self._lock:
+            if self._reservation is reservation and reservation._active:
+                self._reservation = None
+                reservation._active = False
+                return
+            if reservation._active:
+                raise RuntimeError("GPU profile-session cache reservation is invalid")
 
     def _release(self, entry: _CacheEntry) -> None:
         with self._lock:
@@ -342,6 +419,10 @@ class GPUProfileSessionCache:
             if self._closed:
                 return
             self._closed = True
+            reservation = self._reservation
+            if reservation is not None:
+                self._reservation = None
+                reservation._active = False
             entry = self._entry
             if entry is not None and not entry.leased:
                 self._entry = None
@@ -362,6 +443,7 @@ __all__ = [
     "GPUProfileCacheKey",
     "GPUProfileSessionCache",
     "GPUProfileSessionLease",
+    "GPUProfileSessionReservation",
     "PROFILE_SEMANTICS",
     "Plan7RuntimeIdentity",
     "plan7_runtime_identity",

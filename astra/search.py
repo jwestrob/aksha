@@ -351,7 +351,13 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
 
     postfilter = gpu_postfilter_available()
     batch = None
+    cache_reservation = None
     try:
+        if profile_session_cache is not None:
+            # Claim the one-entry cache before allocating a target-dependent
+            # CUDA batch. Concurrent long-lived requests therefore fail while
+            # still host-only instead of transiently doubling device memory.
+            cache_reservation = profile_session_cache.reserve()
         batch_started = time.perf_counter()
         batch = SequenceBatch(
             all_sequences,
@@ -398,7 +404,9 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
                         ),
                         build_workers=threads,
                         selection_workers=0,
+                        reservation=cache_reservation,
                     )
+                    cache_reservation = None
                     pairs = session.profile_pairs
                     session_build_seconds = session.session_build_seconds
                 databases[db_name] = (
@@ -424,6 +432,8 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
                             session.profile_load_seconds
                         )
         elif profile_session_cache is not None:
+            cache_reservation.close()
+            cache_reservation = None
             for db_name, (pressed_base, _, _) in tuple(databases.items()):
                 manifest_path = database_specs[db_name][1]
                 load_started = time.perf_counter()
@@ -441,6 +451,11 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
                 metrics.preflight_seconds = preflight_seconds
         return databases, batch, postfilter
     except BaseException:
+        if cache_reservation is not None:
+            try:
+                cache_reservation.close()
+            except BaseException:
+                pass
         for _, _, session in databases.values():
             if session is not None:
                 try:

@@ -38,7 +38,9 @@ Each search receives an exclusive lease whose interface is the subset of
 closing the cache destroys the native session.  If cache shutdown begins while
 a lease is active, destruction is deferred until that lease returns.  A second
 concurrent lease fails rather than silently doubling PFAM memory or changing
-queue ordering.
+queue ordering.  Astra first takes a lightweight reservation before constructing
+the per-search CUDA target batch, so a concurrent request fails while still
+host-only instead of transiently doubling target memory.
 
 The cache has exactly one entry.  Replacing an idle key closes the old session
 before allocating the new one, so the cache never retains two 1.15 GB profile
