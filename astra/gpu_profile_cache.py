@@ -360,7 +360,15 @@ class GPUProfileSessionCache:
 
             if entry is not None:
                 self._entry = None
-                entry.session.close()
+                try:
+                    entry.session.close()
+                finally:
+                    # Do not carry the old PFAM tuple into replacement load:
+                    # even this local entry would otherwise overlap two large
+                    # immutable profile sets during key invalidation.
+                    entry.pairs = ()
+                    entry.session = None
+                entry = None
 
             load_started = time.perf_counter()
             pairs = tuple(self._loader(canonical_base, manifest=manifest_path))

@@ -50,9 +50,10 @@ before returning the lease; the worker is thereby retired and cannot admit a
 second target allocation beside a possibly live failed batch.
 
 The cache has exactly one entry.  Replacing an idle key closes the old session
-before allocating the new one, so the cache never retains two 1.15 GB profile
-snapshots.  The first seam intentionally supports one mapped database per
-search; ordinary multi-database searches retain their previous uncached path.
+and clears the old entry's pair/session references before loading the new one,
+so key invalidation never overlaps two 1.15 GB profile snapshots.  The first
+seam intentionally supports one mapped database per search; ordinary
+multi-database searches retain their previous uncached path.
 
 ## Exact key and invalidation
 

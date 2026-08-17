@@ -164,6 +164,40 @@ class GPUProfileSessionCacheTests(CacheFixture, unittest.TestCase):
                 second.close()
                 cache.close()
 
+    def test_invalidation_severs_old_entry_before_loading_replacement(self):
+        with tempfile.TemporaryDirectory(
+            prefix="astra-profile-cache-replace-"
+        ) as temporary:
+            base = Path(temporary) / "PFAM"
+            cache, state, _, sessions, _, loader, _ = self.make_cache(base)
+            first = cache.acquire(
+                base,
+                "manifest.json",
+                device_key=0,
+                build_workers=1,
+            )
+            first.close()
+            old_entry = cache._entry
+            state["stat_token"] = ("changed", 2)
+            replacement_pairs = (object(), object())
+
+            def load_replacement(*_args, **_kwargs):
+                self.assertTrue(sessions[0].closed)
+                self.assertEqual(old_entry.pairs, ())
+                self.assertIsNone(old_entry.session)
+                return replacement_pairs
+
+            loader.side_effect = load_replacement
+            second = cache.acquire(
+                base,
+                "manifest.json",
+                device_key=0,
+                build_workers=1,
+            )
+            self.assertIs(second.profile_pairs, replacement_pairs)
+            second.close()
+            cache.close()
+
     def test_active_lease_excludes_overlap_and_owner_close_is_deferred(self):
         with tempfile.TemporaryDirectory(prefix="astra-profile-cache-") as temporary:
             base = Path(temporary) / "PFAM"
