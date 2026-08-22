@@ -6,9 +6,10 @@ import sys
 import time
 import logging
 import shutil
+from collections import deque
 from pathlib import Path
 from queue import Empty, Full, Queue
-from threading import Event, Thread
+from threading import Condition, Event, Thread
 from tqdm import tqdm
 import pyhmmer
 from concurrent.futures import ThreadPoolExecutor
@@ -23,10 +24,14 @@ GPU_TIMING_ENV = 'ASTRA_GPU_OVERLAP_TIMING'
 GPU_SERIAL_ENV = 'ASTRA_GPU_PROFILE_SERIAL'
 GPU_LEGACY_OVERLAP_ENV = 'ASTRA_GPU_PROFILE_LEGACY_OVERLAP'
 GPU_LEGACY_OVERLAP_VALUE = 'single-prefetch'
+GPU_READY_QUEUE_DEPTH_ENV = 'ASTRA_GPU_READY_QUEUE_DEPTH'
+GPU_READY_QUEUE_BYTES_ENV = 'ASTRA_GPU_READY_QUEUE_BYTES'
 GPU_DOMAIN_GUARD = 2.0e-4
 GPU_READY_QUEUE_CAPACITY = 1
 GPU_PRODUCER_LOOKAHEAD_CAPACITY = GPU_READY_QUEUE_CAPACITY + 1
 GPU_LIVE_CANDIDATE_CAPACITY = GPU_READY_QUEUE_CAPACITY + 2
+GPU_READY_QUEUE_DEPTHS = (1, 2, 4)
+GPU_READY_QUEUE_MAX_BYTES = (1 << 63) - 1
 
 
 class GPUConfigurationError(ValueError):
@@ -52,6 +57,13 @@ class GPUOverlapMetrics:
         self.ready_without_wait_count = 0
         self.ready_queue_capacity = 0
         self.ready_queue_high_water = 0
+        self.ready_queue_byte_capacity = 0
+        self.ready_queue_byte_high_water = 0
+        self.ready_queue_final_count = 0
+        self.ready_queue_final_bytes = 0
+        self.generated_candidate_bytes = 0
+        self.consumed_candidate_bytes = 0
+        self.maximum_candidate_bytes = 0
         self.producer_lookahead_capacity = 0
         self.producer_idle_count = 0
         self.producer_idle_seconds = 0.0
@@ -75,6 +87,8 @@ class GPUOverlapMetrics:
         self.continuation_seconds = 0.0
         self.overlap_seconds = 0.0
         self.pipeline_wall_seconds = 0.0
+        self.generation_records = []
+        self.continuation_records = []
 
     def snapshot(self):
         return {
@@ -95,6 +109,13 @@ class GPUOverlapMetrics:
             'ready_without_wait_count': self.ready_without_wait_count,
             'ready_queue_capacity': self.ready_queue_capacity,
             'ready_queue_high_water': self.ready_queue_high_water,
+            'ready_queue_byte_capacity': self.ready_queue_byte_capacity,
+            'ready_queue_byte_high_water': self.ready_queue_byte_high_water,
+            'ready_queue_final_count': self.ready_queue_final_count,
+            'ready_queue_final_bytes': self.ready_queue_final_bytes,
+            'generated_candidate_bytes': self.generated_candidate_bytes,
+            'consumed_candidate_bytes': self.consumed_candidate_bytes,
+            'maximum_candidate_bytes': self.maximum_candidate_bytes,
             'producer_lookahead_capacity': self.producer_lookahead_capacity,
             'producer_idle_count': self.producer_idle_count,
             'producer_idle_seconds': self.producer_idle_seconds,
@@ -126,6 +147,12 @@ class GPUOverlapMetrics:
             'continuation_seconds': self.continuation_seconds,
             'overlap_seconds': self.overlap_seconds,
             'pipeline_wall_seconds': self.pipeline_wall_seconds,
+            'generation_records': [
+                dict(record) for record in self.generation_records
+            ],
+            'continuation_records': [
+                dict(record) for record in self.continuation_records
+            ],
         }
 
 
@@ -176,6 +203,184 @@ def gpu_profile_scheduler_mode(profile_session, overlap_enabled):
             "GPU profile session"
         )
     return 'single-prefetch'
+
+
+def gpu_ready_queue_configuration():
+    """Return the exact experimental ready-queue depth and byte ceiling.
+
+    With neither variable set this deliberately returns the audited one-slot,
+    item-bounded configuration.  Deeper queues require an explicit byte limit
+    so enabling lookahead can never silently turn into an unbounded host-memory
+    experiment.
+    """
+    depth_text = os.environ.get(GPU_READY_QUEUE_DEPTH_ENV)
+    byte_text = os.environ.get(GPU_READY_QUEUE_BYTES_ENV)
+
+    if depth_text is None:
+        depth = GPU_READY_QUEUE_CAPACITY
+    elif depth_text not in tuple(str(value) for value in GPU_READY_QUEUE_DEPTHS):
+        allowed = ', '.join(str(value) for value in GPU_READY_QUEUE_DEPTHS)
+        raise GPUConfigurationError(
+            f"{GPU_READY_QUEUE_DEPTH_ENV} accepts only {allowed}"
+        )
+    else:
+        depth = int(depth_text)
+
+    if byte_text is None:
+        byte_capacity = None
+    else:
+        if (
+            not byte_text
+            or not byte_text.isascii()
+            or not byte_text.isdigit()
+            or byte_text[0] == '0'
+        ):
+            raise GPUConfigurationError(
+                f"{GPU_READY_QUEUE_BYTES_ENV} must be a canonical positive "
+                "decimal byte count"
+            )
+        try:
+            byte_capacity = int(byte_text)
+        except ValueError as error:
+            raise GPUConfigurationError(
+                f"{GPU_READY_QUEUE_BYTES_ENV} is outside the supported "
+                "integer range"
+            ) from error
+        if byte_capacity > GPU_READY_QUEUE_MAX_BYTES:
+            raise GPUConfigurationError(
+                f"{GPU_READY_QUEUE_BYTES_ENV} must be at most "
+                f"{GPU_READY_QUEUE_MAX_BYTES}"
+            )
+
+    if depth != GPU_READY_QUEUE_CAPACITY and byte_capacity is None:
+        raise GPUConfigurationError(
+            f"{GPU_READY_QUEUE_DEPTH_ENV}={depth} requires an explicit "
+            f"{GPU_READY_QUEUE_BYTES_ENV}"
+        )
+    return depth, byte_capacity
+
+
+def _gpu_candidate_resident_bytes(candidates):
+    """Read the adapter's exact incremental CandidateBatch byte charge."""
+    try:
+        resident_bytes = candidates.resident_bytes
+    except AttributeError as error:
+        raise GPUConfigurationError(
+            f"{GPU_READY_QUEUE_BYTES_ENV} requires a plan7_gpu CandidateBatch "
+            "with exact resident_bytes support"
+        ) from error
+    if type(resident_bytes) is not int or resident_bytes < 0:
+        raise RuntimeError(
+            "CandidateBatch.resident_bytes must be an exact nonnegative integer"
+        )
+    return resident_bytes
+
+
+class _GPUByteBoundedReadyQueue:
+    """A strict FIFO bounded by queued-item count and exact queued bytes.
+
+    The ceiling deliberately excludes the batch currently owned by the
+    consumer and the batch being generated by the producer.  Those two live
+    objects are reported by the separate live/lookahead capacity metrics.
+    """
+
+    def __init__(self, max_items, max_bytes):
+        if type(max_items) is not int or max_items <= 0:
+            raise ValueError("max_items must be a positive integer")
+        if type(max_bytes) is not int or max_bytes <= 0:
+            raise ValueError("max_bytes must be a positive integer")
+        self._max_items = max_items
+        self._max_bytes = max_bytes
+        self._items = deque()
+        self._resident_bytes = 0
+        self._item_high_water = 0
+        self._byte_high_water = 0
+        self._condition = Condition()
+
+    def _validate_weight(self, weight):
+        if type(weight) is not int or weight < 0:
+            raise ValueError("queue item bytes must be a nonnegative integer")
+        if weight > self._max_bytes:
+            raise ValueError(
+                f"queue item requires {weight} bytes, exceeding the "
+                f"{self._max_bytes}-byte ready-queue ceiling"
+            )
+
+    def _can_put(self, weight):
+        return (
+            len(self._items) < self._max_items
+            and self._resident_bytes + weight <= self._max_bytes
+        )
+
+    def _append(self, item, weight):
+        self._items.append((item, weight))
+        self._resident_bytes += weight
+        self._item_high_water = max(self._item_high_water, len(self._items))
+        self._byte_high_water = max(
+            self._byte_high_water, self._resident_bytes
+        )
+        self._condition.notify_all()
+
+    def put_nowait(self, item, weight):
+        self._validate_weight(weight)
+        with self._condition:
+            if not self._can_put(weight):
+                raise Full
+            self._append(item, weight)
+
+    def put(self, item, weight, timeout, stop=None):
+        self._validate_weight(weight)
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while not self._can_put(weight):
+                if stop is not None and stop.is_set():
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise Full
+                self._condition.wait(remaining)
+            if stop is not None and stop.is_set():
+                return False
+            self._append(item, weight)
+            return True
+
+    def _popleft(self):
+        item, weight = self._items.popleft()
+        self._resident_bytes -= weight
+        self._condition.notify_all()
+        return item
+
+    def get_nowait(self):
+        with self._condition:
+            if not self._items:
+                raise Empty
+            return self._popleft()
+
+    def get(self, timeout):
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while not self._items:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise Empty
+                self._condition.wait(remaining)
+            return self._popleft()
+
+    def state(self):
+        with self._condition:
+            return (
+                len(self._items),
+                self._resident_bytes,
+                self._item_high_water,
+                self._byte_high_water,
+            )
+
+    def high_water(self):
+        return self.state()[2:]
+
+    def wake_all(self):
+        with self._condition:
+            self._condition.notify_all()
 
 
 def parse_gpu_manifest_mappings(entries):
@@ -823,6 +1028,7 @@ def _consume_gpu_candidate_chunk(spec, candidates, total_chunks, threads, fh,
           f"({len(hmm_chunk)} HMMs)...", end="", flush=True)
     hit_iterator = None
     hits = None
+    completed = False
     started = time.perf_counter()
     try:
         hit_iterator = gpu_hmmsearch(
@@ -834,6 +1040,7 @@ def _consume_gpu_candidate_chunk(spec, candidates, total_chunks, threads, fh,
         )
         for hits in hit_iterator:
             process_hits_to_file(hits, fh)
+        completed = True
     except BaseException:
         if hit_iterator is not None:
             close = getattr(hit_iterator, "close", None)
@@ -847,6 +1054,15 @@ def _consume_gpu_candidate_chunk(spec, candidates, total_chunks, threads, fh,
         finished = time.perf_counter()
         if gpu_metrics is not None:
             gpu_metrics.continuation_seconds += finished - started
+            gpu_metrics.continuation_records.append({
+                'chunk_index': chunk_index,
+                'profile_indices': tuple(spec[2]),
+                'profile_count': len(hmm_chunk),
+                'started_monotonic_seconds': started,
+                'finished_monotonic_seconds': finished,
+                'duration_seconds': finished - started,
+                'completed': completed,
+            })
         hit_iterator = None
         hits = None
     if gpu_metrics is not None:
@@ -1099,27 +1315,49 @@ def _run_gpu_profile_single_prefetch(chunks, profile_session, sequence_batch,
 
 def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                               threads, fh, gpu_metrics=None,
-                              domain_continuation=False):
-    """Continuously produce ordered GPU batches into one bounded ready slot.
+                              domain_continuation=False,
+                              ready_queue_configuration=None):
+    """Continuously produce ordered GPU batches into a bounded ready queue.
 
     The producer owns selection and CUDA generation.  While the caller consumes
-    chunk ``i``, the ready queue may retain ``i + 1`` and the producer may work
-    on ``i + 2``.  The single ready slot is the only additional completed-batch
-    storage relative to the original one-future scheduler.
+    chunk ``i``, a depth-``d`` queue may retain the next ``d`` chunks and the
+    producer may work on one further chunk.  The default remains the audited
+    single ready slot.  Experimental deeper queues require an exact byte cap
+    and exact immutable ``CandidateBatch.resident_bytes`` charges.
     """
     if not chunks:
         return
+
+    if ready_queue_configuration is None:
+        ready_queue_configuration = gpu_ready_queue_configuration()
+    if (
+        type(ready_queue_configuration) is not tuple
+        or len(ready_queue_configuration) != 2
+    ):
+        raise TypeError(
+            "ready_queue_configuration must be an exact (depth, bytes) tuple"
+        )
+    ready_depth, ready_byte_capacity = ready_queue_configuration
+    if type(ready_depth) is not int or ready_depth not in GPU_READY_QUEUE_DEPTHS:
+        raise ValueError("ready queue depth must be exactly 1, 2, or 4")
+    if ready_byte_capacity is not None and (
+        type(ready_byte_capacity) is not int or ready_byte_capacity <= 0
+    ):
+        raise ValueError("ready queue byte capacity must be positive or None")
+    if ready_depth != GPU_READY_QUEUE_CAPACITY and ready_byte_capacity is None:
+        raise ValueError("deeper ready queues require an exact byte capacity")
 
     from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
 
     if gpu_metrics is not None:
         statistics = profile_session.statistics
         gpu_metrics.scheduler_mode = 'bounded-ready-queue'
-        gpu_metrics.ready_queue_capacity = GPU_READY_QUEUE_CAPACITY
+        gpu_metrics.ready_queue_capacity = ready_depth
+        gpu_metrics.ready_queue_byte_capacity = ready_byte_capacity or 0
         gpu_metrics.producer_lookahead_capacity = (
-            GPU_PRODUCER_LOOKAHEAD_CAPACITY
+            ready_depth + 1
         )
-        gpu_metrics.live_candidate_capacity = GPU_LIVE_CANDIDATE_CAPACITY
+        gpu_metrics.live_candidate_capacity = ready_depth + 2
         gpu_metrics.chunk_count += len(chunks)
         gpu_metrics.profile_worker_count = statistics['worker_count']
         gpu_metrics.profile_build_worker_count = statistics.get(
@@ -1130,7 +1368,14 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
         )
         gpu_metrics.profile_host_bytes = statistics['host_bytes']
 
-    ready = Queue(maxsize=GPU_READY_QUEUE_CAPACITY)
+    if ready_byte_capacity is None:
+        # Preserve the audited default implementation, not merely its nominal
+        # capacity.  This path is selected only for the default depth of one.
+        ready = Queue(maxsize=ready_depth)
+    else:
+        ready = _GPUByteBoundedReadyQueue(
+            ready_depth, ready_byte_capacity
+        )
     stop = Event()
     producer_done = Event()
     producer_state = {
@@ -1140,23 +1385,39 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
         'terminal_error': None,
     }
 
-    def publish(item):
+    def put_nowait(item, item_bytes):
+        if ready_byte_capacity is None:
+            ready.put_nowait(item)
+        else:
+            ready.put_nowait(item, item_bytes)
+
+    def put_with_timeout(item, item_bytes):
+        if ready_byte_capacity is None:
+            ready.put(item, timeout=0.05)
+            return True
+        else:
+            return ready.put(
+                item, item_bytes, timeout=0.05, stop=stop
+            )
+
+    def publish(item, item_bytes):
         if stop.is_set():
             return False
         try:
-            ready.put_nowait(item)
+            put_nowait(item, item_bytes)
         except Full:
             producer_state['idle_count'] += 1
             idle_started = time.perf_counter()
             while not stop.is_set():
                 try:
-                    ready.put(item, timeout=0.05)
+                    inserted = put_with_timeout(item, item_bytes)
                     producer_state['idle_seconds'] += (
                         time.perf_counter() - idle_started
                     )
-                    producer_state['ready_high_water'] = max(
-                        producer_state['ready_high_water'], 1
-                    )
+                    if not inserted:
+                        return False
+                    if ready_byte_capacity is None:
+                        producer_state['ready_high_water'] = 1
                     return True
                 except Full:
                     pass
@@ -1164,9 +1425,8 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                 time.perf_counter() - idle_started
             )
             return False
-        producer_state['ready_high_water'] = max(
-            producer_state['ready_high_water'], 1
-        )
+        if ready_byte_capacity is None:
+            producer_state['ready_high_water'] = 1
         return True
 
     def produce():
@@ -1183,9 +1443,9 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                     selection_finished = time.perf_counter()
                     item = (
                         position, spec, None, error,
-                        selection_started, selection_finished, None, None,
+                        selection_started, selection_finished, None, None, 0,
                     )
-                    publish(item)
+                    publish(item, 0)
                     item = None
                     return
                 selection_finished = time.perf_counter()
@@ -1206,9 +1466,9 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                     item = (
                         position, spec, None, error,
                         selection_started, selection_finished,
-                        generation_started, None,
+                        generation_started, None, 0,
                     )
-                    publish(item)
+                    publish(item, 0)
                     item = None
                     return
                 try:
@@ -1219,19 +1479,43 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                     item = (
                         position, spec, None, error,
                         selection_started, selection_finished,
-                        generation_started, None,
+                        generation_started, None, 0,
                     )
-                    publish(item)
+                    publish(item, 0)
                     item = None
                     return
                 selection = None
                 generation_finished = time.perf_counter()
+                candidate_bytes = 0
+                if ready_byte_capacity is not None:
+                    try:
+                        candidate_bytes = _gpu_candidate_resident_bytes(
+                            candidates
+                        )
+                        if candidate_bytes > ready_byte_capacity:
+                            raise GPUConfigurationError(
+                                f"generated CandidateBatch requires "
+                                f"{candidate_bytes} bytes, exceeding "
+                                f"{GPU_READY_QUEUE_BYTES_ENV}="
+                                f"{ready_byte_capacity}"
+                            )
+                    except BaseException as error:
+                        candidates = None
+                        item = (
+                            position, spec, None, error,
+                            selection_started, selection_finished,
+                            generation_started, generation_finished, 0,
+                        )
+                        publish(item, 0)
+                        item = None
+                        return
                 item = (
                     position, spec, candidates, None,
                     selection_started, selection_finished,
                     generation_started, generation_finished,
+                    candidate_bytes,
                 )
-                if not publish(item):
+                if not publish(item, candidate_bytes):
                     item = None
                     candidates = None
                     return
@@ -1282,7 +1566,8 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
         for position, spec in enumerate(chunks):
             wait_started = time.perf_counter()
             item, ready_without_wait = next_ready()
-            wait_seconds = time.perf_counter() - wait_started
+            ready_dequeued = time.perf_counter()
+            wait_seconds = ready_dequeued - wait_started
             (
                 produced_position,
                 produced_spec,
@@ -1292,6 +1577,7 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                 selection_finished,
                 generation_started,
                 generation_finished,
+                candidate_bytes,
             ) = item
             item = None
             if produced_position != position or produced_spec is not spec:
@@ -1306,8 +1592,48 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
             if generation_started is None or generation_finished is None:
                 candidates = None
                 raise RuntimeError("GPU profile producer omitted generation timing")
+            if ready_byte_capacity is not None:
+                observed_candidate_bytes = _gpu_candidate_resident_bytes(
+                    candidates
+                )
+                if observed_candidate_bytes != candidate_bytes:
+                    candidates = None
+                    raise RuntimeError(
+                        "CandidateBatch.resident_bytes changed while queued: "
+                        f"{candidate_bytes} -> {observed_candidate_bytes}"
+                    )
             if gpu_metrics is not None:
                 gpu_metrics.generated_chunk_count += 1
+                gpu_metrics.generated_candidate_bytes += candidate_bytes
+                gpu_metrics.maximum_candidate_bytes = max(
+                    gpu_metrics.maximum_candidate_bytes,
+                    candidate_bytes,
+                )
+                gpu_metrics.generation_records.append({
+                    'position': position,
+                    'chunk_index': spec[0],
+                    'profile_indices': tuple(spec[2]),
+                    'profile_count': len(spec[1]),
+                    'selection_started_monotonic_seconds': selection_started,
+                    'selection_finished_monotonic_seconds': selection_finished,
+                    'selection_duration_seconds': (
+                        selection_finished - selection_started
+                    ),
+                    'generation_started_monotonic_seconds': generation_started,
+                    'generation_finished_monotonic_seconds': generation_finished,
+                    'generation_duration_seconds': (
+                        generation_finished - generation_started
+                    ),
+                    'ready_wait_started_monotonic_seconds': wait_started,
+                    'ready_dequeued_monotonic_seconds': ready_dequeued,
+                    'ready_wait_duration_seconds': wait_seconds,
+                    'ready_without_wait': ready_without_wait,
+                    'candidate_resident_bytes': (
+                        candidate_bytes
+                        if ready_byte_capacity is not None
+                        else None
+                    ),
+                })
                 gpu_metrics.ready_without_wait_count += int(ready_without_wait)
                 gpu_metrics.generation_seconds += (
                     generation_finished - generation_started
@@ -1356,11 +1682,15 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                 gpu_hmmsearch,
                 gpu_metrics,
             )
+            if gpu_metrics is not None:
+                gpu_metrics.consumed_candidate_bytes += candidate_bytes
             candidates = None
             consumption_intervals.append(consumption_interval)
     finally:
         active_error = sys.exc_info()[1]
         stop.set()
+        if ready_byte_capacity is not None:
+            ready.wake_all()
         discard_ready()
         join_error = None
         if producer_started:
@@ -1386,7 +1716,31 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                     continue
                 break
         discard_ready()
+        if ready_byte_capacity is None:
+            final_ready_count = ready.qsize()
+            final_ready_bytes = 0
+        else:
+            (
+                final_ready_count,
+                final_ready_bytes,
+                ready_high_water,
+                byte_high_water,
+            ) = ready.state()
+        if final_ready_count or final_ready_bytes:
+            final_queue_error = RuntimeError(
+                "GPU ready queue retained items or bytes after producer join"
+            )
+        else:
+            final_queue_error = None
         if gpu_metrics is not None:
+            if ready_byte_capacity is not None:
+                producer_state['ready_high_water'] = ready_high_water
+                gpu_metrics.ready_queue_byte_high_water = max(
+                    gpu_metrics.ready_queue_byte_high_water,
+                    byte_high_water,
+                )
+            gpu_metrics.ready_queue_final_count = final_ready_count
+            gpu_metrics.ready_queue_final_bytes = final_ready_bytes
             gpu_metrics.ready_queue_high_water = max(
                 gpu_metrics.ready_queue_high_water,
                 producer_state['ready_high_water'],
@@ -1398,6 +1752,8 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
             )
         if join_error is not None and active_error is None:
             raise join_error
+        if final_queue_error is not None and active_error is None:
+            raise final_queue_error
 
 
 
@@ -1464,6 +1820,20 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
     profile_scheduler_mode = gpu_profile_scheduler_mode(
         gpu_profile_session, profile_overlap_enabled
     )
+    ready_queue_configuration = None
+    if profile_scheduler_mode == 'bounded-ready-queue':
+        # Parse the experimental contract before creating output directories or
+        # files.  Invalid depth/byte requests therefore fail without partial
+        # search output.
+        ready_queue_configuration = gpu_ready_queue_configuration()
+    elif gpu_profile_session is not None and (
+        GPU_READY_QUEUE_DEPTH_ENV in os.environ
+        or GPU_READY_QUEUE_BYTES_ENV in os.environ
+    ):
+        raise GPUConfigurationError(
+            f"{GPU_READY_QUEUE_DEPTH_ENV} and {GPU_READY_QUEUE_BYTES_ENV} "
+            "require the active bounded-ready-queue scheduler"
+        )
 
     # Always write to temp files — bulk mode is faster and avoids
     # keeping huge result lists in memory.  The per-genome loop is
@@ -1573,20 +1943,36 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
 
             if gpu_profile_session is not None:
                 if profile_scheduler_mode == 'bounded-ready-queue':
-                    profile_runner = _run_gpu_profile_pipeline
+                    _run_gpu_profile_pipeline(
+                        chunks,
+                        gpu_profile_session,
+                        gpu_sequence_batch,
+                        continuation_threads,
+                        fh,
+                        gpu_metrics,
+                        profile_domain_continuation,
+                        ready_queue_configuration,
+                    )
                 elif profile_scheduler_mode == 'single-prefetch':
-                    profile_runner = _run_gpu_profile_single_prefetch
+                    _run_gpu_profile_single_prefetch(
+                        chunks,
+                        gpu_profile_session,
+                        gpu_sequence_batch,
+                        continuation_threads,
+                        fh,
+                        gpu_metrics,
+                        profile_domain_continuation,
+                    )
                 else:
-                    profile_runner = _run_gpu_profile_serial
-                profile_runner(
-                    chunks,
-                    gpu_profile_session,
-                    gpu_sequence_batch,
-                    continuation_threads,
-                    fh,
-                    gpu_metrics,
-                    profile_domain_continuation,
-                )
+                    _run_gpu_profile_serial(
+                        chunks,
+                        gpu_profile_session,
+                        gpu_sequence_batch,
+                        continuation_threads,
+                        fh,
+                        gpu_metrics,
+                        profile_domain_continuation,
+                    )
             else:
                 for chunk_index, hmm_chunk, _, kwargs in chunks:
                     print(f"  Chunk {chunk_index}/{total_chunks} "

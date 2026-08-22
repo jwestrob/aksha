@@ -4,6 +4,7 @@ import gc
 import importlib
 import inspect
 import io
+import math
 import os
 import sys
 import tempfile
@@ -12,6 +13,7 @@ import time
 import unittest
 import weakref
 from pathlib import Path
+from queue import Empty, Full
 from types import ModuleType, SimpleNamespace
 from unittest import mock
 
@@ -468,6 +470,194 @@ class GPUConfigurationTests(unittest.TestCase):
                 os.environ[environment] = previous
             else:
                 os.environ.pop(environment, None)
+
+    def test_ready_queue_configuration_is_exact_and_fail_closed(self):
+        depth_environment = search.GPU_READY_QUEUE_DEPTH_ENV
+        byte_environment = search.GPU_READY_QUEUE_BYTES_ENV
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                search.gpu_ready_queue_configuration(), (1, None)
+            )
+
+        accepted = {
+            ("1", None): (1, None),
+            (None, "4096"): (1, 4096),
+            ("1", "4096"): (1, 4096),
+            ("2", "4096"): (2, 4096),
+            ("4", "4096"): (4, 4096),
+        }
+        for (depth, byte_count), expected in accepted.items():
+            environment = {}
+            if depth is not None:
+                environment[depth_environment] = depth
+            if byte_count is not None:
+                environment[byte_environment] = byte_count
+            with self.subTest(environment=environment):
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    self.assertEqual(
+                        search.gpu_ready_queue_configuration(), expected
+                    )
+
+        for depth in ("", "0", "01", "3", "8", "+2", " 2", "2 "):
+            with self.subTest(depth=depth):
+                with mock.patch.dict(
+                    os.environ, {depth_environment: depth}, clear=True
+                ):
+                    with self.assertRaisesRegex(
+                        search.GPUConfigurationError, "accepts only"
+                    ):
+                        search.gpu_ready_queue_configuration()
+
+        for byte_count in (
+            "", "0", "00", "01", "-1", "+1", " 1", "1 ", "1_000", "١",
+        ):
+            with self.subTest(byte_count=byte_count):
+                with mock.patch.dict(
+                    os.environ, {byte_environment: byte_count}, clear=True
+                ):
+                    with self.assertRaisesRegex(
+                        search.GPUConfigurationError,
+                        "canonical positive decimal",
+                    ):
+                        search.gpu_ready_queue_configuration()
+
+        with mock.patch.dict(
+            os.environ, {depth_environment: "2"}, clear=True
+        ):
+            with self.assertRaisesRegex(
+                search.GPUConfigurationError, "requires an explicit"
+            ):
+                search.gpu_ready_queue_configuration()
+        with mock.patch.dict(
+            os.environ,
+            {byte_environment: str(search.GPU_READY_QUEUE_MAX_BYTES + 1)},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                search.GPUConfigurationError, "must be at most"
+            ):
+                search.gpu_ready_queue_configuration()
+
+    def test_invalid_ready_queue_configuration_precedes_output_creation(self):
+        pair = SimpleNamespace(cutoffs=SimpleNamespace(
+            gathering=None, noise=None, trusted=None
+        ))
+
+        class Session:
+            closed = False
+            statistics = {"worker_count": 0, "host_bytes": 0}
+
+            def __len__(self):
+                return 1
+
+        with tempfile.TemporaryDirectory(
+            prefix="astra-gpu-ready-config-"
+        ) as temporary:
+            outdir = Path(temporary) / "output"
+            with mock.patch.dict(
+                os.environ,
+                {search.GPU_READY_QUEUE_DEPTH_ENV: "2"},
+                clear=True,
+            ):
+                with mock.patch.object(
+                    search, "gpu_profile_domain_available", return_value=False
+                ):
+                    with self.assertRaisesRegex(
+                        search.GPUConfigurationError, "requires an explicit"
+                    ):
+                        search.hmmsearch(
+                            {},
+                            [pair],
+                            2,
+                            search_options(outdir),
+                            all_sequences=[object()],
+                            gpu_sequence_batch=object(),
+                            gpu_postfilter=True,
+                            gpu_profile_session=Session(),
+                        )
+            self.assertFalse(outdir.exists())
+
+            serial_outdir = Path(temporary) / "serial-output"
+            with mock.patch.dict(
+                os.environ,
+                {search.GPU_READY_QUEUE_BYTES_ENV: "10"},
+                clear=True,
+            ):
+                with mock.patch.object(
+                    search, "gpu_profile_domain_available", return_value=False
+                ):
+                    with self.assertRaisesRegex(
+                        search.GPUConfigurationError,
+                        "require the active bounded-ready-queue",
+                    ):
+                        search.hmmsearch(
+                            {},
+                            [pair],
+                            1,
+                            search_options(serial_outdir),
+                            all_sequences=[object()],
+                            gpu_sequence_batch=object(),
+                            gpu_postfilter=True,
+                            gpu_profile_session=Session(),
+                        )
+            self.assertFalse(serial_outdir.exists())
+
+
+class GPUByteBoundedQueueTests(unittest.TestCase):
+    def test_fifo_enforces_both_caps_and_releases_bytes_on_pop(self):
+        ready = search._GPUByteBoundedReadyQueue(2, 10)
+        ready.put_nowait("first", 6)
+        with self.assertRaises(Full):
+            ready.put_nowait("byte-blocked", 5)
+        ready.put_nowait("second", 4)
+        with self.assertRaises(Full):
+            ready.put_nowait("item-blocked", 0)
+        self.assertEqual(ready.get_nowait(), "first")
+        ready.put_nowait("third", 6)
+        self.assertEqual(ready.get_nowait(), "second")
+        self.assertEqual(ready.get_nowait(), "third")
+        with self.assertRaises(Empty):
+            ready.get_nowait()
+        self.assertEqual(ready.high_water(), (2, 10))
+        self.assertEqual(ready.state(), (0, 0, 2, 10))
+
+        # The popped six bytes were subtracted before the third item entered;
+        # otherwise this high-water would incorrectly be sixteen.
+        one_at_a_time = search._GPUByteBoundedReadyQueue(2, 6)
+        one_at_a_time.put_nowait("a", 6)
+        self.assertEqual(one_at_a_time.get_nowait(), "a")
+        one_at_a_time.put_nowait("b", 6)
+        self.assertEqual(one_at_a_time.get_nowait(), "b")
+        self.assertEqual(one_at_a_time.high_water(), (1, 6))
+
+    def test_rejects_oversize_and_nonexact_byte_weights(self):
+        ready = search._GPUByteBoundedReadyQueue(1, 10)
+        with self.assertRaisesRegex(ValueError, "exceeding"):
+            ready.put_nowait("large", 11)
+        for invalid in (True, -1, 1.0, None):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "nonnegative"):
+                    ready.put_nowait("invalid", invalid)
+
+    def test_candidate_byte_api_is_exact_or_fails_closed(self):
+        self.assertEqual(
+            search._gpu_candidate_resident_bytes(
+                SimpleNamespace(resident_bytes=17)
+            ),
+            17,
+        )
+        with self.assertRaisesRegex(
+            search.GPUConfigurationError, "exact resident_bytes support"
+        ):
+            search._gpu_candidate_resident_bytes(SimpleNamespace())
+        for invalid in (True, -1, 1.0, None):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(
+                    RuntimeError, "exact nonnegative integer"
+                ):
+                    search._gpu_candidate_resident_bytes(
+                        SimpleNamespace(resident_bytes=invalid)
+                    )
 
     def test_oversized_gpu_target_set_is_rejected_before_preflight_or_output(self):
         with tempfile.TemporaryDirectory(prefix="astra-gpu-cap-") as temporary:
@@ -983,6 +1173,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory(prefix="astra-gpu-overlap-") as temporary:
             with (
+                mock.patch.dict(os.environ, {}, clear=True),
                 mock.patch.dict(sys.modules, modules),
                 mock.patch.object(search, "GPU_CELL_CAP", 2),
                 mock.patch.object(
@@ -1054,6 +1245,19 @@ class GPUProfileOverlapTests(unittest.TestCase):
         self.assertEqual(snapshot["consumed_chunk_count"], 4)
         self.assertEqual(snapshot["ready_queue_capacity"], 1)
         self.assertEqual(snapshot["ready_queue_high_water"], 1)
+        self.assertEqual(snapshot["ready_queue_byte_capacity"], 0)
+        self.assertEqual(snapshot["ready_queue_byte_high_water"], 0)
+        self.assertEqual(snapshot["ready_queue_final_count"], 0)
+        self.assertEqual(snapshot["ready_queue_final_bytes"], 0)
+        self.assertEqual(snapshot["generated_candidate_bytes"], 0)
+        self.assertEqual(snapshot["consumed_candidate_bytes"], 0)
+        self.assertEqual(snapshot["maximum_candidate_bytes"], 0)
+        self.assertEqual(len(snapshot["generation_records"]), 4)
+        self.assertTrue(all(
+            record["candidate_resident_bytes"] is None
+            for record in snapshot["generation_records"]
+        ))
+        self.assertEqual(len(snapshot["continuation_records"]), 4)
         self.assertEqual(snapshot["producer_lookahead_capacity"], 2)
         self.assertEqual(snapshot["producer_lookahead_high_water"], 2)
         self.assertGreaterEqual(snapshot["producer_lookahead_start_count"], 1)
@@ -1065,6 +1269,518 @@ class GPUProfileOverlapTests(unittest.TestCase):
         self.assertEqual(max(live_candidate_counts), 3)
         gc.collect()
         self.assertTrue(all(reference() is None for reference in candidate_refs))
+        self.assertFalse(any(
+            thread.name.startswith("astra-gpu-generate")
+            for thread in threading.enumerate()
+        ))
+
+    def test_byte_bounded_depths_reach_exact_fifo_and_memory_limits(self):
+        for depth in (1, 2, 4):
+            with self.subTest(depth=depth):
+                pair_count = depth + 2
+                pairs = [self.pair() for _ in range(pair_count)]
+                first_consumption_started = threading.Event()
+                last_generation_started = threading.Event()
+                selection_calls = []
+                selections = []
+                generation_calls = []
+                candidate_refs = []
+                live_candidate_counts = []
+                observed = []
+
+                class Selection:
+                    def __init__(self, indices):
+                        self.indices = tuple(indices)
+                        self.close_count = 0
+
+                    def close(self):
+                        self.close_count += 1
+
+                class Session:
+                    statistics = {
+                        "worker_count": 0,
+                        "build_worker_count": 3,
+                        "selection_worker_count": 0,
+                        "host_bytes": 1234,
+                    }
+
+                    def select(self, indices):
+                        selection_calls.append(tuple(indices))
+                        selection = Selection(indices)
+                        selections.append(selection)
+                        return selection
+
+                class Candidate:
+                    resident_bytes = 10
+
+                    def __init__(self, indices):
+                        self.indices = tuple(indices)
+
+                class Batch:
+                    def _postfilter_forward_selection(
+                        self, selection, F1, F2, F3, bias_filter
+                    ):
+                        if selection.indices == (1,):
+                            self_outer.assertTrue(
+                                first_consumption_started.wait(2)
+                            )
+                        generation_calls.append(selection.indices)
+                        candidate = Candidate(selection.indices)
+                        candidate_refs.append(weakref.ref(candidate))
+                        live_candidate_counts.append(sum(
+                            reference() is not None
+                            for reference in candidate_refs
+                        ))
+                        if len(generation_calls) == pair_count:
+                            last_generation_started.set()
+                        return candidate
+
+                def gpu_search(_chunk, candidates, **_kwargs):
+                    def results():
+                        if candidates.indices == (0,):
+                            first_consumption_started.set()
+                            self.assertTrue(last_generation_started.wait(2))
+                        yield candidates.indices
+
+                    return results()
+
+                chunks = [
+                    (index + 1, [pair], (index,), {})
+                    for index, pair in enumerate(pairs)
+                ]
+                self_outer = self
+                modules, _ = synthetic_plan7_gpu(True)
+                modules["plan7_gpu.astra_search"].hmmsearch = gpu_search
+                metrics = search.GPUOverlapMetrics()
+                with (
+                    mock.patch.dict(sys.modules, modules),
+                    mock.patch.object(
+                        search,
+                        "process_hits_to_file",
+                        side_effect=lambda hits, _fh: observed.append(hits),
+                    ),
+                ):
+                    search._run_gpu_profile_pipeline(
+                        chunks,
+                        Session(),
+                        Batch(),
+                        2,
+                        io.StringIO(),
+                        metrics,
+                        ready_queue_configuration=(depth, depth * 10),
+                    )
+
+                expected_order = [(index,) for index in range(pair_count)]
+                self.assertEqual(selection_calls, expected_order)
+                self.assertEqual(generation_calls, expected_order)
+                self.assertEqual(observed, expected_order)
+                self.assertTrue(all(
+                    selection.close_count == 1 for selection in selections
+                ))
+                snapshot = metrics.snapshot()
+                self.assertEqual(snapshot["ready_queue_capacity"], depth)
+                self.assertEqual(
+                    snapshot["ready_queue_byte_capacity"], depth * 10
+                )
+                self.assertEqual(snapshot["ready_queue_high_water"], depth)
+                self.assertEqual(
+                    snapshot["ready_queue_byte_high_water"], depth * 10
+                )
+                self.assertEqual(snapshot["ready_queue_final_count"], 0)
+                self.assertEqual(snapshot["ready_queue_final_bytes"], 0)
+                self.assertEqual(
+                    snapshot["producer_lookahead_capacity"], depth + 1
+                )
+                self.assertEqual(
+                    snapshot["live_candidate_capacity"], depth + 2
+                )
+                self.assertEqual(
+                    snapshot["generated_candidate_bytes"], pair_count * 10
+                )
+                self.assertEqual(
+                    snapshot["consumed_candidate_bytes"], pair_count * 10
+                )
+                self.assertEqual(snapshot["maximum_candidate_bytes"], 10)
+                self.assertEqual(
+                    [record["position"] for record in snapshot["generation_records"]],
+                    list(range(pair_count)),
+                )
+                self.assertTrue(all(
+                    record["candidate_resident_bytes"] == 10
+                    and math.isfinite(
+                        record["generation_started_monotonic_seconds"]
+                    )
+                    and math.isfinite(
+                        record["generation_finished_monotonic_seconds"]
+                    )
+                    and math.isfinite(record["generation_duration_seconds"])
+                    and record["generation_finished_monotonic_seconds"]
+                    >= record["generation_started_monotonic_seconds"]
+                    and record["generation_duration_seconds"]
+                    == record["generation_finished_monotonic_seconds"]
+                    - record["generation_started_monotonic_seconds"]
+                    for record in snapshot["generation_records"]
+                ))
+                for record in snapshot["generation_records"]:
+                    for phase in ("selection", "generation"):
+                        started = record[
+                            f"{phase}_started_monotonic_seconds"
+                        ]
+                        finished = record[
+                            f"{phase}_finished_monotonic_seconds"
+                        ]
+                        duration = record[f"{phase}_duration_seconds"]
+                        self.assertTrue(all(map(
+                            math.isfinite, (started, finished, duration)
+                        )))
+                        self.assertGreaterEqual(finished, started)
+                        self.assertEqual(duration, finished - started)
+                    wait_started = record[
+                        "ready_wait_started_monotonic_seconds"
+                    ]
+                    dequeued = record["ready_dequeued_monotonic_seconds"]
+                    wait_duration = record["ready_wait_duration_seconds"]
+                    self.assertTrue(all(map(
+                        math.isfinite,
+                        (wait_started, dequeued, wait_duration),
+                    )))
+                    self.assertGreaterEqual(dequeued, wait_started)
+                    self.assertEqual(
+                        wait_duration, dequeued - wait_started
+                    )
+                self.assertEqual(
+                    [
+                        record["chunk_index"]
+                        for record in snapshot["continuation_records"]
+                    ],
+                    list(range(1, pair_count + 1)),
+                )
+                self.assertTrue(all(
+                    record["completed"]
+                    and math.isfinite(record["started_monotonic_seconds"])
+                    and math.isfinite(record["finished_monotonic_seconds"])
+                    and math.isfinite(record["duration_seconds"])
+                    and record["finished_monotonic_seconds"]
+                    >= record["started_monotonic_seconds"]
+                    and record["duration_seconds"]
+                    == record["finished_monotonic_seconds"]
+                    - record["started_monotonic_seconds"]
+                    for record in snapshot["continuation_records"]
+                ))
+                self.assertGreaterEqual(snapshot["producer_idle_count"], 1)
+                self.assertEqual(max(live_candidate_counts), depth + 2)
+                gc.collect()
+                self.assertTrue(all(
+                    reference() is None for reference in candidate_refs
+                ))
+                self.assertFalse(any(
+                    thread.name.startswith("astra-gpu-generate")
+                    for thread in threading.enumerate()
+                ))
+
+    def test_byte_ceiling_can_bind_before_configured_item_depth(self):
+        pairs = [self.pair() for _ in range(4)]
+        first_consumption_started = threading.Event()
+        fourth_generation_started = threading.Event()
+        generation_count = 0
+
+        class Selection:
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+
+            def close(self):
+                pass
+
+        class Session:
+            statistics = {"worker_count": 0, "host_bytes": 0}
+
+            def select(self, indices):
+                return Selection(indices)
+
+        class Candidate:
+            resident_bytes = 10
+
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+
+        class Batch:
+            def _postfilter_forward_selection(self, selection, *_args):
+                nonlocal generation_count
+                if selection.indices == (1,):
+                    self_outer.assertTrue(first_consumption_started.wait(2))
+                generation_count += 1
+                if generation_count == 4:
+                    fourth_generation_started.set()
+                return Candidate(selection.indices)
+
+        def gpu_search(_chunk, candidates, **_kwargs):
+            def results():
+                if candidates.indices == (0,):
+                    first_consumption_started.set()
+                    self.assertTrue(fourth_generation_started.wait(2))
+                yield candidates.indices
+
+            return results()
+
+        self_outer = self
+        modules, _ = synthetic_plan7_gpu(True)
+        modules["plan7_gpu.astra_search"].hmmsearch = gpu_search
+        metrics = search.GPUOverlapMetrics()
+        with (
+            mock.patch.dict(sys.modules, modules),
+            mock.patch.object(search, "process_hits_to_file"),
+        ):
+            search._run_gpu_profile_pipeline(
+                [
+                    (index + 1, [pair], (index,), {})
+                    for index, pair in enumerate(pairs)
+                ],
+                Session(),
+                Batch(),
+                2,
+                io.StringIO(),
+                metrics,
+                ready_queue_configuration=(4, 20),
+            )
+
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["ready_queue_capacity"], 4)
+        self.assertEqual(snapshot["ready_queue_high_water"], 2)
+        self.assertEqual(snapshot["ready_queue_byte_high_water"], 20)
+        self.assertGreaterEqual(snapshot["producer_idle_count"], 1)
+
+    def test_overweight_candidate_error_remains_behind_earlier_output(self):
+        pairs = [self.pair() for _ in range(3)]
+        selections = []
+        observed = []
+
+        class Selection:
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+                self.close_count = 0
+
+            def close(self):
+                self.close_count += 1
+
+        class Session:
+            statistics = {"worker_count": 0, "host_bytes": 0}
+
+            def select(self, indices):
+                selection = Selection(indices)
+                selections.append(selection)
+                return selection
+
+        class Candidate:
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+                self.resident_bytes = 11 if self.indices == (1,) else 5
+
+        class Batch:
+            def _postfilter_forward_selection(self, selection, *_args):
+                return Candidate(selection.indices)
+
+        def gpu_search(_chunk, candidates, **_kwargs):
+            return iter((candidates.indices,))
+
+        modules, _ = synthetic_plan7_gpu(True)
+        modules["plan7_gpu.astra_search"].hmmsearch = gpu_search
+        with (
+            mock.patch.dict(sys.modules, modules),
+            mock.patch.object(
+                search,
+                "process_hits_to_file",
+                side_effect=lambda hits, _fh: observed.append(hits),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                search.GPUConfigurationError,
+                "requires 11 bytes, exceeding",
+            ):
+                search._run_gpu_profile_pipeline(
+                    [
+                        (index + 1, [pair], (index,), {})
+                        for index, pair in enumerate(pairs)
+                    ],
+                    Session(),
+                    Batch(),
+                    2,
+                    io.StringIO(),
+                    ready_queue_configuration=(2, 10),
+                )
+
+        self.assertEqual(observed, [(0,)])
+        self.assertEqual(
+            [selection.indices for selection in selections], [(0,), (1,)]
+        )
+        self.assertTrue(all(
+            selection.close_count == 1 for selection in selections
+        ))
+
+    def test_mutating_candidate_byte_charge_is_rejected_before_search(self):
+        pair = self.pair()
+        search_called = []
+
+        class Selection:
+            indices = (0,)
+
+            def close(self):
+                pass
+
+        class Session:
+            statistics = {"worker_count": 0, "host_bytes": 0}
+
+            def select(self, _indices):
+                return Selection()
+
+        class Candidate:
+            def __init__(self):
+                self.read_count = 0
+
+            @property
+            def resident_bytes(self):
+                self.read_count += 1
+                return 5 if self.read_count == 1 else 6
+
+        class Batch:
+            def _postfilter_forward_selection(self, *_args):
+                return Candidate()
+
+        def gpu_search(*_args, **_kwargs):
+            search_called.append(True)
+            return iter(())
+
+        modules, _ = synthetic_plan7_gpu(True)
+        modules["plan7_gpu.astra_search"].hmmsearch = gpu_search
+        with mock.patch.dict(sys.modules, modules):
+            with self.assertRaisesRegex(
+                RuntimeError, "changed while queued: 5 -> 6"
+            ):
+                search._run_gpu_profile_pipeline(
+                    [(1, [pair], (0,), {})],
+                    Session(),
+                    Batch(),
+                    2,
+                    io.StringIO(),
+                    ready_queue_configuration=(1, 10),
+                )
+        self.assertEqual(search_called, [])
+
+    def test_missing_candidate_byte_api_is_rejected_before_search(self):
+        pair = self.pair()
+        search_called = []
+
+        class Selection:
+            def close(self):
+                pass
+
+        class Session:
+            statistics = {"worker_count": 0, "host_bytes": 0}
+
+            def select(self, _indices):
+                return Selection()
+
+        class Batch:
+            def _postfilter_forward_selection(self, *_args):
+                return SimpleNamespace()
+
+        def gpu_search(*_args, **_kwargs):
+            search_called.append(True)
+            return iter(())
+
+        modules, _ = synthetic_plan7_gpu(True)
+        modules["plan7_gpu.astra_search"].hmmsearch = gpu_search
+        with mock.patch.dict(sys.modules, modules):
+            with self.assertRaisesRegex(
+                search.GPUConfigurationError, "exact resident_bytes support"
+            ):
+                search._run_gpu_profile_pipeline(
+                    [(1, [pair], (0,), {})],
+                    Session(),
+                    Batch(),
+                    2,
+                    io.StringIO(),
+                    ready_queue_configuration=(1, 10),
+                )
+        self.assertEqual(search_called, [])
+
+    def test_current_error_stops_producer_blocked_by_byte_ceiling(self):
+        pairs = [self.pair() for _ in range(3)]
+        third_generated = threading.Event()
+        selections = []
+        candidate_refs = []
+
+        class Selection:
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+                self.close_count = 0
+
+            def close(self):
+                self.close_count += 1
+
+        class Session:
+            statistics = {"worker_count": 0, "host_bytes": 0}
+
+            def select(self, indices):
+                selection = Selection(indices)
+                selections.append(selection)
+                return selection
+
+        class Candidate:
+            resident_bytes = 10
+
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+
+        class Batch:
+            def _postfilter_forward_selection(self, selection, *_args):
+                candidate = Candidate(selection.indices)
+                candidate_refs.append(weakref.ref(candidate))
+                if selection.indices == (2,):
+                    third_generated.set()
+                return candidate
+
+        def gpu_search(_chunk, candidates, **_kwargs):
+            def results():
+                if candidates.indices == (0,):
+                    self.assertTrue(third_generated.wait(2))
+                yield candidates.indices
+
+            return results()
+
+        modules, _ = synthetic_plan7_gpu(True)
+        modules["plan7_gpu.astra_search"].hmmsearch = gpu_search
+        metrics = search.GPUOverlapMetrics()
+        with (
+            mock.patch.dict(sys.modules, modules),
+            mock.patch.object(
+                search,
+                "process_hits_to_file",
+                side_effect=ValueError("current write failed"),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "current write failed"):
+                search._run_gpu_profile_pipeline(
+                    [
+                        (index + 1, [pair], (index,), {})
+                        for index, pair in enumerate(pairs)
+                    ],
+                    Session(),
+                    Batch(),
+                    2,
+                    io.StringIO(),
+                    metrics,
+                    ready_queue_configuration=(4, 10),
+                )
+
+        self.assertEqual(
+            [selection.close_count for selection in selections], [1, 1, 1]
+        )
+        self.assertGreaterEqual(metrics.producer_idle_count, 1)
+        gc.collect()
+        self.assertEqual(len(candidate_refs), 3)
+        self.assertTrue(all(
+            reference() is None for reference in candidate_refs
+        ))
         self.assertFalse(any(
             thread.name.startswith("astra-gpu-generate")
             for thread in threading.enumerate()
