@@ -96,12 +96,14 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
                         compact_adapter_available=False,
                         compact_native_available=False,
                         compact_seam_available=None,
-                        compact_tail_available=None):
+                        compact_tail_available=None,
+                        phase0_telemetry_available=False):
     """Return optional-package modules suitable for CPU-only wiring tests."""
     package = ModuleType("plan7_gpu")
     package.__path__ = []
     astra_search_module = ModuleType("plan7_gpu.astra_search")
     manifest_module = ModuleType("plan7_gpu.pressed_manifest")
+    telemetry_report_module = ModuleType("plan7_gpu.telemetry_report")
     pipeline_module = ModuleType("plan7_gpu._pipeline")
     native_module = ModuleType("plan7_gpu._native")
 
@@ -144,6 +146,26 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
         ):
             pass
 
+    class TelemetrySequenceBatch:
+        def _postfilter_forward_selection(
+            self, selection, F1, F2, F3, bias_filter, *,
+            pipeline=None, domain_guard=2.0e-4,
+            _rescore_compact_byte_budget=0,
+            _rescore_matrix_byte_budget=0,
+            _rescore_trace_byte_budget=0,
+            _rescore_test_fault=0,
+            telemetry=False,
+        ):
+            pass
+
+        def _postfilter_forward_domain_selection(
+            self, selection, F1, f2, f3, bias_filter,
+            pipeline, domain_guard, rescore_compact_byte_budget,
+            rescore_matrix_byte_budget, rescore_trace_byte_budget,
+            rescore_test_fault, telemetry,
+        ):
+            pass
+
     class LegacyNativeSequenceBatch:
         def _postfilter_forward_domain_selection_sealed(
             self, selection, f1, f2, f3, guard_band=2.0e-4,
@@ -161,10 +183,23 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
         ):
             pass
 
+    class TelemetryNativeSequenceBatch:
+        def _postfilter_forward_domain_selection_sealed(
+            self, selection, f1, f2, f3, guard_band=2.0e-4,
+            gathered_byte_budget=0, rescore_simple_diagnostic=False,
+            rescore_matrix_byte_budget=0, rescore_trace_byte_budget=0,
+            rescore_compact_byte_budget=0, _rescore_test_fault=0,
+            generation_tail_fingerprint=0, _return_stage_timings=False,
+            _return_generation_statistics=False,
+        ):
+            pass
+
     class NoDomainNativeSequenceBatch:
         pass
 
-    if compact_adapter_available:
+    if phase0_telemetry_available:
+        sequence_batch_spec = TelemetrySequenceBatch
+    elif compact_adapter_available:
         sequence_batch_spec = (
             CompactDomainSequenceBatch
             if domain_method_available
@@ -196,6 +231,13 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
         compact_tail_fingerprint=None,
         seal_profile_selection_continuation=None,
     )
+    class TelemetryCollector:
+        def __init__(self):
+            self.expected_profile_calls = []
+
+        def bind_expected_profiles(self, profile_ordinals):
+            self.expected_profile_calls.append(tuple(profile_ordinals))
+    api.TelemetryCollector = TelemetryCollector
     api.SequenceBatch._postfilter_forward_selection = (
         sequence_batch_spec._postfilter_forward_selection
     )
@@ -259,7 +301,9 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
     package.astra_search = astra_search_module
     package._native = native_module
     package._pipeline = pipeline_module
-    if not domain_native_available:
+    if phase0_telemetry_available:
+        native_module.SequenceBatch = TelemetryNativeSequenceBatch
+    elif not domain_native_available:
         native_module.SequenceBatch = NoDomainNativeSequenceBatch
     elif compact_native_available:
         native_module.SequenceBatch = CompactNativeSequenceBatch
@@ -267,11 +311,13 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
         native_module.SequenceBatch = LegacyNativeSequenceBatch
     astra_search_module.hmmsearch = api.gpu_hmmsearch
     manifest_module.validate_pressed_manifest = api.validate_pressed_manifest
+    telemetry_report_module.TelemetryCollector = TelemetryCollector
     return (
         {
             "plan7_gpu": package,
             "plan7_gpu.astra_search": astra_search_module,
             "plan7_gpu.pressed_manifest": manifest_module,
+            "plan7_gpu.telemetry_report": telemetry_report_module,
             "plan7_gpu._native": native_module,
             "plan7_gpu._pipeline": pipeline_module,
         },
@@ -280,6 +326,30 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
 
 
 class GPUConfigurationTests(unittest.TestCase):
+    def test_route_telemetry_requires_explicit_fused_session_before_output(self):
+        modules, api = synthetic_plan7_gpu(True, True, True)
+        collector = api.TelemetryCollector()
+        with tempfile.TemporaryDirectory(
+            prefix="astra-route-telemetry-preflight-"
+        ) as temporary:
+            root = Path(temporary)
+            with mock.patch.dict(sys.modules, modules):
+                with self.assertRaisesRegex(
+                    search.GPUConfigurationError, "GPU profile session"
+                ):
+                    search.hmmsearch(
+                        {},
+                        [],
+                        1,
+                        search_options(root),
+                        all_sequences=[],
+                        gpu_sequence_batch=object(),
+                        gpu_postfilter=True,
+                        telemetry_collector=collector,
+                    )
+            self.assertFalse((root / "tmp_results").exists())
+            self.assertEqual(collector.expected_profile_calls, [])
+
     def test_search_cli_collects_repeatable_gpu_manifest_values(self):
         argv = [
             "astra",
@@ -1030,6 +1100,76 @@ class GPUProfileOverlapTests(unittest.TestCase):
             **pipeline_options,
         )
 
+    def test_collector_enables_phase0_generation_and_global_ordinal_join(self):
+        pair = self.pair()
+        generation_calls = []
+
+        class Selection:
+            def close(self):
+                pass
+
+        class Session:
+            closed = False
+            statistics = {"worker_count": 0, "host_bytes": 1}
+
+            def __len__(self):
+                return 1
+
+            def select(self, indices):
+                self_outer.assertEqual(tuple(indices), (0,))
+                return Selection()
+
+        class Batch:
+            alphabet = object()
+
+            def _postfilter_forward_selection(self, *args, **kwargs):
+                generation_calls.append((args, kwargs))
+                return object()
+
+        self_outer = self
+        modules, api = synthetic_plan7_gpu(
+            True,
+            True,
+            True,
+            compact_seam_available=True,
+            phase0_telemetry_available=True,
+        )
+        collector = api.TelemetryCollector()
+        api.gpu_hmmsearch.return_value = iter(("row",))
+        pipeline = object()
+        with tempfile.TemporaryDirectory(
+            prefix="astra-phase0-collector-"
+        ) as temporary:
+            with (
+                mock.patch.dict(sys.modules, modules),
+                mock.patch.object(
+                    pyhmmer.plan7, "Pipeline", return_value=pipeline
+                ),
+                mock.patch.object(search, "process_hits_to_file"),
+            ):
+                search.hmmsearch(
+                    {},
+                    [pair],
+                    1,
+                    search_options(temporary),
+                    all_sequences=[object()],
+                    gpu_sequence_batch=Batch(),
+                    gpu_postfilter=True,
+                    gpu_profile_session=Session(),
+                    telemetry_collector=collector,
+                )
+        self.assertEqual(len(generation_calls), 1)
+        self.assertIs(generation_calls[0][1]["telemetry"], True)
+        self.assertEqual(collector.expected_profile_calls, [(0,)])
+        api.gpu_hmmsearch.assert_called_once_with(
+            [pair],
+            mock.ANY,
+            cpus=1,
+            postfilter=True,
+            telemetry_collector=collector,
+            profile_ordinals=(0,),
+        )
+
     def test_disabled_bias_uses_the_existing_forward_selection_abi(self):
         calls = []
 
@@ -1056,6 +1196,68 @@ class GPUProfileOverlapTests(unittest.TestCase):
             calls,
             [(("selection", 0.03, 0.004, 0.00005, False), {})],
         )
+
+    def test_explicit_telemetry_uses_only_the_fused_instrumented_generation(self):
+        calls = []
+        pipeline = object()
+
+        class Batch:
+            alphabet = object()
+
+            def _postfilter_forward_selection(self, *args, **kwargs):
+                calls.append((args, kwargs))
+                return "instrumented"
+
+        options = {
+            "F1": 0.03,
+            "F2": 0.004,
+            "F3": 0.00005,
+            "bias_filter": True,
+        }
+        with mock.patch.object(
+            pyhmmer.plan7, "Pipeline", return_value=pipeline
+        ) as pipeline_factory:
+            result = search._generate_gpu_profile_candidates(
+                Batch(), "selection", options, True, telemetry=True
+            )
+        self.assertEqual(result, "instrumented")
+        pipeline_factory.assert_called_once_with(Batch.alphabet, **options)
+        args, kwargs = calls[0]
+        self.assertEqual(args, ("selection", 0.03, 0.004, 0.00005, True))
+        self.assertIs(kwargs["pipeline"], pipeline)
+        self.assertIs(kwargs["telemetry"], True)
+        with self.assertRaisesRegex(
+            search.GPUConfigurationError, "fused domain continuation"
+        ):
+            search._generate_gpu_profile_candidates(
+                Batch(), "selection", options, False, telemetry=True
+            )
+
+    def test_explicit_collector_is_forwarded_with_global_profile_ordinals(self):
+        collector = object()
+        gpu_hmmsearch = mock.Mock(return_value=iter(("hits",)))
+        spec = (3, [self.pair()], (17,), {"F1": 0.03})
+        with mock.patch.object(search, "process_hits_to_file") as process:
+            search._consume_gpu_candidate_chunk(
+                spec,
+                object(),
+                5,
+                7,
+                object(),
+                gpu_hmmsearch,
+                None,
+                telemetry_collector=collector,
+            )
+        gpu_hmmsearch.assert_called_once_with(
+            spec[1],
+            mock.ANY,
+            cpus=7,
+            postfilter=True,
+            telemetry_collector=collector,
+            profile_ordinals=(17,),
+            F1=0.03,
+        )
+        process.assert_called_once_with("hits", mock.ANY)
 
     def test_bounded_queue_runs_two_ahead_in_canonical_order(self):
         pairs = [
@@ -2634,6 +2836,18 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
                         search.gpu_profile_compact_available(),
                         compact_expected,
                     )
+
+    def test_phase0_telemetry_signatures_are_a_coherent_v2_extension(self):
+        modules, _ = synthetic_plan7_gpu(
+            True,
+            True,
+            True,
+            compact_seam_available=True,
+            phase0_telemetry_available=True,
+        )
+        with mock.patch.dict(sys.modules, modules):
+            self.assertIs(search.gpu_profile_domain_available(), True)
+            self.assertIs(search.gpu_profile_compact_available(), True)
 
     def test_preflight_selects_live_seam_and_safely_falls_back_when_absent(self):
         with tempfile.TemporaryDirectory(prefix="astra-gpu-mode-") as temporary:

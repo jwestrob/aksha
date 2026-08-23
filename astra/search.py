@@ -812,6 +812,26 @@ def _profile_continuation_capabilities():
             domain_method, domain_prefix + compact_domain_suffix
         )
     )
+    telemetry_adapter = (
+        _signature_matches(
+            selection_method,
+            selection_prefix + compact_selection_suffix + ('telemetry',),
+            keyword_only=(
+                selection_options
+                + compact_selection_suffix
+                + ('telemetry',)
+            ),
+            defaulted=(
+                selection_options
+                + compact_selection_suffix
+                + ('telemetry',)
+            ),
+        )
+        and _signature_matches(
+            domain_method,
+            domain_prefix + compact_domain_suffix + ('telemetry',),
+        )
+    )
     legacy_native = _signature_matches(
         native_method,
         native_prefix,
@@ -833,6 +853,28 @@ def _profile_continuation_capabilities():
             'gathered_byte_budget',
         ) + compact_native_suffix,
     )
+    timing_native = _signature_matches(
+        native_method,
+        native_prefix + compact_native_suffix + ('_return_stage_timings',),
+        defaulted=(
+            ('guard_band', 'gathered_byte_budget')
+            + compact_native_suffix
+            + ('_return_stage_timings',)
+        ),
+    )
+    telemetry_native_suffix = (
+        '_return_stage_timings',
+        '_return_generation_statistics',
+    )
+    telemetry_native = _signature_matches(
+        native_method,
+        native_prefix + compact_native_suffix + telemetry_native_suffix,
+        defaulted=(
+            ('guard_band', 'gathered_byte_budget')
+            + compact_native_suffix
+            + telemetry_native_suffix
+        ),
+    )
 
     compact_probe = getattr(
         _pipeline, '_compact_domains_seam_available', None
@@ -849,15 +891,28 @@ def _profile_continuation_capabilities():
     # guarded journal it did before V2 existed.
     if legacy_adapter and legacy_native and legacy_pipeline:
         return True, False
-    if not compact_pipeline or not compact_native:
+    if not compact_pipeline:
+        return False, False
+    if legacy_adapter:
+        if not (compact_native or timing_native or telemetry_native):
+            return False, False
+        compact_seam = compact_probe()
+        if compact_seam is not True and compact_seam is not False:
+            return False, False
+        return True, False
+    if telemetry_adapter:
+        if not telemetry_native:
+            return False, False
+    elif compact_adapter:
+        if not (compact_native or timing_native or telemetry_native):
+            return False, False
+    else:
         return False, False
     compact_seam = compact_probe()
     if compact_seam is not True and compact_seam is not False:
         return False, False
     if legacy_adapter:
         return True, False
-    if not compact_adapter:
-        return False, False
     return True, compact_seam
 
 
@@ -1022,7 +1077,8 @@ def extract_sequences(results_or_ids, protein_dict_or_outdir, outdir=None):
 
 
 def _consume_gpu_candidate_chunk(spec, candidates, total_chunks, threads, fh,
-                                 gpu_hmmsearch, gpu_metrics):
+                                 gpu_hmmsearch, gpu_metrics,
+                                 telemetry_collector=None):
     chunk_index, hmm_chunk, _, kwargs = spec
     print(f"  Chunk {chunk_index}/{total_chunks} "
           f"({len(hmm_chunk)} HMMs)...", end="", flush=True)
@@ -1031,13 +1087,24 @@ def _consume_gpu_candidate_chunk(spec, candidates, total_chunks, threads, fh,
     completed = False
     started = time.perf_counter()
     try:
-        hit_iterator = gpu_hmmsearch(
-            hmm_chunk,
-            candidates,
-            cpus=threads,
-            postfilter=True,
-            **kwargs,
-        )
+        if telemetry_collector is None:
+            hit_iterator = gpu_hmmsearch(
+                hmm_chunk,
+                candidates,
+                cpus=threads,
+                postfilter=True,
+                **kwargs,
+            )
+        else:
+            hit_iterator = gpu_hmmsearch(
+                hmm_chunk,
+                candidates,
+                cpus=threads,
+                postfilter=True,
+                telemetry_collector=telemetry_collector,
+                profile_ordinals=tuple(spec[2]),
+                **kwargs,
+            )
         for hits in hit_iterator:
             process_hits_to_file(hits, fh)
         completed = True
@@ -1072,12 +1139,19 @@ def _consume_gpu_candidate_chunk(spec, candidates, total_chunks, threads, fh,
 
 
 def _generate_gpu_profile_candidates(sequence_batch, selection, kwargs,
-                                     domain_continuation=False):
+                                     domain_continuation=False,
+                                     telemetry=False):
     """Run the same bounded CUDA stages as the live post-filter product path."""
     F1 = kwargs.get('F1', 0.02)
     F2 = kwargs.get('F2', 0.001)
     F3 = kwargs.get('F3', 0.00001)
     bias_filter = kwargs.get('bias_filter', True)
+    if type(telemetry) is not bool:
+        raise TypeError("telemetry must be bool")
+    if telemetry and (not domain_continuation or bias_filter is not True):
+        raise GPUConfigurationError(
+            "route telemetry requires fused domain continuation with bias filtering"
+        )
     if domain_continuation and bias_filter is True:
         # This configuration-only pipeline is private to the producer call.
         # CPU continuation workers still create and exclusively own their
@@ -1086,6 +1160,17 @@ def _generate_gpu_profile_candidates(sequence_batch, selection, kwargs,
             sequence_batch.alphabet,
             **kwargs,
         )
+        if telemetry:
+            return sequence_batch._postfilter_forward_selection(
+                selection,
+                F1,
+                F2,
+                F3,
+                bias_filter,
+                pipeline=generation_pipeline,
+                domain_guard=GPU_DOMAIN_GUARD,
+                telemetry=True,
+            )
         return sequence_batch._postfilter_forward_selection(
             selection,
             F1,
@@ -1100,9 +1185,53 @@ def _generate_gpu_profile_candidates(sequence_batch, selection, kwargs,
     )
 
 
+def _generate_gpu_profile_candidates_for_run(
+        sequence_batch, selection, kwargs, domain_continuation,
+        telemetry_collector):
+    """Preserve the exact default call and opt in only with a collector."""
+    if telemetry_collector is None:
+        return _generate_gpu_profile_candidates(
+            sequence_batch, selection, kwargs, domain_continuation
+        )
+    return _generate_gpu_profile_candidates(
+        sequence_batch,
+        selection,
+        kwargs,
+        domain_continuation,
+        telemetry=True,
+    )
+
+
+def _consume_gpu_candidate_chunk_for_run(
+        spec, candidates, total_chunks, threads, fh, gpu_hmmsearch,
+        gpu_metrics, telemetry_collector):
+    """Preserve ordinary TopHits consumption unless telemetry is explicit."""
+    if telemetry_collector is None:
+        return _consume_gpu_candidate_chunk(
+            spec,
+            candidates,
+            total_chunks,
+            threads,
+            fh,
+            gpu_hmmsearch,
+            gpu_metrics,
+        )
+    return _consume_gpu_candidate_chunk(
+        spec,
+        candidates,
+        total_chunks,
+        threads,
+        fh,
+        gpu_hmmsearch,
+        gpu_metrics,
+        telemetry_collector=telemetry_collector,
+    )
+
+
 def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
                             threads, fh, gpu_metrics=None,
-                            domain_continuation=False):
+                            domain_continuation=False,
+                            telemetry_collector=None):
     """Run sealed GPU-through-Forward generation as the serial control."""
     from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
 
@@ -1129,11 +1258,12 @@ def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
                 )
             generation_started = time.perf_counter()
             try:
-                candidates = _generate_gpu_profile_candidates(
+                candidates = _generate_gpu_profile_candidates_for_run(
                     sequence_batch,
                     selection,
                     spec[3],
                     domain_continuation,
+                    telemetry_collector,
                 )
             except BaseException:
                 try:
@@ -1148,7 +1278,7 @@ def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
                 gpu_metrics.generation_seconds += (
                     generation_finished - generation_started
                 )
-            _consume_gpu_candidate_chunk(
+            _consume_gpu_candidate_chunk_for_run(
                 spec,
                 candidates,
                 len(chunks),
@@ -1156,6 +1286,7 @@ def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
                 fh,
                 gpu_hmmsearch,
                 gpu_metrics,
+                telemetry_collector,
             )
             candidates = None
     finally:
@@ -1167,7 +1298,8 @@ def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
 
 def _run_gpu_profile_single_prefetch(chunks, profile_session, sequence_batch,
                                      threads, fh, gpu_metrics=None,
-                                     domain_continuation=False):
+                                     domain_continuation=False,
+                                     telemetry_collector=None):
     """Retain the original one-future overlap scheduler as a control."""
     if not chunks:
         return
@@ -1190,11 +1322,12 @@ def _run_gpu_profile_single_prefetch(chunks, profile_session, sequence_batch,
     def generate(spec, selection):
         started = time.perf_counter()
         try:
-            candidates = _generate_gpu_profile_candidates(
+            candidates = _generate_gpu_profile_candidates_for_run(
                 sequence_batch,
                 selection,
                 spec[3],
                 domain_continuation,
+                telemetry_collector,
             )
         except BaseException:
             try:
@@ -1283,7 +1416,7 @@ def _run_gpu_profile_single_prefetch(chunks, profile_session, sequence_batch,
                     pending_selection,
                 ) = start_generation(chunks[position + 1])
 
-            previous_consumption = _consume_gpu_candidate_chunk(
+            previous_consumption = _consume_gpu_candidate_chunk_for_run(
                 spec,
                 candidates,
                 len(chunks),
@@ -1291,6 +1424,7 @@ def _run_gpu_profile_single_prefetch(chunks, profile_session, sequence_batch,
                 fh,
                 gpu_hmmsearch,
                 gpu_metrics,
+                telemetry_collector,
             )
             candidates = None
     finally:
@@ -1316,7 +1450,8 @@ def _run_gpu_profile_single_prefetch(chunks, profile_session, sequence_batch,
 def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                               threads, fh, gpu_metrics=None,
                               domain_continuation=False,
-                              ready_queue_configuration=None):
+                              ready_queue_configuration=None,
+                              telemetry_collector=None):
     """Continuously produce ordered GPU batches into a bounded ready queue.
 
     The producer owns selection and CUDA generation.  While the caller consumes
@@ -1451,11 +1586,12 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                 selection_finished = time.perf_counter()
                 generation_started = time.perf_counter()
                 try:
-                    candidates = _generate_gpu_profile_candidates(
+                    candidates = _generate_gpu_profile_candidates_for_run(
                         sequence_batch,
                         selection,
                         spec[3],
                         domain_continuation,
+                        telemetry_collector,
                     )
                 except BaseException as error:
                     try:
@@ -1673,7 +1809,7 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                     generation_lookahead >= 2
                 )
 
-            consumption_interval = _consume_gpu_candidate_chunk(
+            consumption_interval = _consume_gpu_candidate_chunk_for_run(
                 spec,
                 candidates,
                 len(chunks),
@@ -1681,6 +1817,7 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                 fh,
                 gpu_hmmsearch,
                 gpu_metrics,
+                telemetry_collector,
             )
             if gpu_metrics is not None:
                 gpu_metrics.consumed_candidate_bytes += candidate_bytes
@@ -1761,8 +1898,17 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
               macsyfinder_dir=None, hmm_name_to_filename=None,
               all_sequences=None, gpu_sequence_batch=None,
               gpu_postfilter=None, gpu_profile_session=None,
-              gpu_metrics=None, gpu_profile_overlap=True):
+              gpu_metrics=None, gpu_profile_overlap=True,
+              telemetry_collector=None):
     hmmsearch_kwargs = define_kwargs(options)
+
+    if telemetry_collector is not None:
+        from plan7_gpu.telemetry_report import TelemetryCollector
+
+        if type(telemetry_collector) is not TelemetryCollector:
+            raise TypeError(
+                "telemetry_collector must be exactly TelemetryCollector"
+            )
 
     if gpu_sequence_batch is not None and macsyfinder_dir is not None:
         raise GPUConfigurationError(
@@ -1817,6 +1963,16 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
             gpu_metrics.producer_slot_count = producer_slots
             gpu_metrics.continuation_worker_count = continuation_threads
             gpu_metrics.profile_overlap_enabled = profile_overlap_enabled
+    if telemetry_collector is not None:
+        if gpu_profile_session is None:
+            raise GPUConfigurationError(
+                "route telemetry requires an explicit GPU profile session"
+            )
+        if not profile_domain_continuation:
+            raise GPUConfigurationError(
+                "route telemetry requires the fused domain-continuation path"
+            )
+        telemetry_collector.bind_expected_profiles(range(len(hmms)))
     profile_scheduler_mode = gpu_profile_scheduler_mode(
         gpu_profile_session, profile_overlap_enabled
     )
@@ -1943,36 +2099,73 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
 
             if gpu_profile_session is not None:
                 if profile_scheduler_mode == 'bounded-ready-queue':
-                    _run_gpu_profile_pipeline(
-                        chunks,
-                        gpu_profile_session,
-                        gpu_sequence_batch,
-                        continuation_threads,
-                        fh,
-                        gpu_metrics,
-                        profile_domain_continuation,
-                        ready_queue_configuration,
-                    )
+                    if telemetry_collector is None:
+                        _run_gpu_profile_pipeline(
+                            chunks,
+                            gpu_profile_session,
+                            gpu_sequence_batch,
+                            continuation_threads,
+                            fh,
+                            gpu_metrics,
+                            profile_domain_continuation,
+                            ready_queue_configuration,
+                        )
+                    else:
+                        _run_gpu_profile_pipeline(
+                            chunks,
+                            gpu_profile_session,
+                            gpu_sequence_batch,
+                            continuation_threads,
+                            fh,
+                            gpu_metrics,
+                            profile_domain_continuation,
+                            ready_queue_configuration,
+                            telemetry_collector=telemetry_collector,
+                        )
                 elif profile_scheduler_mode == 'single-prefetch':
-                    _run_gpu_profile_single_prefetch(
-                        chunks,
-                        gpu_profile_session,
-                        gpu_sequence_batch,
-                        continuation_threads,
-                        fh,
-                        gpu_metrics,
-                        profile_domain_continuation,
-                    )
+                    if telemetry_collector is None:
+                        _run_gpu_profile_single_prefetch(
+                            chunks,
+                            gpu_profile_session,
+                            gpu_sequence_batch,
+                            continuation_threads,
+                            fh,
+                            gpu_metrics,
+                            profile_domain_continuation,
+                        )
+                    else:
+                        _run_gpu_profile_single_prefetch(
+                            chunks,
+                            gpu_profile_session,
+                            gpu_sequence_batch,
+                            continuation_threads,
+                            fh,
+                            gpu_metrics,
+                            profile_domain_continuation,
+                            telemetry_collector=telemetry_collector,
+                        )
                 else:
-                    _run_gpu_profile_serial(
-                        chunks,
-                        gpu_profile_session,
-                        gpu_sequence_batch,
-                        continuation_threads,
-                        fh,
-                        gpu_metrics,
-                        profile_domain_continuation,
-                    )
+                    if telemetry_collector is None:
+                        _run_gpu_profile_serial(
+                            chunks,
+                            gpu_profile_session,
+                            gpu_sequence_batch,
+                            continuation_threads,
+                            fh,
+                            gpu_metrics,
+                            profile_domain_continuation,
+                        )
+                    else:
+                        _run_gpu_profile_serial(
+                            chunks,
+                            gpu_profile_session,
+                            gpu_sequence_batch,
+                            continuation_threads,
+                            fh,
+                            gpu_metrics,
+                            profile_domain_continuation,
+                            telemetry_collector=telemetry_collector,
+                        )
             else:
                 for chunk_index, hmm_chunk, _, kwargs in chunks:
                     print(f"  Chunk {chunk_index}/{total_chunks} "
