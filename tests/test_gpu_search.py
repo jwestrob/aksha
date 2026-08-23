@@ -98,7 +98,8 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
                         compact_seam_available=None,
                         compact_tail_available=None,
                         phase0_telemetry_available=False,
-                        sparse_journal_v3_available=False):
+                        sparse_journal_v3_available=False,
+                        sparse_journal_v3_pipeline_available=None):
     """Return optional-package modules suitable for CPU-only wiring tests."""
     package = ModuleType("plan7_gpu")
     package.__path__ = []
@@ -112,6 +113,8 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
         domain_method_available = domain_adapter_available
     if domain_native_available is None:
         domain_native_available = domain_adapter_available
+    if sparse_journal_v3_pipeline_available is None:
+        sparse_journal_v3_pipeline_available = sparse_journal_v3_available
 
     class LegacySequenceBatch:
         def _postfilter_forward_selection(
@@ -219,6 +222,24 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
     class NoDomainNativeSequenceBatch:
         pass
 
+    def sparse_journal_v3_seal(
+        queries, optimized_profiles, sequences, residue_offsets, f1,
+        background_fingerprint, continuation_journal, selection_identity,
+        selection_identity_tokens, profile_fingerprints, batch_generation,
+        sequence_content_fingerprint, pipeline, guard_band,
+        native_stage_timings=None, generation_statistics=None,
+        sparse_journal_v3=False,
+    ):
+        pass
+
+    def sparse_journal_v3_enabled(sealed_object):
+        pass
+
+    def sparse_journal_v3_search(
+        sealed_object, row, pipeline, _return_route_statistics=False,
+    ):
+        pass
+
     if sparse_journal_v3_available:
         sequence_batch_spec = SparseJournalV3SequenceBatch
     elif phase0_telemetry_available:
@@ -318,6 +339,17 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
         )
         pipeline_module._compact_tail_fingerprint_bound = (
             api.compact_tail_fingerprint
+        )
+    if sparse_journal_v3_pipeline_available:
+        api.seal_profile_selection_continuation = sparse_journal_v3_seal
+        pipeline_module._seal_profile_selection_continuation_bound = (
+            sparse_journal_v3_seal
+        )
+        pipeline_module._sealed_sparse_journal_v3_enabled_bound = (
+            sparse_journal_v3_enabled
+        )
+        pipeline_module._search_hmm_sealed_sparse_journal_v3_bound = (
+            sparse_journal_v3_search
         )
     package.SequenceBatch = api.SequenceBatch
     package.ProfileSession = api.ProfileSession
@@ -3029,6 +3061,25 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, modules):
             self.assertIs(search.gpu_profile_domain_available(), True)
             self.assertIs(search.gpu_profile_compact_available(), True)
+
+    def test_sparse_v3_capability_requires_the_complete_v3_pipeline(self):
+        for pipeline_available, sparse_expected in ((False, False), (True, True)):
+            with self.subTest(pipeline_available=pipeline_available):
+                modules, _ = synthetic_plan7_gpu(
+                    True,
+                    True,
+                    True,
+                    compact_seam_available=True,
+                    sparse_journal_v3_available=True,
+                    sparse_journal_v3_pipeline_available=pipeline_available,
+                )
+                with mock.patch.dict(sys.modules, modules):
+                    self.assertIs(search.gpu_profile_domain_available(), True)
+                    self.assertIs(search.gpu_profile_compact_available(), True)
+                    self.assertIs(
+                        search.gpu_profile_sparse_journal_v3_available(),
+                        sparse_expected,
+                    )
 
     def test_preflight_selects_live_seam_and_safely_falls_back_when_absent(self):
         with tempfile.TemporaryDirectory(prefix="astra-gpu-mode-") as temporary:

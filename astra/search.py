@@ -742,6 +742,12 @@ def _profile_continuation_capabilities():
     seal = getattr(
         _pipeline, '_seal_profile_selection_continuation_bound', None
     )
+    sparse_enabled = getattr(
+        _pipeline, '_sealed_sparse_journal_v3_enabled_bound', None
+    )
+    sparse_search = getattr(
+        _pipeline, '_search_hmm_sealed_sparse_journal_v3_bound', None
+    )
     selection_method = getattr(
         SequenceBatch, '_postfilter_forward_selection', None
     )
@@ -856,6 +862,33 @@ def _profile_continuation_capabilities():
             + ('telemetry', 'sparse_journal_v3'),
         )
     )
+    sparse_journal_v3_pipeline = (
+        _signature_matches(
+            seal,
+            (
+                'queries', 'optimized_profiles', 'sequences',
+                'residue_offsets', 'f1', 'background_fingerprint',
+                'continuation_journal', 'selection_identity',
+                'selection_identity_tokens', 'profile_fingerprints',
+                'batch_generation', 'sequence_content_fingerprint',
+                'pipeline', 'guard_band', 'native_stage_timings',
+                'generation_statistics', 'sparse_journal_v3',
+            ),
+            defaulted=(
+                'native_stage_timings', 'generation_statistics',
+                'sparse_journal_v3',
+            ),
+        )
+        and _signature_matches(sparse_enabled, ('sealed_object',))
+        and _signature_matches(
+            sparse_search,
+            (
+                'sealed_object', 'row', 'pipeline',
+                '_return_route_statistics',
+            ),
+            defaulted=('_return_route_statistics',),
+        )
+    )
     legacy_native = _signature_matches(
         native_method,
         native_prefix,
@@ -940,7 +973,11 @@ def _profile_continuation_capabilities():
         return False, False, False
     if legacy_adapter:
         return True, False, False
-    return True, compact_seam, sparse_journal_v3_adapter
+    return (
+        True,
+        compact_seam,
+        sparse_journal_v3_adapter and sparse_journal_v3_pipeline,
+    )
 
 
 def gpu_profile_domain_available():
