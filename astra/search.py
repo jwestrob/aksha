@@ -932,6 +932,19 @@ def _profile_continuation_capabilities():
             + telemetry_native_suffix
         ),
     )
+    direct_sparse_v3_native = _signature_matches(
+        native_method,
+        native_prefix
+        + compact_native_suffix
+        + telemetry_native_suffix
+        + ('_direct_sparse_v3',),
+        defaulted=(
+            ('guard_band', 'gathered_byte_budget')
+            + compact_native_suffix
+            + telemetry_native_suffix
+            + ('_direct_sparse_v3',)
+        ),
+    )
 
     compact_probe = getattr(
         _pipeline, '_compact_domains_seam_available', None
@@ -951,20 +964,30 @@ def _profile_continuation_capabilities():
     if not compact_pipeline:
         return False, False, False
     if legacy_adapter:
-        if not (compact_native or timing_native or telemetry_native):
+        if not (
+            compact_native
+            or timing_native
+            or telemetry_native
+            or direct_sparse_v3_native
+        ):
             return False, False, False
         compact_seam = compact_probe()
         if compact_seam is not True and compact_seam is not False:
             return False, False, False
         return True, False, False
     if sparse_journal_v3_adapter:
-        if not telemetry_native:
+        if not direct_sparse_v3_native:
             return False, False, False
     elif telemetry_adapter:
-        if not telemetry_native:
+        if not (telemetry_native or direct_sparse_v3_native):
             return False, False, False
     elif compact_adapter:
-        if not (compact_native or timing_native or telemetry_native):
+        if not (
+            compact_native
+            or timing_native
+            or telemetry_native
+            or direct_sparse_v3_native
+        ):
             return False, False, False
     else:
         return False, False, False

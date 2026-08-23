@@ -99,7 +99,8 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
                         compact_tail_available=None,
                         phase0_telemetry_available=False,
                         sparse_journal_v3_available=False,
-                        sparse_journal_v3_pipeline_available=None):
+                        sparse_journal_v3_pipeline_available=None,
+                        direct_sparse_v3_native_available=None):
     """Return optional-package modules suitable for CPU-only wiring tests."""
     package = ModuleType("plan7_gpu")
     package.__path__ = []
@@ -115,6 +116,8 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
         domain_native_available = domain_adapter_available
     if sparse_journal_v3_pipeline_available is None:
         sparse_journal_v3_pipeline_available = sparse_journal_v3_available
+    if direct_sparse_v3_native_available is None:
+        direct_sparse_v3_native_available = sparse_journal_v3_available
 
     class LegacySequenceBatch:
         def _postfilter_forward_selection(
@@ -216,6 +219,17 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
             rescore_compact_byte_budget=0, _rescore_test_fault=0,
             generation_tail_fingerprint=0, _return_stage_timings=False,
             _return_generation_statistics=False,
+        ):
+            pass
+
+    class DirectSparseV3NativeSequenceBatch:
+        def _postfilter_forward_domain_selection_sealed(
+            self, selection, f1, f2, f3, guard_band=2.0e-4,
+            gathered_byte_budget=0, rescore_simple_diagnostic=False,
+            rescore_matrix_byte_budget=0, rescore_trace_byte_budget=0,
+            rescore_compact_byte_budget=0, _rescore_test_fault=0,
+            generation_tail_fingerprint=0, _return_stage_timings=False,
+            _return_generation_statistics=False, _direct_sparse_v3=False,
         ):
             pass
 
@@ -357,7 +371,9 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
     package.astra_search = astra_search_module
     package._native = native_module
     package._pipeline = pipeline_module
-    if phase0_telemetry_available or sparse_journal_v3_available:
+    if sparse_journal_v3_available and direct_sparse_v3_native_available:
+        native_module.SequenceBatch = DirectSparseV3NativeSequenceBatch
+    elif phase0_telemetry_available or sparse_journal_v3_available:
         native_module.SequenceBatch = TelemetryNativeSequenceBatch
     elif not domain_native_available:
         native_module.SequenceBatch = NoDomainNativeSequenceBatch
@@ -3080,6 +3096,49 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
                         search.gpu_profile_sparse_journal_v3_available(),
                         sparse_expected,
                     )
+
+    def test_sparse_v3_native_signature_is_exact_and_fail_closed(self):
+        for label, direct_native, expected in (
+            ("coherent", True, (True, True, True)),
+            ("old-native", False, (False, False, False)),
+        ):
+            with self.subTest(label=label):
+                modules, _ = synthetic_plan7_gpu(
+                    True,
+                    True,
+                    True,
+                    compact_seam_available=True,
+                    sparse_journal_v3_available=True,
+                    direct_sparse_v3_native_available=direct_native,
+                )
+                with mock.patch.dict(sys.modules, modules):
+                    self.assertEqual(
+                        search._profile_continuation_capabilities(), expected
+                    )
+
+        modules, _ = synthetic_plan7_gpu(
+            True,
+            True,
+            True,
+            compact_seam_available=True,
+            sparse_journal_v3_available=True,
+        )
+        native_method = modules[
+            "plan7_gpu._native"
+        ].SequenceBatch._postfilter_forward_domain_selection_sealed
+        signature = inspect.signature(native_method)
+        parameters = list(signature.parameters.values())
+        parameters[-1] = parameters[-1].replace(
+            name="_direct_sparse_v3_typo"
+        )
+        native_method.__signature__ = signature.replace(
+            parameters=parameters
+        )
+        with mock.patch.dict(sys.modules, modules):
+            self.assertEqual(
+                search._profile_continuation_capabilities(),
+                (False, False, False),
+            )
 
     def test_preflight_selects_live_seam_and_safely_falls_back_when_absent(self):
         with tempfile.TemporaryDirectory(prefix="astra-gpu-mode-") as temporary:
