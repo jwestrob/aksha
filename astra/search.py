@@ -765,7 +765,7 @@ def _profile_continuation_capabilities():
         and callable(seam_probe)
         and seam_probe() is True
     ):
-        return False, False
+        return False, False, False
 
     selection_prefix = (
         'self', 'selection', 'F1', 'F2', 'F3', 'bias_filter',
@@ -832,6 +832,30 @@ def _profile_continuation_capabilities():
             domain_prefix + compact_domain_suffix + ('telemetry',),
         )
     )
+    sparse_journal_v3_adapter = (
+        _signature_matches(
+            selection_method,
+            selection_prefix
+            + compact_selection_suffix
+            + ('telemetry', 'sparse_journal_v3'),
+            keyword_only=(
+                selection_options
+                + compact_selection_suffix
+                + ('telemetry', 'sparse_journal_v3')
+            ),
+            defaulted=(
+                selection_options
+                + compact_selection_suffix
+                + ('telemetry', 'sparse_journal_v3')
+            ),
+        )
+        and _signature_matches(
+            domain_method,
+            domain_prefix
+            + compact_domain_suffix
+            + ('telemetry', 'sparse_journal_v3'),
+        )
+    )
     legacy_native = _signature_matches(
         native_method,
         native_prefix,
@@ -890,30 +914,33 @@ def _profile_continuation_capabilities():
     # omits the optional compact fingerprint and therefore generates the same
     # guarded journal it did before V2 existed.
     if legacy_adapter and legacy_native and legacy_pipeline:
-        return True, False
+        return True, False, False
     if not compact_pipeline:
-        return False, False
+        return False, False, False
     if legacy_adapter:
         if not (compact_native or timing_native or telemetry_native):
-            return False, False
+            return False, False, False
         compact_seam = compact_probe()
         if compact_seam is not True and compact_seam is not False:
-            return False, False
-        return True, False
-    if telemetry_adapter:
+            return False, False, False
+        return True, False, False
+    if sparse_journal_v3_adapter:
         if not telemetry_native:
-            return False, False
+            return False, False, False
+    elif telemetry_adapter:
+        if not telemetry_native:
+            return False, False, False
     elif compact_adapter:
         if not (compact_native or timing_native or telemetry_native):
-            return False, False
+            return False, False, False
     else:
-        return False, False
+        return False, False, False
     compact_seam = compact_probe()
     if compact_seam is not True and compact_seam is not False:
-        return False, False
+        return False, False, False
     if legacy_adapter:
-        return True, False
-    return True, compact_seam
+        return True, False, False
+    return True, compact_seam, sparse_journal_v3_adapter
 
 
 def gpu_profile_domain_available():
@@ -924,6 +951,11 @@ def gpu_profile_domain_available():
 def gpu_profile_compact_available():
     """Return whether a session selection can carry compact DEVICE domains."""
     return _profile_continuation_capabilities()[1]
+
+
+def gpu_profile_sparse_journal_v3_available():
+    """Return whether fused session generation supports sparse journal v3."""
+    return _profile_continuation_capabilities()[2]
 
 
 def has_thresholds(x):
@@ -1140,7 +1172,8 @@ def _consume_gpu_candidate_chunk(spec, candidates, total_chunks, threads, fh,
 
 def _generate_gpu_profile_candidates(sequence_batch, selection, kwargs,
                                      domain_continuation=False,
-                                     telemetry=False):
+                                     telemetry=False,
+                                     sparse_journal_v3=False):
     """Run the same bounded CUDA stages as the live post-filter product path."""
     F1 = kwargs.get('F1', 0.02)
     F2 = kwargs.get('F2', 0.001)
@@ -1148,9 +1181,17 @@ def _generate_gpu_profile_candidates(sequence_batch, selection, kwargs,
     bias_filter = kwargs.get('bias_filter', True)
     if type(telemetry) is not bool:
         raise TypeError("telemetry must be bool")
+    if type(sparse_journal_v3) is not bool:
+        raise TypeError("sparse_journal_v3 must be bool")
     if telemetry and (not domain_continuation or bias_filter is not True):
         raise GPUConfigurationError(
             "route telemetry requires fused domain continuation with bias filtering"
+        )
+    if sparse_journal_v3 and (
+        not domain_continuation or bias_filter is not True
+    ):
+        raise GPUConfigurationError(
+            "sparse journal v3 requires fused domain continuation with bias filtering"
         )
     if domain_continuation and bias_filter is True:
         # This configuration-only pipeline is private to the producer call.
@@ -1160,25 +1201,21 @@ def _generate_gpu_profile_candidates(sequence_batch, selection, kwargs,
             sequence_batch.alphabet,
             **kwargs,
         )
+        generation_options = {
+            'pipeline': generation_pipeline,
+            'domain_guard': GPU_DOMAIN_GUARD,
+        }
         if telemetry:
-            return sequence_batch._postfilter_forward_selection(
-                selection,
-                F1,
-                F2,
-                F3,
-                bias_filter,
-                pipeline=generation_pipeline,
-                domain_guard=GPU_DOMAIN_GUARD,
-                telemetry=True,
-            )
+            generation_options['telemetry'] = True
+        if sparse_journal_v3:
+            generation_options['sparse_journal_v3'] = True
         return sequence_batch._postfilter_forward_selection(
             selection,
             F1,
             F2,
             F3,
             bias_filter,
-            pipeline=generation_pipeline,
-            domain_guard=GPU_DOMAIN_GUARD,
+            **generation_options,
         )
     return sequence_batch._postfilter_forward_selection(
         selection, F1, F2, F3, bias_filter
@@ -1187,18 +1224,20 @@ def _generate_gpu_profile_candidates(sequence_batch, selection, kwargs,
 
 def _generate_gpu_profile_candidates_for_run(
         sequence_batch, selection, kwargs, domain_continuation,
-        telemetry_collector):
-    """Preserve the exact default call and opt in only with a collector."""
-    if telemetry_collector is None:
+        telemetry_collector, sparse_journal_v3=False):
+    """Preserve the exact default call and add only explicit opt-ins."""
+    if telemetry_collector is None and not sparse_journal_v3:
         return _generate_gpu_profile_candidates(
             sequence_batch, selection, kwargs, domain_continuation
         )
+    generation_options = {}
+    if telemetry_collector is not None:
+        generation_options['telemetry'] = True
+    if sparse_journal_v3:
+        generation_options['sparse_journal_v3'] = True
     return _generate_gpu_profile_candidates(
-        sequence_batch,
-        selection,
-        kwargs,
-        domain_continuation,
-        telemetry=True,
+        sequence_batch, selection, kwargs, domain_continuation,
+        **generation_options,
     )
 
 
@@ -1231,7 +1270,8 @@ def _consume_gpu_candidate_chunk_for_run(
 def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
                             threads, fh, gpu_metrics=None,
                             domain_continuation=False,
-                            telemetry_collector=None):
+                            telemetry_collector=None,
+                            sparse_journal_v3=False):
     """Run sealed GPU-through-Forward generation as the serial control."""
     from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
 
@@ -1264,6 +1304,7 @@ def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
                     spec[3],
                     domain_continuation,
                     telemetry_collector,
+                    sparse_journal_v3,
                 )
             except BaseException:
                 try:
@@ -1299,7 +1340,8 @@ def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
 def _run_gpu_profile_single_prefetch(chunks, profile_session, sequence_batch,
                                      threads, fh, gpu_metrics=None,
                                      domain_continuation=False,
-                                     telemetry_collector=None):
+                                     telemetry_collector=None,
+                                     sparse_journal_v3=False):
     """Retain the original one-future overlap scheduler as a control."""
     if not chunks:
         return
@@ -1328,6 +1370,7 @@ def _run_gpu_profile_single_prefetch(chunks, profile_session, sequence_batch,
                 spec[3],
                 domain_continuation,
                 telemetry_collector,
+                sparse_journal_v3,
             )
         except BaseException:
             try:
@@ -1451,7 +1494,8 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                               threads, fh, gpu_metrics=None,
                               domain_continuation=False,
                               ready_queue_configuration=None,
-                              telemetry_collector=None):
+                              telemetry_collector=None,
+                              sparse_journal_v3=False):
     """Continuously produce ordered GPU batches into a bounded ready queue.
 
     The producer owns selection and CUDA generation.  While the caller consumes
@@ -1592,6 +1636,7 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                         spec[3],
                         domain_continuation,
                         telemetry_collector,
+                        sparse_journal_v3,
                     )
                 except BaseException as error:
                     try:
@@ -1899,7 +1944,9 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
               all_sequences=None, gpu_sequence_batch=None,
               gpu_postfilter=None, gpu_profile_session=None,
               gpu_metrics=None, gpu_profile_overlap=True,
-              telemetry_collector=None):
+              telemetry_collector=None, sparse_journal_v3=False):
+    if type(sparse_journal_v3) is not bool:
+        raise TypeError("sparse_journal_v3 must be bool")
     hmmsearch_kwargs = define_kwargs(options)
 
     if telemetry_collector is not None:
@@ -1935,6 +1982,10 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
             raise GPUConfigurationError(
                 "GPU profile session does not cover the supplied profiles"
             )
+    elif sparse_journal_v3:
+        raise GPUConfigurationError(
+            "sparse journal v3 requires an explicit GPU profile session"
+        )
     if gpu_metrics is not None and not isinstance(gpu_metrics, GPUOverlapMetrics):
         raise TypeError("gpu_metrics must be GPUOverlapMetrics or None")
     if type(gpu_profile_overlap) is not bool:
@@ -1963,6 +2014,20 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
             gpu_metrics.producer_slot_count = producer_slots
             gpu_metrics.continuation_worker_count = continuation_threads
             gpu_metrics.profile_overlap_enabled = profile_overlap_enabled
+    if sparse_journal_v3:
+        if not profile_domain_continuation:
+            raise GPUConfigurationError(
+                "sparse journal v3 requires the fused domain-continuation path"
+            )
+        if not gpu_profile_sparse_journal_v3_available():
+            raise GPUConfigurationError(
+                "installed plan7_gpu does not support sparse journal v3"
+            )
+        if hmmsearch_kwargs.get('bias_filter', True) is not True:
+            raise GPUConfigurationError(
+                "sparse journal v3 requires fused domain continuation with "
+                "bias filtering"
+            )
     if telemetry_collector is not None:
         if gpu_profile_session is None:
             raise GPUConfigurationError(
@@ -2098,74 +2163,47 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                     ))
 
             if gpu_profile_session is not None:
+                profile_run_options = {}
+                if telemetry_collector is not None:
+                    profile_run_options['telemetry_collector'] = (
+                        telemetry_collector
+                    )
+                if sparse_journal_v3:
+                    profile_run_options['sparse_journal_v3'] = True
                 if profile_scheduler_mode == 'bounded-ready-queue':
-                    if telemetry_collector is None:
-                        _run_gpu_profile_pipeline(
-                            chunks,
-                            gpu_profile_session,
-                            gpu_sequence_batch,
-                            continuation_threads,
-                            fh,
-                            gpu_metrics,
-                            profile_domain_continuation,
-                            ready_queue_configuration,
-                        )
-                    else:
-                        _run_gpu_profile_pipeline(
-                            chunks,
-                            gpu_profile_session,
-                            gpu_sequence_batch,
-                            continuation_threads,
-                            fh,
-                            gpu_metrics,
-                            profile_domain_continuation,
-                            ready_queue_configuration,
-                            telemetry_collector=telemetry_collector,
-                        )
+                    _run_gpu_profile_pipeline(
+                        chunks,
+                        gpu_profile_session,
+                        gpu_sequence_batch,
+                        continuation_threads,
+                        fh,
+                        gpu_metrics,
+                        profile_domain_continuation,
+                        ready_queue_configuration,
+                        **profile_run_options,
+                    )
                 elif profile_scheduler_mode == 'single-prefetch':
-                    if telemetry_collector is None:
-                        _run_gpu_profile_single_prefetch(
-                            chunks,
-                            gpu_profile_session,
-                            gpu_sequence_batch,
-                            continuation_threads,
-                            fh,
-                            gpu_metrics,
-                            profile_domain_continuation,
-                        )
-                    else:
-                        _run_gpu_profile_single_prefetch(
-                            chunks,
-                            gpu_profile_session,
-                            gpu_sequence_batch,
-                            continuation_threads,
-                            fh,
-                            gpu_metrics,
-                            profile_domain_continuation,
-                            telemetry_collector=telemetry_collector,
-                        )
+                    _run_gpu_profile_single_prefetch(
+                        chunks,
+                        gpu_profile_session,
+                        gpu_sequence_batch,
+                        continuation_threads,
+                        fh,
+                        gpu_metrics,
+                        profile_domain_continuation,
+                        **profile_run_options,
+                    )
                 else:
-                    if telemetry_collector is None:
-                        _run_gpu_profile_serial(
-                            chunks,
-                            gpu_profile_session,
-                            gpu_sequence_batch,
-                            continuation_threads,
-                            fh,
-                            gpu_metrics,
-                            profile_domain_continuation,
-                        )
-                    else:
-                        _run_gpu_profile_serial(
-                            chunks,
-                            gpu_profile_session,
-                            gpu_sequence_batch,
-                            continuation_threads,
-                            fh,
-                            gpu_metrics,
-                            profile_domain_continuation,
-                            telemetry_collector=telemetry_collector,
-                        )
+                    _run_gpu_profile_serial(
+                        chunks,
+                        gpu_profile_session,
+                        gpu_sequence_batch,
+                        continuation_threads,
+                        fh,
+                        gpu_metrics,
+                        profile_domain_continuation,
+                        **profile_run_options,
+                    )
             else:
                 for chunk_index, hmm_chunk, _, kwargs in chunks:
                     print(f"  Chunk {chunk_index}/{total_chunks} "

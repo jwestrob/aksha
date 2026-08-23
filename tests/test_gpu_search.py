@@ -97,7 +97,8 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
                         compact_native_available=False,
                         compact_seam_available=None,
                         compact_tail_available=None,
-                        phase0_telemetry_available=False):
+                        phase0_telemetry_available=False,
+                        sparse_journal_v3_available=False):
     """Return optional-package modules suitable for CPU-only wiring tests."""
     package = ModuleType("plan7_gpu")
     package.__path__ = []
@@ -166,6 +167,27 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
         ):
             pass
 
+    class SparseJournalV3SequenceBatch:
+        def _postfilter_forward_selection(
+            self, selection, F1, F2, F3, bias_filter, *,
+            pipeline=None, domain_guard=2.0e-4,
+            _rescore_compact_byte_budget=0,
+            _rescore_matrix_byte_budget=0,
+            _rescore_trace_byte_budget=0,
+            _rescore_test_fault=0,
+            telemetry=False,
+            sparse_journal_v3=False,
+        ):
+            pass
+
+        def _postfilter_forward_domain_selection(
+            self, selection, F1, f2, f3, bias_filter,
+            pipeline, domain_guard, rescore_compact_byte_budget,
+            rescore_matrix_byte_budget, rescore_trace_byte_budget,
+            rescore_test_fault, telemetry, sparse_journal_v3,
+        ):
+            pass
+
     class LegacyNativeSequenceBatch:
         def _postfilter_forward_domain_selection_sealed(
             self, selection, f1, f2, f3, guard_band=2.0e-4,
@@ -197,7 +219,9 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
     class NoDomainNativeSequenceBatch:
         pass
 
-    if phase0_telemetry_available:
+    if sparse_journal_v3_available:
+        sequence_batch_spec = SparseJournalV3SequenceBatch
+    elif phase0_telemetry_available:
         sequence_batch_spec = TelemetrySequenceBatch
     elif compact_adapter_available:
         sequence_batch_spec = (
@@ -301,7 +325,7 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
     package.astra_search = astra_search_module
     package._native = native_module
     package._pipeline = pipeline_module
-    if phase0_telemetry_available:
+    if phase0_telemetry_available or sparse_journal_v3_available:
         native_module.SequenceBatch = TelemetryNativeSequenceBatch
     elif not domain_native_available:
         native_module.SequenceBatch = NoDomainNativeSequenceBatch
@@ -326,6 +350,60 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
 
 
 class GPUConfigurationTests(unittest.TestCase):
+    def test_sparse_journal_v3_preflight_rejects_invalid_configuration(self):
+        class Session:
+            closed = False
+            statistics = {"worker_count": 0, "host_bytes": 1}
+
+            def __len__(self):
+                return 0
+
+        modules, _ = synthetic_plan7_gpu(
+            True,
+            True,
+            True,
+            compact_seam_available=True,
+            phase0_telemetry_available=True,
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="astra-sparse-v3-preflight-"
+        ) as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(TypeError, "must be bool"):
+                search.hmmsearch(
+                    {}, [], 1, search_options(root), sparse_journal_v3=1
+                )
+            with mock.patch.dict(sys.modules, modules):
+                with self.assertRaisesRegex(
+                    search.GPUConfigurationError, "GPU profile session"
+                ):
+                    search.hmmsearch(
+                        {},
+                        [],
+                        1,
+                        search_options(root),
+                        all_sequences=[],
+                        gpu_sequence_batch=object(),
+                        gpu_postfilter=True,
+                        sparse_journal_v3=True,
+                    )
+                with self.assertRaisesRegex(
+                    search.GPUConfigurationError,
+                    "does not support sparse journal v3",
+                ):
+                    search.hmmsearch(
+                        {},
+                        [],
+                        1,
+                        search_options(root),
+                        all_sequences=[],
+                        gpu_sequence_batch=object(),
+                        gpu_postfilter=True,
+                        gpu_profile_session=Session(),
+                        sparse_journal_v3=True,
+                    )
+            self.assertFalse((root / "tmp_results").exists())
+
     def test_route_telemetry_requires_explicit_fused_session_before_output(self):
         modules, api = synthetic_plan7_gpu(True, True, True)
         collector = api.TelemetryCollector()
@@ -1091,6 +1169,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
         self.assertEqual(args[1:], (0.03, 0.004, 0.00005, True))
         self.assertIs(kwargs["pipeline"], pipeline)
         self.assertEqual(kwargs["domain_guard"], search.GPU_DOMAIN_GUARD)
+        self.assertNotIn("sparse_journal_v3", kwargs)
         self.assertEqual(selection.close_count, 1)
         api.gpu_hmmsearch.assert_called_once_with(
             [pair],
@@ -1170,6 +1249,56 @@ class GPUProfileOverlapTests(unittest.TestCase):
             profile_ordinals=(0,),
         )
 
+    def test_sparse_journal_v3_threads_through_pipeline_with_telemetry(self):
+        class Session:
+            closed = False
+            statistics = {"worker_count": 0, "host_bytes": 1}
+
+            def __len__(self):
+                return 0
+
+        modules, api = synthetic_plan7_gpu(
+            True,
+            True,
+            True,
+            compact_seam_available=True,
+            sparse_journal_v3_available=True,
+        )
+        collector = api.TelemetryCollector()
+        with tempfile.TemporaryDirectory(
+            prefix="astra-sparse-journal-v3-"
+        ) as temporary:
+            with (
+                mock.patch.dict(sys.modules, modules),
+                mock.patch.object(search, "_run_gpu_profile_pipeline") as run,
+            ):
+                search.hmmsearch(
+                    {},
+                    [],
+                    2,
+                    search_options(temporary),
+                    all_sequences=[],
+                    gpu_sequence_batch=object(),
+                    gpu_postfilter=True,
+                    gpu_profile_session=Session(),
+                    telemetry_collector=collector,
+                    sparse_journal_v3=True,
+                )
+
+        run.assert_called_once_with(
+            [],
+            mock.ANY,
+            mock.ANY,
+            1,
+            mock.ANY,
+            None,
+            True,
+            (1, None),
+            telemetry_collector=collector,
+            sparse_journal_v3=True,
+        )
+        self.assertEqual(collector.expected_profile_calls, [()])
+
     def test_disabled_bias_uses_the_existing_forward_selection_abi(self):
         calls = []
 
@@ -1232,6 +1361,58 @@ class GPUProfileOverlapTests(unittest.TestCase):
             search._generate_gpu_profile_candidates(
                 Batch(), "selection", options, False, telemetry=True
             )
+
+    def test_sparse_journal_v3_requires_fused_generation(self):
+        calls = []
+
+        class Batch:
+            alphabet = object()
+
+            def _postfilter_forward_selection(self, *args, **kwargs):
+                calls.append((args, kwargs))
+                return "sealed"
+
+        options = {
+            "F1": 0.03,
+            "F2": 0.004,
+            "F3": 0.00005,
+            "bias_filter": True,
+        }
+        pipeline = object()
+        with mock.patch.object(
+            pyhmmer.plan7, "Pipeline", return_value=pipeline
+        ):
+            result = search._generate_gpu_profile_candidates(
+                Batch(),
+                "selection",
+                options,
+                True,
+                telemetry=True,
+                sparse_journal_v3=True,
+            )
+        self.assertEqual(result, "sealed")
+        self.assertIs(calls[0][1]["pipeline"], pipeline)
+        self.assertIs(calls[0][1]["telemetry"], True)
+        self.assertIs(calls[0][1]["sparse_journal_v3"], True)
+        with self.assertRaisesRegex(
+            search.GPUConfigurationError, "fused domain continuation"
+        ):
+            search._generate_gpu_profile_candidates(
+                Batch(),
+                "selection",
+                options,
+                False,
+                sparse_journal_v3=True,
+            )
+        with self.assertRaisesRegex(TypeError, "must be bool"):
+            search._generate_gpu_profile_candidates(
+                Batch(),
+                "selection",
+                options,
+                True,
+                sparse_journal_v3=1,
+            )
+        self.assertEqual(len(calls), 1)
 
     def test_explicit_collector_is_forwarded_with_global_profile_ordinals(self):
         collector = object()
