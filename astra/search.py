@@ -838,7 +838,7 @@ def _profile_continuation_capabilities():
             domain_prefix + compact_domain_suffix + ('telemetry',),
         )
     )
-    sparse_journal_v3_adapter = (
+    sparse_journal_v3_adapter_v1 = (
         _signature_matches(
             selection_method,
             selection_prefix
@@ -861,6 +861,33 @@ def _profile_continuation_capabilities():
             + compact_domain_suffix
             + ('telemetry', 'sparse_journal_v3'),
         )
+    )
+    ga_pruning_adapter = (
+        _signature_matches(
+            selection_method,
+            selection_prefix
+            + compact_selection_suffix
+            + ('telemetry', 'sparse_journal_v3', '_ga_pruning'),
+            keyword_only=(
+                selection_options
+                + compact_selection_suffix
+                + ('telemetry', 'sparse_journal_v3', '_ga_pruning')
+            ),
+            defaulted=(
+                selection_options
+                + compact_selection_suffix
+                + ('telemetry', 'sparse_journal_v3', '_ga_pruning')
+            ),
+        )
+        and _signature_matches(
+            domain_method,
+            domain_prefix
+            + compact_domain_suffix
+            + ('telemetry', 'sparse_journal_v3', 'ga_pruning'),
+        )
+    )
+    sparse_journal_v3_adapter = (
+        sparse_journal_v3_adapter_v1 or ga_pruning_adapter
     )
     sparse_journal_v3_pipeline = (
         _signature_matches(
@@ -932,7 +959,7 @@ def _profile_continuation_capabilities():
             + telemetry_native_suffix
         ),
     )
-    direct_sparse_v3_native = _signature_matches(
+    direct_sparse_v3_native_v1 = _signature_matches(
         native_method,
         native_prefix
         + compact_native_suffix
@@ -944,6 +971,22 @@ def _profile_continuation_capabilities():
             + telemetry_native_suffix
             + ('_direct_sparse_v3',)
         ),
+    )
+    ga_pruning_native = _signature_matches(
+        native_method,
+        native_prefix
+        + compact_native_suffix
+        + telemetry_native_suffix
+        + ('_direct_sparse_v3', '_ga_target_cutoffs'),
+        defaulted=(
+            ('guard_band', 'gathered_byte_budget')
+            + compact_native_suffix
+            + telemetry_native_suffix
+            + ('_direct_sparse_v3', '_ga_target_cutoffs')
+        ),
+    )
+    direct_sparse_v3_native = (
+        direct_sparse_v3_native_v1 or ga_pruning_native
     )
 
     compact_probe = getattr(
@@ -1016,6 +1059,36 @@ def gpu_profile_compact_available():
 def gpu_profile_sparse_journal_v3_available():
     """Return whether fused session generation supports sparse journal v3."""
     return _profile_continuation_capabilities()[2]
+
+
+def gpu_profile_ga_pruning_available():
+    """Return whether exact gathering-cutoff GA pruning is available."""
+    from plan7_gpu import SequenceBatch, _native
+
+    selection_method = getattr(
+        SequenceBatch, '_postfilter_forward_selection', None
+    )
+    domain_method = getattr(
+        SequenceBatch, '_postfilter_forward_domain_selection', None
+    )
+    native_method = getattr(
+        _native.SequenceBatch,
+        '_postfilter_forward_domain_selection_sealed',
+        None,
+    )
+    if not gpu_profile_sparse_journal_v3_available():
+        return False
+    try:
+        selection_names = tuple(inspect.signature(selection_method).parameters)
+        domain_names = tuple(inspect.signature(domain_method).parameters)
+        native_names = tuple(inspect.signature(native_method).parameters)
+    except (TypeError, ValueError):
+        return False
+    return (
+        selection_names[-1:] == ('_ga_pruning',)
+        and domain_names[-1:] == ('ga_pruning',)
+        and native_names[-1:] == ('_ga_target_cutoffs',)
+    )
 
 
 def has_thresholds(x):
@@ -1233,7 +1306,8 @@ def _consume_gpu_candidate_chunk(spec, candidates, total_chunks, threads, fh,
 def _generate_gpu_profile_candidates(sequence_batch, selection, kwargs,
                                      domain_continuation=False,
                                      telemetry=False,
-                                     sparse_journal_v3=False):
+                                     sparse_journal_v3=False,
+                                     ga_pruning=False):
     """Run the same bounded CUDA stages as the live post-filter product path."""
     F1 = kwargs.get('F1', 0.02)
     F2 = kwargs.get('F2', 0.001)
@@ -1243,6 +1317,8 @@ def _generate_gpu_profile_candidates(sequence_batch, selection, kwargs,
         raise TypeError("telemetry must be bool")
     if type(sparse_journal_v3) is not bool:
         raise TypeError("sparse_journal_v3 must be bool")
+    if type(ga_pruning) is not bool:
+        raise TypeError("ga_pruning must be bool")
     if telemetry and (not domain_continuation or bias_filter is not True):
         raise GPUConfigurationError(
             "route telemetry requires fused domain continuation with bias filtering"
@@ -1253,6 +1329,8 @@ def _generate_gpu_profile_candidates(sequence_batch, selection, kwargs,
         raise GPUConfigurationError(
             "sparse journal v3 requires fused domain continuation with bias filtering"
         )
+    if ga_pruning and not sparse_journal_v3:
+        raise GPUConfigurationError("GA pruning requires sparse journal v3")
     if domain_continuation and bias_filter is True:
         # This configuration-only pipeline is private to the producer call.
         # CPU continuation workers still create and exclusively own their
@@ -1269,6 +1347,8 @@ def _generate_gpu_profile_candidates(sequence_batch, selection, kwargs,
             generation_options['telemetry'] = True
         if sparse_journal_v3:
             generation_options['sparse_journal_v3'] = True
+        if ga_pruning:
+            generation_options['_ga_pruning'] = True
         return sequence_batch._postfilter_forward_selection(
             selection,
             F1,
@@ -1284,9 +1364,9 @@ def _generate_gpu_profile_candidates(sequence_batch, selection, kwargs,
 
 def _generate_gpu_profile_candidates_for_run(
         sequence_batch, selection, kwargs, domain_continuation,
-        telemetry_collector, sparse_journal_v3=False):
+        telemetry_collector, sparse_journal_v3=False, ga_pruning=False):
     """Preserve the exact default call and add only explicit opt-ins."""
-    if telemetry_collector is None and not sparse_journal_v3:
+    if telemetry_collector is None and not sparse_journal_v3 and not ga_pruning:
         return _generate_gpu_profile_candidates(
             sequence_batch, selection, kwargs, domain_continuation
         )
@@ -1295,6 +1375,8 @@ def _generate_gpu_profile_candidates_for_run(
         generation_options['telemetry'] = True
     if sparse_journal_v3:
         generation_options['sparse_journal_v3'] = True
+    if ga_pruning:
+        generation_options['ga_pruning'] = True
     return _generate_gpu_profile_candidates(
         sequence_batch, selection, kwargs, domain_continuation,
         **generation_options,
@@ -1331,7 +1413,7 @@ def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
                             threads, fh, gpu_metrics=None,
                             domain_continuation=False,
                             telemetry_collector=None,
-                            sparse_journal_v3=False):
+                            sparse_journal_v3=False, ga_pruning=False):
     """Run sealed GPU-through-Forward generation as the serial control."""
     from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
 
@@ -1365,6 +1447,7 @@ def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
                     domain_continuation,
                     telemetry_collector,
                     sparse_journal_v3,
+                    ga_pruning,
                 )
             except BaseException:
                 try:
@@ -1401,7 +1484,8 @@ def _run_gpu_profile_single_prefetch(chunks, profile_session, sequence_batch,
                                      threads, fh, gpu_metrics=None,
                                      domain_continuation=False,
                                      telemetry_collector=None,
-                                     sparse_journal_v3=False):
+                                     sparse_journal_v3=False,
+                                     ga_pruning=False):
     """Retain the original one-future overlap scheduler as a control."""
     if not chunks:
         return
@@ -1431,6 +1515,7 @@ def _run_gpu_profile_single_prefetch(chunks, profile_session, sequence_batch,
                 domain_continuation,
                 telemetry_collector,
                 sparse_journal_v3,
+                ga_pruning,
             )
         except BaseException:
             try:
@@ -1555,7 +1640,7 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                               domain_continuation=False,
                               ready_queue_configuration=None,
                               telemetry_collector=None,
-                              sparse_journal_v3=False):
+                              sparse_journal_v3=False, ga_pruning=False):
     """Continuously produce ordered GPU batches into a bounded ready queue.
 
     The producer owns selection and CUDA generation.  While the caller consumes
@@ -1697,6 +1782,7 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                         domain_continuation,
                         telemetry_collector,
                         sparse_journal_v3,
+                        ga_pruning,
                     )
                 except BaseException as error:
                     try:
@@ -2004,9 +2090,12 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
               all_sequences=None, gpu_sequence_batch=None,
               gpu_postfilter=None, gpu_profile_session=None,
               gpu_metrics=None, gpu_profile_overlap=True,
-              telemetry_collector=None, sparse_journal_v3=False):
+              telemetry_collector=None, sparse_journal_v3=False,
+              ga_pruning=False):
     if type(sparse_journal_v3) is not bool:
         raise TypeError("sparse_journal_v3 must be bool")
+    if type(ga_pruning) is not bool:
+        raise TypeError("ga_pruning must be bool")
     hmmsearch_kwargs = define_kwargs(options)
 
     if telemetry_collector is not None:
@@ -2046,6 +2135,8 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
         raise GPUConfigurationError(
             "sparse journal v3 requires an explicit GPU profile session"
         )
+    if ga_pruning and not sparse_journal_v3:
+        raise GPUConfigurationError("GA pruning requires sparse journal v3")
     if gpu_metrics is not None and not isinstance(gpu_metrics, GPUOverlapMetrics):
         raise TypeError("gpu_metrics must be GPUOverlapMetrics or None")
     if type(gpu_profile_overlap) is not bool:
@@ -2087,6 +2178,15 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
             raise GPUConfigurationError(
                 "sparse journal v3 requires fused domain continuation with "
                 "bias filtering"
+            )
+    if ga_pruning:
+        if not gpu_profile_ga_pruning_available():
+            raise GPUConfigurationError(
+                "installed plan7_gpu does not support exact GA pruning"
+            )
+        if hmmsearch_kwargs.get('bit_cutoffs') != 'gathering':
+            raise GPUConfigurationError(
+                "GA pruning requires gathering bit cutoffs"
             )
     if telemetry_collector is not None:
         if gpu_profile_session is None:
@@ -2230,6 +2330,8 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                     )
                 if sparse_journal_v3:
                     profile_run_options['sparse_journal_v3'] = True
+                if ga_pruning:
+                    profile_run_options['ga_pruning'] = True
                 if profile_scheduler_mode == 'bounded-ready-queue':
                     _run_gpu_profile_pipeline(
                         chunks,
