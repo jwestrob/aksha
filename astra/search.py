@@ -26,6 +26,7 @@ GPU_LEGACY_OVERLAP_ENV = 'ASTRA_GPU_PROFILE_LEGACY_OVERLAP'
 GPU_LEGACY_OVERLAP_VALUE = 'single-prefetch'
 GPU_READY_QUEUE_DEPTH_ENV = 'ASTRA_GPU_READY_QUEUE_DEPTH'
 GPU_READY_QUEUE_BYTES_ENV = 'ASTRA_GPU_READY_QUEUE_BYTES'
+GPU_CONTINUATION_POOL_ENV = 'ASTRA_GPU_CONTINUATION_POOL'
 GPU_DOMAIN_GUARD = 2.0e-4
 GPU_READY_QUEUE_CAPACITY = 1
 GPU_PRODUCER_LOOKAHEAD_CAPACITY = GPU_READY_QUEUE_CAPACITY + 1
@@ -36,6 +37,58 @@ GPU_READY_QUEUE_MAX_BYTES = (1 << 63) - 1
 
 class GPUConfigurationError(ValueError):
     """Raised when an explicit installed-database GPU request is invalid."""
+
+
+def _gpu_continuation_pool_enabled():
+    value = os.environ.get(GPU_CONTINUATION_POOL_ENV)
+    if value is None or value == '0':
+        return False
+    if value == '1':
+        return True
+    raise GPUConfigurationError(
+        f"{GPU_CONTINUATION_POOL_ENV} must be exactly '0' or '1'"
+    )
+
+
+def _new_gpu_continuation_pools(chunks, threads, enabled):
+    if not enabled:
+        return None
+    try:
+        from plan7_gpu.astra_search import _ContinuationPool
+    except (ImportError, AttributeError) as error:
+        raise GPUConfigurationError(
+            "installed plan7_gpu lacks request-scoped continuation pools"
+        ) from error
+    pools = {}
+    try:
+        for spec in chunks:
+            key = id(spec[3])
+            if key not in pools:
+                pools[key] = _ContinuationPool(threads)
+    except BaseException:
+        for pool in pools.values():
+            pool.close()
+        raise
+    return pools
+
+
+def _close_gpu_continuation_pools(pools, gpu_metrics):
+    if pools is None:
+        return
+    active_error = sys.exc_info()[0] is not None
+    close_error = None
+    for pool in pools.values():
+        try:
+            pool.close()
+        except BaseException as error:
+            if close_error is None:
+                close_error = error
+        statistics = pool.statistics
+        if gpu_metrics is not None:
+            gpu_metrics.continuation_pool_call_count += statistics['call_count']
+            gpu_metrics.continuation_pipeline_count += statistics['pipeline_count']
+    if close_error is not None and not active_error:
+        raise close_error
 
 
 class GPUOverlapMetrics:
@@ -85,6 +138,9 @@ class GPUOverlapMetrics:
         self.initial_generation_wait_seconds = 0.0
         self.pipeline_stall_seconds = 0.0
         self.continuation_seconds = 0.0
+        self.continuation_pool_enabled = False
+        self.continuation_pool_call_count = 0
+        self.continuation_pipeline_count = 0
         self.overlap_seconds = 0.0
         self.pipeline_wall_seconds = 0.0
         self.generation_records = []
@@ -145,6 +201,9 @@ class GPUOverlapMetrics:
             'initial_generation_wait_seconds': self.initial_generation_wait_seconds,
             'pipeline_stall_seconds': self.pipeline_stall_seconds,
             'continuation_seconds': self.continuation_seconds,
+            'continuation_pool_enabled': self.continuation_pool_enabled,
+            'continuation_pool_call_count': self.continuation_pool_call_count,
+            'continuation_pipeline_count': self.continuation_pipeline_count,
             'overlap_seconds': self.overlap_seconds,
             'pipeline_wall_seconds': self.pipeline_wall_seconds,
             'generation_records': [
@@ -1243,7 +1302,8 @@ def extract_sequences(results_or_ids, protein_dict_or_outdir, outdir=None):
 
 def _consume_gpu_candidate_chunk(spec, candidates, total_chunks, threads, fh,
                                  gpu_hmmsearch, gpu_metrics,
-                                 telemetry_collector=None):
+                                 telemetry_collector=None,
+                                 continuation_pool=None):
     chunk_index, hmm_chunk, _, kwargs = spec
     print(f"  Chunk {chunk_index}/{total_chunks} "
           f"({len(hmm_chunk)} HMMs)...", end="", flush=True)
@@ -1252,12 +1312,16 @@ def _consume_gpu_candidate_chunk(spec, candidates, total_chunks, threads, fh,
     completed = False
     started = time.perf_counter()
     try:
+        continuation_options = {}
+        if continuation_pool is not None:
+            continuation_options['continuation_pool'] = continuation_pool
         if telemetry_collector is None:
             hit_iterator = gpu_hmmsearch(
                 hmm_chunk,
                 candidates,
                 cpus=threads,
                 postfilter=True,
+                **continuation_options,
                 **kwargs,
             )
         else:
@@ -1268,6 +1332,7 @@ def _consume_gpu_candidate_chunk(spec, candidates, total_chunks, threads, fh,
                 postfilter=True,
                 telemetry_collector=telemetry_collector,
                 profile_ordinals=tuple(spec[2]),
+                **continuation_options,
                 **kwargs,
             )
         for hits in hit_iterator:
@@ -1385,7 +1450,7 @@ def _generate_gpu_profile_candidates_for_run(
 
 def _consume_gpu_candidate_chunk_for_run(
         spec, candidates, total_chunks, threads, fh, gpu_hmmsearch,
-        gpu_metrics, telemetry_collector):
+        gpu_metrics, telemetry_collector, continuation_pools=None):
     """Preserve ordinary TopHits consumption unless telemetry is explicit."""
     if telemetry_collector is None:
         return _consume_gpu_candidate_chunk(
@@ -1396,6 +1461,11 @@ def _consume_gpu_candidate_chunk_for_run(
             fh,
             gpu_hmmsearch,
             gpu_metrics,
+            continuation_pool=(
+                None
+                if continuation_pools is None
+                else continuation_pools[id(spec[3])]
+            ),
         )
     return _consume_gpu_candidate_chunk(
         spec,
@@ -1406,6 +1476,11 @@ def _consume_gpu_candidate_chunk_for_run(
         gpu_hmmsearch,
         gpu_metrics,
         telemetry_collector=telemetry_collector,
+        continuation_pool=(
+            None
+            if continuation_pools is None
+            else continuation_pools[id(spec[3])]
+        ),
     )
 
 
@@ -1413,9 +1488,14 @@ def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
                             threads, fh, gpu_metrics=None,
                             domain_continuation=False,
                             telemetry_collector=None,
-                            sparse_journal_v3=False, ga_pruning=False):
+                            sparse_journal_v3=False, ga_pruning=False,
+                            continuation_pools=None):
     """Run sealed GPU-through-Forward generation as the serial control."""
     from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
+    if continuation_pools is not None:
+        from plan7_gpu.astra_search import (
+            _hmmsearch_with_continuation_pool as gpu_hmmsearch,
+        )
 
     if gpu_metrics is not None:
         statistics = profile_session.statistics
@@ -1471,6 +1551,7 @@ def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
                 gpu_hmmsearch,
                 gpu_metrics,
                 telemetry_collector,
+                continuation_pools,
             )
             candidates = None
     finally:
@@ -1485,12 +1566,17 @@ def _run_gpu_profile_single_prefetch(chunks, profile_session, sequence_batch,
                                      domain_continuation=False,
                                      telemetry_collector=None,
                                      sparse_journal_v3=False,
-                                     ga_pruning=False):
+                                     ga_pruning=False,
+                                     continuation_pools=None):
     """Retain the original one-future overlap scheduler as a control."""
     if not chunks:
         return
 
     from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
+    if continuation_pools is not None:
+        from plan7_gpu.astra_search import (
+            _hmmsearch_with_continuation_pool as gpu_hmmsearch,
+        )
 
     if gpu_metrics is not None:
         statistics = profile_session.statistics
@@ -1613,6 +1699,7 @@ def _run_gpu_profile_single_prefetch(chunks, profile_session, sequence_batch,
                 gpu_hmmsearch,
                 gpu_metrics,
                 telemetry_collector,
+                continuation_pools,
             )
             candidates = None
     finally:
@@ -1640,7 +1727,8 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                               domain_continuation=False,
                               ready_queue_configuration=None,
                               telemetry_collector=None,
-                              sparse_journal_v3=False, ga_pruning=False):
+                              sparse_journal_v3=False, ga_pruning=False,
+                              continuation_pools=None):
     """Continuously produce ordered GPU batches into a bounded ready queue.
 
     The producer owns selection and CUDA generation.  While the caller consumes
@@ -1672,6 +1760,10 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
         raise ValueError("deeper ready queues require an exact byte capacity")
 
     from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
+    if continuation_pools is not None:
+        from plan7_gpu.astra_search import (
+            _hmmsearch_with_continuation_pool as gpu_hmmsearch,
+        )
 
     if gpu_metrics is not None:
         statistics = profile_session.statistics
@@ -2009,6 +2101,7 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                 gpu_hmmsearch,
                 gpu_metrics,
                 telemetry_collector,
+                continuation_pools,
             )
             if gpu_metrics is not None:
                 gpu_metrics.consumed_candidate_bytes += candidate_bytes
@@ -2215,6 +2308,13 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
             f"{GPU_READY_QUEUE_DEPTH_ENV} and {GPU_READY_QUEUE_BYTES_ENV} "
             "require the active bounded-ready-queue scheduler"
         )
+    continuation_pool_enabled = _gpu_continuation_pool_enabled()
+    if continuation_pool_enabled and gpu_profile_session is None:
+        raise GPUConfigurationError(
+            f"{GPU_CONTINUATION_POOL_ENV}=1 requires a GPU profile session"
+        )
+    if gpu_metrics is not None:
+        gpu_metrics.continuation_pool_enabled = continuation_pool_enabled
 
     # Always write to temp files — bulk mode is faster and avoids
     # keeping huge result lists in memory.  The per-genome loop is
@@ -2332,39 +2432,48 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                     profile_run_options['sparse_journal_v3'] = True
                 if ga_pruning:
                     profile_run_options['ga_pruning'] = True
-                if profile_scheduler_mode == 'bounded-ready-queue':
-                    _run_gpu_profile_pipeline(
-                        chunks,
-                        gpu_profile_session,
-                        gpu_sequence_batch,
-                        continuation_threads,
-                        fh,
-                        gpu_metrics,
-                        profile_domain_continuation,
-                        ready_queue_configuration,
-                        **profile_run_options,
-                    )
-                elif profile_scheduler_mode == 'single-prefetch':
-                    _run_gpu_profile_single_prefetch(
-                        chunks,
-                        gpu_profile_session,
-                        gpu_sequence_batch,
-                        continuation_threads,
-                        fh,
-                        gpu_metrics,
-                        profile_domain_continuation,
-                        **profile_run_options,
-                    )
-                else:
-                    _run_gpu_profile_serial(
-                        chunks,
-                        gpu_profile_session,
-                        gpu_sequence_batch,
-                        continuation_threads,
-                        fh,
-                        gpu_metrics,
-                        profile_domain_continuation,
-                        **profile_run_options,
+                continuation_pools = _new_gpu_continuation_pools(
+                    chunks, continuation_threads, continuation_pool_enabled
+                )
+                profile_run_options['continuation_pools'] = continuation_pools
+                try:
+                    if profile_scheduler_mode == 'bounded-ready-queue':
+                        _run_gpu_profile_pipeline(
+                            chunks,
+                            gpu_profile_session,
+                            gpu_sequence_batch,
+                            continuation_threads,
+                            fh,
+                            gpu_metrics,
+                            profile_domain_continuation,
+                            ready_queue_configuration,
+                            **profile_run_options,
+                        )
+                    elif profile_scheduler_mode == 'single-prefetch':
+                        _run_gpu_profile_single_prefetch(
+                            chunks,
+                            gpu_profile_session,
+                            gpu_sequence_batch,
+                            continuation_threads,
+                            fh,
+                            gpu_metrics,
+                            profile_domain_continuation,
+                            **profile_run_options,
+                        )
+                    else:
+                        _run_gpu_profile_serial(
+                            chunks,
+                            gpu_profile_session,
+                            gpu_sequence_batch,
+                            continuation_threads,
+                            fh,
+                            gpu_metrics,
+                            profile_domain_continuation,
+                            **profile_run_options,
+                        )
+                finally:
+                    _close_gpu_continuation_pools(
+                        continuation_pools, gpu_metrics
                     )
             else:
                 for chunk_index, hmm_chunk, _, kwargs in chunks:
