@@ -1466,6 +1466,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
         collector = object()
         gpu_hmmsearch = mock.Mock(return_value=iter(("hits",)))
         spec = (3, [self.pair()], (17,), {"F1": 0.03})
+        metrics = search.GPUOverlapMetrics()
         with mock.patch.object(search, "process_hits_to_file") as process:
             search._consume_gpu_candidate_chunk(
                 spec,
@@ -1474,7 +1475,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
                 7,
                 object(),
                 gpu_hmmsearch,
-                None,
+                metrics,
                 telemetry_collector=collector,
             )
         gpu_hmmsearch.assert_called_once_with(
@@ -1487,6 +1488,46 @@ class GPUProfileOverlapTests(unittest.TestCase):
             F1=0.03,
         )
         process.assert_called_once_with("hits", mock.ANY)
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["tsv_worker_rendered_profile_count"], 0)
+        self.assertEqual(snapshot["tsv_worker_rendered_row_count"], 0)
+        self.assertEqual(snapshot["tsv_worker_rendered_bytes"], 0)
+        self.assertEqual(snapshot["tsv_consumer_fallback_profile_count"], 1)
+
+    def test_worker_rendered_rows_have_exact_sink_accounting(self):
+        class RenderedRows:
+            def __init__(self, rows):
+                self.rows = rows
+                self.row_count = rows.count("\n")
+                self.byte_count = len(rows.encode("utf-8"))
+
+        modules, _api = synthetic_plan7_gpu(True)
+        modules["plan7_gpu.astra_search"]._AstraTSVRows = RenderedRows
+        rendered = (RenderedRows("first\nsecond\n"), RenderedRows("β\n"))
+        gpu_hmmsearch = mock.Mock(return_value=iter(rendered))
+        metrics = search.GPUOverlapMetrics()
+        output = io.StringIO()
+        spec = (1, [self.pair(), self.pair()], (0, 1), {"F1": 0.03})
+        with mock.patch.dict(sys.modules, modules):
+            search._consume_gpu_candidate_chunk(
+                spec,
+                object(),
+                1,
+                2,
+                output,
+                gpu_hmmsearch,
+                metrics,
+            )
+
+        self.assertEqual(output.getvalue(), "first\nsecond\nβ\n")
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["tsv_worker_rendered_profile_count"], 2)
+        self.assertEqual(snapshot["tsv_worker_rendered_row_count"], 3)
+        self.assertEqual(
+            snapshot["tsv_worker_rendered_bytes"],
+            len(output.getvalue().encode("utf-8")),
+        )
+        self.assertEqual(snapshot["tsv_consumer_fallback_profile_count"], 0)
 
     def test_bounded_queue_runs_two_ahead_in_canonical_order(self):
         pairs = [

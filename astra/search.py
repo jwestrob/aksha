@@ -34,6 +34,8 @@ GPU_PRODUCER_LOOKAHEAD_CAPACITY = GPU_READY_QUEUE_CAPACITY + 1
 GPU_LIVE_CANDIDATE_CAPACITY = GPU_READY_QUEUE_CAPACITY + 2
 GPU_READY_QUEUE_DEPTHS = (1, 2, 4)
 GPU_READY_QUEUE_MAX_BYTES = (1 << 63) - 1
+_NATIVE_TSV_ROWS_UNRESOLVED = object()
+_native_tsv_rows = _NATIVE_TSV_ROWS_UNRESOLVED
 
 
 class GPUConfigurationError(ValueError):
@@ -142,6 +144,10 @@ class GPUOverlapMetrics:
         self.continuation_pool_enabled = False
         self.continuation_pool_call_count = 0
         self.continuation_pipeline_count = 0
+        self.tsv_worker_rendered_profile_count = 0
+        self.tsv_worker_rendered_row_count = 0
+        self.tsv_worker_rendered_bytes = 0
+        self.tsv_consumer_fallback_profile_count = 0
         self.overlap_seconds = 0.0
         self.pipeline_wall_seconds = 0.0
         self.generation_records = []
@@ -205,6 +211,16 @@ class GPUOverlapMetrics:
             'continuation_pool_enabled': self.continuation_pool_enabled,
             'continuation_pool_call_count': self.continuation_pool_call_count,
             'continuation_pipeline_count': self.continuation_pipeline_count,
+            'tsv_worker_rendered_profile_count': (
+                self.tsv_worker_rendered_profile_count
+            ),
+            'tsv_worker_rendered_row_count': (
+                self.tsv_worker_rendered_row_count
+            ),
+            'tsv_worker_rendered_bytes': self.tsv_worker_rendered_bytes,
+            'tsv_consumer_fallback_profile_count': (
+                self.tsv_consumer_fallback_profile_count
+            ),
             'overlap_seconds': self.overlap_seconds,
             'pipeline_wall_seconds': self.pipeline_wall_seconds,
             'generation_records': [
@@ -1311,6 +1327,12 @@ def _consume_gpu_candidate_chunk(spec, candidates, total_chunks, threads, fh,
     hit_iterator = None
     hits = None
     completed = False
+    try:
+        from plan7_gpu.astra_search import _AstraTSVRows
+    except ImportError:
+        rendered_rows_type = None
+    else:
+        rendered_rows_type = _AstraTSVRows
     started = time.perf_counter()
     try:
         continuation_options = {}
@@ -1337,7 +1359,19 @@ def _consume_gpu_candidate_chunk(spec, candidates, total_chunks, threads, fh,
                 **kwargs,
             )
         for hits in hit_iterator:
-            process_hits_to_file(hits, fh)
+            if (
+                rendered_rows_type is not None
+                and type(hits) is rendered_rows_type
+            ):
+                fh.write(hits.rows)
+                if gpu_metrics is not None:
+                    gpu_metrics.tsv_worker_rendered_profile_count += 1
+                    gpu_metrics.tsv_worker_rendered_row_count += hits.row_count
+                    gpu_metrics.tsv_worker_rendered_bytes += hits.byte_count
+            else:
+                if gpu_metrics is not None:
+                    gpu_metrics.tsv_consumer_fallback_profile_count += 1
+                process_hits_to_file(hits, fh)
         completed = True
     except BaseException:
         if hit_iterator is not None:
@@ -1492,11 +1526,21 @@ def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
                             sparse_journal_v3=False, ga_pruning=False,
                             continuation_pools=None):
     """Run sealed GPU-through-Forward generation as the serial control."""
-    from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
-    if continuation_pools is not None:
+    try:
         from plan7_gpu.astra_search import (
-            _hmmsearch_with_continuation_pool as gpu_hmmsearch,
+            _hmmsearch_astra_tsv as gpu_hmmsearch,
         )
+    except ImportError:
+        from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
+    if continuation_pools is not None:
+        try:
+            from plan7_gpu.astra_search import (
+                _hmmsearch_astra_tsv_with_continuation_pool as gpu_hmmsearch,
+            )
+        except ImportError:
+            from plan7_gpu.astra_search import (
+                _hmmsearch_with_continuation_pool as gpu_hmmsearch,
+            )
 
     if gpu_metrics is not None:
         statistics = profile_session.statistics
@@ -1573,11 +1617,21 @@ def _run_gpu_profile_single_prefetch(chunks, profile_session, sequence_batch,
     if not chunks:
         return
 
-    from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
-    if continuation_pools is not None:
+    try:
         from plan7_gpu.astra_search import (
-            _hmmsearch_with_continuation_pool as gpu_hmmsearch,
+            _hmmsearch_astra_tsv as gpu_hmmsearch,
         )
+    except ImportError:
+        from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
+    if continuation_pools is not None:
+        try:
+            from plan7_gpu.astra_search import (
+                _hmmsearch_astra_tsv_with_continuation_pool as gpu_hmmsearch,
+            )
+        except ImportError:
+            from plan7_gpu.astra_search import (
+                _hmmsearch_with_continuation_pool as gpu_hmmsearch,
+            )
 
     if gpu_metrics is not None:
         statistics = profile_session.statistics
@@ -1760,11 +1814,21 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
     if ready_depth != GPU_READY_QUEUE_CAPACITY and ready_byte_capacity is None:
         raise ValueError("deeper ready queues require an exact byte capacity")
 
-    from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
-    if continuation_pools is not None:
+    try:
         from plan7_gpu.astra_search import (
-            _hmmsearch_with_continuation_pool as gpu_hmmsearch,
+            _hmmsearch_astra_tsv as gpu_hmmsearch,
         )
+    except ImportError:
+        from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
+    if continuation_pools is not None:
+        try:
+            from plan7_gpu.astra_search import (
+                _hmmsearch_astra_tsv_with_continuation_pool as gpu_hmmsearch,
+            )
+        except ImportError:
+            from plan7_gpu.astra_search import (
+                _hmmsearch_with_continuation_pool as gpu_hmmsearch,
+            )
 
     if gpu_metrics is not None:
         statistics = profile_session.statistics
@@ -2557,8 +2621,20 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                         hit_iterator = pyhmmer.hmmsearch(
                             hmm_chunk, all_sequences, cpus=threads, **kwargs
                         )
+                        rendered_rows_type = None
                     else:
-                        from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
+                        try:
+                            from plan7_gpu.astra_search import (
+                                _AstraTSVRows,
+                                _hmmsearch_astra_tsv as gpu_hmmsearch,
+                            )
+                        except ImportError:
+                            from plan7_gpu.astra_search import (
+                                hmmsearch as gpu_hmmsearch,
+                            )
+                            rendered_rows_type = None
+                        else:
+                            rendered_rows_type = _AstraTSVRows
                         if gpu_postfilter:
                             hit_iterator = gpu_hmmsearch(
                                 hmm_chunk, gpu_sequence_batch, cpus=threads,
@@ -2570,7 +2646,26 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                             )
                     try:
                         for hits in hit_iterator:
-                            process_hits_to_file(hits, fh)
+                            if (
+                                rendered_rows_type is not None
+                                and type(hits) is rendered_rows_type
+                            ):
+                                fh.write(hits.rows)
+                                if gpu_metrics is not None:
+                                    gpu_metrics.tsv_worker_rendered_profile_count += 1
+                                    gpu_metrics.tsv_worker_rendered_row_count += (
+                                        hits.row_count
+                                    )
+                                    gpu_metrics.tsv_worker_rendered_bytes += (
+                                        hits.byte_count
+                                    )
+                            else:
+                                if (
+                                    gpu_sequence_batch is not None
+                                    and gpu_metrics is not None
+                                ):
+                                    gpu_metrics.tsv_consumer_fallback_profile_count += 1
+                                process_hits_to_file(hits, fh)
                     except BaseException:
                         if gpu_sequence_batch is not None:
                             close = getattr(hit_iterator, "close", None)
@@ -2612,6 +2707,19 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
 
 def process_hits_to_file(hits, fh):
     """Write hits to an already-open file handle *fh*."""
+    global _native_tsv_rows
+    if _native_tsv_rows is _NATIVE_TSV_ROWS_UNRESOLVED:
+        try:
+            from plan7_gpu import _pipeline
+        except ImportError:
+            _native_tsv_rows = None
+        else:
+            renderer = getattr(_pipeline, '_astra_tsv_rows_bound', None)
+            _native_tsv_rows = renderer if callable(renderer) else None
+    if _native_tsv_rows is not None:
+        fh.write(_native_tsv_rows(hits))
+        return
+
     cog = hits.query.name
     for hit in hits:
         if hit.included:
