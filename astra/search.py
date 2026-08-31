@@ -19,6 +19,7 @@ from astra import rp16 as rp16_module
 
 PRESSED_SUFFIXES = ('h3m', 'h3i', 'h3f', 'h3p')
 HMM_CHUNK_SIZE = 2000
+CPU_STREAM_PRESSED_ENV = "ASTRA_CPU_STREAM_PRESSED"
 GPU_CELL_CAP = 100_000_000
 GPU_TIMING_ENV = 'ASTRA_GPU_OVERLAP_TIMING'
 GPU_SERIAL_ENV = 'ASTRA_GPU_PROFILE_SERIAL'
@@ -2343,6 +2344,50 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                 return hmmsearch_kwargs['bit_cutoffs']
         return None
 
+    if isinstance(hmms, _PressedHMMStream):
+        if (gpu_sequence_batch is not None or gpu_profile_session is not None
+                or macsyfinder_dir is not None or options['cascade']):
+            raise GPUConfigurationError(
+                "streamed pressed profiles require ordinary bulk CPU search "
+                "with a fixed threshold policy"
+            )
+        if all_sequences is None:
+            all_sequences = []
+            for sequences in protein_dict.values():
+                all_sequences.extend(sequences)
+
+        kwargs = hmmsearch_kwargs.copy()
+        kwargs.pop('preferred_cutoff', None)
+        out_file = os.path.join(tmp_dir, "bulk_results.tsv")
+        print(
+            f"Bulk search: {len(all_sequences)} sequences × streamed pressed "
+            "HMMs (bounded profile residency)"
+        )
+        with open(out_file, 'w') as fh:
+            fh.write(
+                "sequence_id\thmm_name\tbitscore\tevalue\tc_evalue\ti_evalue\t"
+                "env_from\tenv_to\tdom_bitscore\tali_from\tali_to\thmm_from\thmm_to\n"
+            )
+            for chunk_index, hmm_chunk in enumerate(
+                    hmms.chunks(HMM_CHUNK_SIZE), 1):
+                print(
+                    f"  Chunk {chunk_index} ({len(hmm_chunk)} HMMs)...",
+                    end="",
+                    flush=True,
+                )
+                hit_iterator = pyhmmer.hmmsearch(
+                    hmm_chunk, all_sequences, cpus=threads, **kwargs
+                )
+                for hits in hit_iterator:
+                    process_hits_to_file(hits, fh)
+                hit_iterator = None
+                hits = None
+                hmm_chunk = None
+                gc.collect()
+                print(" done")
+        gc.collect()
+        return tmp_dir
+
     # Pre-compute HMM groups ONCE — grouping depends only on HMM cutoff
     # availability, not on per-genome data.  Previously this was inside the
     # per-genome loop, wasting len(hmms) * len(protein_dict) iterations.
@@ -2583,6 +2628,44 @@ def parse_single_hmm(hmm_path):
     """Single-file parser for fallback when no pressed DB exists."""
     with pyhmmer.plan7.HMMFile(hmm_path) as hmm_file:
         return hmm_file.read()
+
+
+class _PressedHMMStream:
+    """Re-openable, bounded-memory view of a pressed HMM database.
+
+    This is deliberately private and used only by the opt-in CPU experiment.
+    Each iteration owns its ``HMMFile`` and releases every completed chunk
+    before reading the next one; no public Astra/PyHMMER API changes.
+    """
+
+    __slots__ = ("pressed_base",)
+
+    def __init__(self, pressed_base):
+        self.pressed_base = os.fspath(pressed_base)
+
+    def chunks(self, chunk_size):
+        if (isinstance(chunk_size, bool)
+                or not isinstance(chunk_size, int)
+                or chunk_size <= 0):
+            raise ValueError("chunk_size must be a positive integer")
+        with pyhmmer.plan7.HMMFile(self.pressed_base) as hmm_file:
+            chunk = []
+            for hmm in hmm_file:
+                chunk.append(hmm)
+                if len(chunk) == chunk_size:
+                    yield chunk
+                    chunk = []
+            if chunk:
+                yield chunk
+
+
+def _stream_pressed_cpu_enabled():
+    value = os.environ.get(CPU_STREAM_PRESSED_ENV)
+    if value is None:
+        return False
+    if value not in ("0", "1"):
+        raise ValueError(f"{CPU_STREAM_PRESSED_ENV} must be 0 or 1")
+    return value == "1"
 
 def _find_pressed_db(db_dir):
     """Check if a pressed HMM database exists in *db_dir*.
@@ -3122,7 +3205,22 @@ def main(args, *, gpu_profile_session_cache=None):
                     installation_dir = installed_hmm_in['installation_dir']
                     manifest_path = gpu_manifests.get(hmm_db)
                     if manifest_path is None:
-                        db_hmms, db_name_map = parse_hmms(installation_dir)
+                        pressed_base = _find_pressed_db(installation_dir)
+                        stream_pressed = (
+                            _stream_pressed_cpu_enabled()
+                            and pressed_base is not None
+                            and not args.cascade
+                            and macsyfinder_dir is None
+                        )
+                        if stream_pressed:
+                            print(
+                                "  Streaming pressed profiles with bounded "
+                                f"residency: {pressed_base}"
+                            )
+                            db_hmms = _PressedHMMStream(pressed_base)
+                            db_name_map = {}
+                        else:
+                            db_hmms, db_name_map = parse_hmms(installation_dir)
                         tmp_dir = hmmsearch(
                             protein_dict, db_hmms, args.threads, hmmsearch_options,
                             hmm_db, macsyfinder_dir=macsyfinder_dir,
