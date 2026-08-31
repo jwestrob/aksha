@@ -633,6 +633,50 @@ class GPUConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "overlap_requested"):
             search.gpu_profile_worker_allocation(2, 1)
 
+    def test_continuation_worker_cap_is_private_pool_only_and_fail_closed(self):
+        environment = search.GPU_CONTINUATION_WORKERS_ENV
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                search._gpu_continuation_worker_count(63, None, False),
+                63,
+            )
+        for requested in ("63", "48", "32"):
+            with self.subTest(requested=requested), mock.patch.dict(
+                os.environ, {environment: requested}, clear=True
+            ):
+                self.assertEqual(
+                    search._gpu_continuation_worker_count(
+                        63, object(), True
+                    ),
+                    int(requested),
+                )
+        for invalid in ("", "0", "01", "+1", " 1", "1 ", "1.0"):
+            with self.subTest(invalid=invalid), mock.patch.dict(
+                os.environ, {environment: invalid}, clear=True
+            ):
+                with self.assertRaisesRegex(
+                    search.GPUConfigurationError, "canonical positive integer"
+                ):
+                    search._gpu_continuation_worker_count(63, object(), True)
+        with mock.patch.dict(os.environ, {environment: "64"}, clear=True):
+            with self.assertRaisesRegex(
+                search.GPUConfigurationError, "cannot exceed"
+            ):
+                search._gpu_continuation_worker_count(63, object(), True)
+        for session, pool_enabled in ((None, True), (object(), False)):
+            with self.subTest(
+                session=session, pool_enabled=pool_enabled
+            ), mock.patch.dict(
+                os.environ, {environment: "32"}, clear=True
+            ):
+                with self.assertRaisesRegex(
+                    search.GPUConfigurationError,
+                    "active GPU profile session and continuation pool",
+                ):
+                    search._gpu_continuation_worker_count(
+                        63, session, pool_enabled
+                    )
+
     def test_legacy_scheduler_selector_is_exact_and_overlap_only(self):
         environment = search.GPU_LEGACY_OVERLAP_ENV
         previous = os.environ.pop(environment, None)

@@ -32,6 +32,7 @@ GPU_READY_QUEUE_DEPTH_ENV = 'ASTRA_GPU_READY_QUEUE_DEPTH'
 GPU_READY_QUEUE_BYTES_ENV = 'ASTRA_GPU_READY_QUEUE_BYTES'
 GPU_CONTINUATION_POOL_ENV = 'ASTRA_GPU_CONTINUATION_POOL'
 GPU_CONTINUATION_WINDOW_ENV = 'ASTRA_GPU_CONTINUATION_WINDOW'
+GPU_CONTINUATION_WORKERS_ENV = 'ASTRA_GPU_CONTINUATION_WORKERS'
 GPU_DOMAIN_GUARD = 2.0e-4
 GPU_READY_QUEUE_CAPACITY = 1
 GPU_PRODUCER_LOOKAHEAD_CAPACITY = GPU_READY_QUEUE_CAPACITY + 1
@@ -69,6 +70,29 @@ def _gpu_continuation_window():
             f"{GPU_CONTINUATION_WINDOW_ENV} accepts only {allowed}"
         )
     return int(value)
+
+
+def _gpu_continuation_worker_count(available, profile_session, pool_enabled):
+    """Apply the private continuation-only cap after producer reservation."""
+    value = os.environ.get(GPU_CONTINUATION_WORKERS_ENV)
+    if value is None:
+        return available
+    if not value.isascii() or not value.isdecimal() or value.startswith('0'):
+        raise GPUConfigurationError(
+            f"{GPU_CONTINUATION_WORKERS_ENV} must be a canonical positive integer"
+        )
+    requested = int(value)
+    if profile_session is None or not pool_enabled:
+        raise GPUConfigurationError(
+            f"{GPU_CONTINUATION_WORKERS_ENV} requires an active GPU profile "
+            "session and continuation pool"
+        )
+    if requested > available:
+        raise GPUConfigurationError(
+            f"{GPU_CONTINUATION_WORKERS_ENV} cannot exceed the {available} "
+            "continuation workers available after producer reservation"
+        )
+    return requested
 
 
 def _new_gpu_continuation_pools(chunks, threads, enabled,
@@ -2516,9 +2540,16 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                 f"{GPU_CONTINUATION_WINDOW_ENV}>1 requires the bounded "
                 "ready-queue scheduler"
             )
+    continuation_threads = _gpu_continuation_worker_count(
+        continuation_threads,
+        gpu_profile_session,
+        continuation_pool_enabled,
+    )
     if gpu_metrics is not None:
         gpu_metrics.continuation_pool_enabled = continuation_pool_enabled
         gpu_metrics.continuation_window = continuation_window
+        if gpu_profile_session is not None:
+            gpu_metrics.continuation_worker_count = continuation_threads
 
     # Always write to temp files — bulk mode is faster and avoids
     # keeping huge result lists in memory.  The per-genome loop is
