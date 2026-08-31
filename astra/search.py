@@ -2358,6 +2358,26 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
 
         kwargs = hmmsearch_kwargs.copy()
         kwargs.pop('preferred_cutoff', None)
+        requested_cutoff = kwargs.get('bit_cutoffs')
+        if (requested_cutoff is not None
+                and not hmms.all_have_cutoff(requested_cutoff)):
+            # The eager implementation globally groups mixed cutoff
+            # availability. Re-enter it unchanged so profile/output and
+            # failure ordering stay authoritative for that uncommon case.
+            print(
+                "  Pressed profile stream has mixed cutoff availability; "
+                "using the ordinary eager CPU path"
+            )
+            with pyhmmer.plan7.HMMFile(hmms.pressed_base) as hmm_file:
+                eager_hmms = list(hmm_file)
+            return hmmsearch(
+                protein_dict,
+                eager_hmms,
+                threads,
+                options,
+                db_name=db_name,
+                all_sequences=all_sequences,
+            )
         out_file = os.path.join(tmp_dir, "bulk_results.tsv")
         print(
             f"Bulk search: {len(all_sequences)} sequences × streamed pressed "
@@ -2368,23 +2388,32 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                 "sequence_id\thmm_name\tbitscore\tevalue\tc_evalue\ti_evalue\t"
                 "env_from\tenv_to\tdom_bitscore\tali_from\tali_to\thmm_from\thmm_to\n"
             )
-            for chunk_index, hmm_chunk in enumerate(
-                    hmms.chunks(HMM_CHUNK_SIZE), 1):
-                print(
-                    f"  Chunk {chunk_index} ({len(hmm_chunk)} HMMs)...",
-                    end="",
-                    flush=True,
-                )
-                hit_iterator = pyhmmer.hmmsearch(
-                    hmm_chunk, all_sequences, cpus=threads, **kwargs
-                )
-                for hits in hit_iterator:
-                    process_hits_to_file(hits, fh)
-                hit_iterator = None
-                hits = None
-                hmm_chunk = None
-                gc.collect()
-                print(" done")
+            profile_chunks = hmms.chunks(HMM_CHUNK_SIZE)
+            try:
+                for chunk_index, hmm_chunk in enumerate(profile_chunks, 1):
+                    print(
+                        f"  Chunk {chunk_index} ({len(hmm_chunk)} HMMs)...",
+                        end="",
+                        flush=True,
+                    )
+                    hit_iterator = pyhmmer.hmmsearch(
+                        hmm_chunk, all_sequences, cpus=threads, **kwargs
+                    )
+                    hits = None
+                    try:
+                        for hits in hit_iterator:
+                            process_hits_to_file(hits, fh)
+                    finally:
+                        close = getattr(hit_iterator, "close", None)
+                        if close is not None:
+                            close()
+                        hit_iterator = None
+                        hits = None
+                        hmm_chunk = None
+                    gc.collect()
+                    print(" done")
+            finally:
+                profile_chunks.close()
         gc.collect()
         return tmp_dir
 
@@ -2657,6 +2686,15 @@ class _PressedHMMStream:
                     chunk = []
             if chunk:
                 yield chunk
+
+    def all_have_cutoff(self, cutoff):
+        method_name = f"{cutoff}_available"
+        with pyhmmer.plan7.HMMFile(self.pressed_base) as hmm_file:
+            for hmm in hmm_file:
+                method = getattr(hmm.cutoffs, method_name, None)
+                if method is None or not method():
+                    return False
+        return True
 
 
 def _stream_pressed_cpu_enabled():
