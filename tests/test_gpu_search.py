@@ -2376,6 +2376,188 @@ class GPUProfileOverlapTests(unittest.TestCase):
                 )
         self.assertEqual(output.getvalue(), "0\n")
 
+    def test_continuation_wait_interrupt_retires_future_before_buffer(self):
+        class CoordinatorInterrupt(KeyboardInterrupt):
+            pass
+
+        class CleanupInterrupt(RuntimeError):
+            pass
+
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        worker_terminal = threading.Event()
+        buffers = []
+
+        class TrackedBuffer(io.StringIO):
+            def __init__(self):
+                super().__init__()
+                self.read_before_terminal = False
+                self.close_before_terminal = False
+                self.close_count = 0
+                buffers.append(self)
+
+            def getvalue(self):
+                self.read_before_terminal |= not worker_terminal.is_set()
+                return super().getvalue()
+
+            def close(self):
+                self.close_before_terminal |= not worker_terminal.is_set()
+                self.close_count += 1
+                super().close()
+
+        class InterruptingFuture:
+            def __init__(self, function, args, kwargs):
+                self._done = threading.Event()
+                self._result = None
+                self._error = None
+                self.result_calls = 0
+                self.cancel_calls = 0
+                self.thread = threading.Thread(target=self._run)
+                self._function = function
+                self._args = args
+                self._kwargs = kwargs
+                self.thread.start()
+
+            def _run(self):
+                try:
+                    self._result = self._function(
+                        *self._args, **self._kwargs
+                    )
+                except BaseException as error:
+                    self._error = error
+                finally:
+                    worker_terminal.set()
+                    self._done.set()
+
+            def result(self, timeout=None):
+                self.result_calls += 1
+                if self.result_calls == 1:
+                    self_outer.assertTrue(worker_started.wait(2))
+                    self_outer.assertFalse(self.done())
+                    raise CoordinatorInterrupt("coordinator wait interrupted")
+                release_worker.set()
+                if not self._done.wait(timeout):
+                    raise TimeoutError()
+                if self._error is not None:
+                    raise self._error
+                return self._result
+
+            def cancel(self):
+                self.cancel_calls += 1
+                return False
+
+            def done(self):
+                return self._done.is_set()
+
+        class InterruptingExecutor:
+            instances = []
+
+            def __init__(self, *_args, **_kwargs):
+                self.futures = []
+                self.shutdown_calls = 0
+                self.instances.append(self)
+
+            def submit(self, function, *args, **kwargs):
+                future = InterruptingFuture(function, args, kwargs)
+                self.futures.append(future)
+                return future
+
+            def shutdown(self, **_kwargs):
+                self.shutdown_calls += 1
+                if self.shutdown_calls == 1:
+                    raise CleanupInterrupt("executor shutdown interrupted")
+
+        class Selection:
+            indices = (0,)
+
+            def close(self):
+                pass
+
+        class Session:
+            statistics = {"worker_count": 0, "host_bytes": 0}
+
+            def select(self, _indices):
+                return Selection()
+
+        class Candidate:
+            resident_bytes = 10
+            indices = (0,)
+
+        class Batch:
+            def _postfilter_forward_selection(self, *_args):
+                return Candidate()
+
+        def gpu_search(_chunk, candidates, **_options):
+            def results():
+                worker_started.set()
+                self.assertTrue(release_worker.wait(2))
+                yield candidates.indices
+
+            return results()
+
+        pair = self.pair()
+        kwargs = {}
+        modules, _ = synthetic_plan7_gpu(True)
+        modules["plan7_gpu.astra_search"]._hmmsearch_with_continuation_pool = (
+            gpu_search
+        )
+        output = io.StringIO()
+        self_outer = self
+        try:
+            with (
+                mock.patch.dict(sys.modules, modules),
+                mock.patch.object(
+                    search, "ThreadPoolExecutor", InterruptingExecutor
+                ),
+                mock.patch.object(
+                    search,
+                    "io",
+                    SimpleNamespace(StringIO=TrackedBuffer),
+                ),
+                mock.patch.object(
+                    search,
+                    "process_hits_to_file",
+                    side_effect=lambda hits, handle: handle.write(
+                        f"{hits[0]}\n"
+                    ),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    CoordinatorInterrupt, "coordinator wait interrupted"
+                ):
+                    search._run_gpu_profile_pipeline(
+                        [(1, [pair], (0,), kwargs)],
+                        Session(),
+                        Batch(),
+                        2,
+                        output,
+                        ready_queue_configuration=(1, None),
+                        continuation_pools={id(kwargs): object()},
+                        continuation_window=2,
+                    )
+        finally:
+            release_worker.set()
+            for executor in InterruptingExecutor.instances:
+                for future in executor.futures:
+                    future.thread.join(2)
+
+        self.assertEqual(output.getvalue(), "")
+        self.assertTrue(worker_terminal.is_set())
+        self.assertEqual(len(InterruptingExecutor.instances), 1)
+        executor = InterruptingExecutor.instances[0]
+        self.assertEqual(executor.shutdown_calls, 2)
+        self.assertEqual(len(executor.futures), 1)
+        future = executor.futures[0]
+        self.assertEqual(future.result_calls, 2)
+        self.assertEqual(future.cancel_calls, 1)
+        self.assertTrue(future.done())
+        self.assertEqual(len(buffers), 1)
+        buffer = buffers[0]
+        self.assertFalse(buffer.read_before_terminal)
+        self.assertFalse(buffer.close_before_terminal)
+        self.assertEqual(buffer.close_count, 1)
+        self.assertTrue(buffer.closed)
+
     def test_overweight_candidate_error_remains_behind_earlier_output(self):
         pairs = [self.pair() for _ in range(3)]
         selections = []

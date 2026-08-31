@@ -14,7 +14,10 @@ from threading import Condition, Event, Lock, Thread
 from typing import NamedTuple
 from tqdm import tqdm
 import pyhmmer
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+)
 from astra import initialize
 from astra import rp16 as rp16_module
 
@@ -2194,6 +2197,10 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                 interval = future.result()
             except BaseException as error:
                 if not future.done():
+                    # The wait, rather than the coordinator task, was
+                    # interrupted.  Keep the future and its buffer in the
+                    # pending deque: cleanup owns both until the task reaches
+                    # a terminal state.
                     raise
                 try:
                     interval = future.result()
@@ -2531,6 +2538,19 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                     continue
                 break
         if continuation_executor is not None:
+            # A wait on Future.result() may itself be interrupted while its
+            # coordinator task is still using the StringIO.  Cancel work that
+            # has not started, then retire every still-tracked future before
+            # closing any of its buffers.  Futures removed from the deque have
+            # already returned from result() and are therefore terminal.
+            for _position, future, _buffer, _bytes, _spec in (
+                pending_continuations
+            ):
+                try:
+                    future.cancel()
+                except BaseException as error:
+                    if join_error is None:
+                        join_error = error
             while True:
                 try:
                     continuation_executor.shutdown(
@@ -2542,11 +2562,24 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                         join_error = error
                     continue
                 break
+            for _position, future, _buffer, _bytes, _spec in (
+                pending_continuations
+            ):
+                while not future.done():
+                    try:
+                        future.result(timeout=0.05)
+                    except FutureTimeoutError:
+                        continue
+                    except BaseException as error:
+                        # A terminal exception belongs to the worker and is
+                        # already ordered behind the active pipeline error.
+                        # Only preserve interruptions of this cleanup wait.
+                        if not future.done() and join_error is None:
+                            join_error = error
             while pending_continuations:
                 _position, future, output_buffer, _bytes, _spec = (
                     pending_continuations.popleft()
                 )
-                future.cancel()
                 output_buffer.close()
         discard_ready()
         if ready_byte_capacity is None:
