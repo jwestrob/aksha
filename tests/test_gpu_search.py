@@ -611,6 +611,27 @@ class GPUConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(search.GPUConfigurationError, "at most"):
             search.gpu_hmm_chunk_size(100_000_001)
 
+    def test_gpu_profile_cell_cap_is_explicit_and_does_not_widen_target_limit(self):
+        with mock.patch.dict(
+            os.environ,
+            {search.GPU_PROFILE_CELL_CAP_ENV: "200000000"},
+            clear=False,
+        ):
+            self.assertEqual(search.gpu_profile_cell_cap(), 200_000_000)
+            self.assertEqual(search.gpu_hmm_chunk_size(300_186), 666)
+            with self.assertRaisesRegex(search.GPUConfigurationError, "at most"):
+                search.gpu_hmm_chunk_size(100_000_001)
+        for invalid in ("", "0", "150000000", "400000001", "banana"):
+            with self.subTest(invalid=invalid), mock.patch.dict(
+                os.environ,
+                {search.GPU_PROFILE_CELL_CAP_ENV: invalid},
+                clear=False,
+            ):
+                with self.assertRaisesRegex(
+                    search.GPUConfigurationError, "accepts only"
+                ):
+                    search.gpu_profile_cell_cap()
+
     def test_profile_worker_allocation_reserves_one_control_slot(self):
         self.assertEqual(
             search.gpu_profile_worker_allocation(1, True),

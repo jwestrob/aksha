@@ -23,6 +23,8 @@ HMM_CHUNK_SIZE = 2000
 CPU_STREAM_PRESSED_ENV = "ASTRA_CPU_STREAM_PRESSED"
 CPU_STREAM_PRESSED_AUTO = "auto"
 GPU_CELL_CAP = 100_000_000
+GPU_PROFILE_CELL_CAP_ENV = 'ASTRA_GPU_PROFILE_CELL_CAP'
+GPU_PROFILE_CELL_CAPS = (100_000_000, 200_000_000, 300_000_000, 400_000_000)
 GPU_TIMING_ENV = 'ASTRA_GPU_OVERLAP_TIMING'
 GPU_SERIAL_ENV = 'ASTRA_GPU_PROFILE_SERIAL'
 GPU_LEGACY_OVERLAP_ENV = 'ASTRA_GPU_PROFILE_LEGACY_OVERLAP'
@@ -235,6 +237,19 @@ class GPUOverlapMetrics:
         }
 
 
+def gpu_profile_cell_cap():
+    """Return the private exact profile-by-target chunk ceiling."""
+    value = os.environ.get(GPU_PROFILE_CELL_CAP_ENV)
+    if value is None:
+        return GPU_CELL_CAP
+    allowed = tuple(str(cap) for cap in GPU_PROFILE_CELL_CAPS)
+    if value not in allowed:
+        raise GPUConfigurationError(
+            f"{GPU_PROFILE_CELL_CAP_ENV} accepts only {', '.join(allowed)}"
+        )
+    return int(value)
+
+
 def gpu_hmm_chunk_size(sequence_count):
     """Bound one GPU candidate matrix while retaining Astra's 2,000-HMM cap."""
     if sequence_count > GPU_CELL_CAP:
@@ -242,9 +257,10 @@ def gpu_hmm_chunk_size(sequence_count):
             f"explicit GPU search supports at most {GPU_CELL_CAP:,} targets; "
             f"received {sequence_count:,}"
         )
+    profile_cell_cap = gpu_profile_cell_cap()
     return min(
         HMM_CHUNK_SIZE,
-        max(1, GPU_CELL_CAP // max(1, sequence_count)),
+        max(1, profile_cell_cap // max(1, sequence_count)),
     )
 
 
