@@ -737,6 +737,28 @@ class GPUConfigurationTests(unittest.TestCase):
             ):
                 search.gpu_ready_queue_configuration()
 
+    def test_continuation_window_configuration_is_exact(self):
+        environment = search.GPU_CONTINUATION_WINDOW_ENV
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(search._gpu_continuation_window(), 1)
+        for value in ("1", "2", "4"):
+            with self.subTest(value=value):
+                with mock.patch.dict(
+                    os.environ, {environment: value}, clear=True
+                ):
+                    self.assertEqual(
+                        search._gpu_continuation_window(), int(value)
+                    )
+        for value in ("", "0", "01", "3", "8", "+2", " 2", "2 "):
+            with self.subTest(value=value):
+                with mock.patch.dict(
+                    os.environ, {environment: value}, clear=True
+                ):
+                    with self.assertRaisesRegex(
+                        search.GPUConfigurationError, "accepts only"
+                    ):
+                        search._gpu_continuation_window()
+
     def test_invalid_ready_queue_configuration_precedes_output_creation(self):
         pair = SimpleNamespace(cutoffs=SimpleNamespace(
             gathering=None, noise=None, trusted=None
@@ -1345,6 +1367,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
             None,
             True,
             (1, None),
+            continuation_window=1,
             telemetry_collector=collector,
             sparse_journal_v3=True,
             continuation_pools=None,
@@ -2103,6 +2126,95 @@ class GPUProfileOverlapTests(unittest.TestCase):
         self.assertEqual(snapshot["ready_queue_high_water"], 2)
         self.assertEqual(snapshot["ready_queue_byte_high_water"], 20)
         self.assertGreaterEqual(snapshot["producer_idle_count"], 1)
+
+    def test_continuation_window_overlaps_calls_and_writes_canonically(self):
+        pairs = [self.pair() for _ in range(3)]
+        kwargs = {}
+        active = 0
+        maximum_active = 0
+        active_lock = threading.Lock()
+        second_started = threading.Event()
+
+        class Selection:
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+
+            def close(self):
+                pass
+
+        class Session:
+            statistics = {"worker_count": 0, "host_bytes": 0}
+
+            def select(self, indices):
+                return Selection(indices)
+
+        class Candidate:
+            resident_bytes = 10
+
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+
+        class Batch:
+            def _postfilter_forward_selection(self, selection, *_args):
+                return Candidate(selection.indices)
+
+        def gpu_search(_chunk, candidates, **_options):
+            def results():
+                nonlocal active, maximum_active
+                with active_lock:
+                    active += 1
+                    maximum_active = max(maximum_active, active)
+                try:
+                    if candidates.indices == (0,):
+                        self.assertTrue(second_started.wait(2))
+                    elif candidates.indices == (1,):
+                        second_started.set()
+                    yield candidates.indices
+                finally:
+                    with active_lock:
+                        active -= 1
+
+            return results()
+
+        chunks = [
+            (index + 1, [pair], (index,), kwargs)
+            for index, pair in enumerate(pairs)
+        ]
+        modules, _ = synthetic_plan7_gpu(True)
+        modules["plan7_gpu.astra_search"]._hmmsearch_with_continuation_pool = (
+            gpu_search
+        )
+        metrics = search.GPUOverlapMetrics()
+        output = io.StringIO()
+        with (
+            mock.patch.dict(sys.modules, modules),
+            mock.patch.object(
+                search,
+                "process_hits_to_file",
+                side_effect=lambda hits, handle: handle.write(f"{hits[0]}\n"),
+            ),
+        ):
+            search._run_gpu_profile_pipeline(
+                chunks,
+                Session(),
+                Batch(),
+                2,
+                output,
+                metrics,
+                ready_queue_configuration=(1, None),
+                continuation_pools={id(kwargs): object()},
+                continuation_window=2,
+            )
+
+        self.assertEqual(output.getvalue(), "0\n1\n2\n")
+        self.assertGreaterEqual(maximum_active, 2)
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["continuation_window"], 2)
+        self.assertEqual(snapshot["continuation_window_high_water"], 2)
+        self.assertEqual(snapshot["generated_candidate_bytes"], 30)
+        self.assertEqual(snapshot["consumed_candidate_bytes"], 30)
+        self.assertEqual(snapshot["live_candidate_capacity"], 4)
+        self.assertEqual(snapshot["consumed_chunk_count"], 3)
 
     def test_overweight_candidate_error_remains_behind_earlier_output(self):
         pairs = [self.pair() for _ in range(3)]
