@@ -153,7 +153,7 @@ class GPUOverlapMetrics:
         self.continuation_worker_count = 0
         self.continuation_window = 1
         self.continuation_window_high_water = 0
-        self.continuation_output_buffer_high_water_bytes = 0
+        self.continuation_maximum_chunk_output_bytes = 0
         self.profile_overlap_enabled = False
         self.scheduler_mode = 'none'
         self.profile_host_bytes = 0
@@ -191,6 +191,7 @@ class GPUOverlapMetrics:
         self.initial_generation_wait_seconds = 0.0
         self.pipeline_stall_seconds = 0.0
         self.continuation_seconds = 0.0
+        self.continuation_call_seconds = 0.0
         self.continuation_pool_enabled = False
         self.continuation_pool_call_count = 0
         self.continuation_pipeline_count = 0
@@ -217,8 +218,8 @@ class GPUOverlapMetrics:
             'continuation_window_high_water': (
                 self.continuation_window_high_water
             ),
-            'continuation_output_buffer_high_water_bytes': (
-                self.continuation_output_buffer_high_water_bytes
+            'continuation_maximum_chunk_output_bytes': (
+                self.continuation_maximum_chunk_output_bytes
             ),
             'profile_overlap_enabled': self.profile_overlap_enabled,
             'scheduler_mode': self.scheduler_mode,
@@ -265,6 +266,7 @@ class GPUOverlapMetrics:
             'initial_generation_wait_seconds': self.initial_generation_wait_seconds,
             'pipeline_stall_seconds': self.pipeline_stall_seconds,
             'continuation_seconds': self.continuation_seconds,
+            'continuation_call_seconds': self.continuation_call_seconds,
             'continuation_pool_enabled': self.continuation_pool_enabled,
             'continuation_pool_call_count': self.continuation_pool_call_count,
             'continuation_pipeline_count': self.continuation_pipeline_count,
@@ -287,6 +289,41 @@ class GPUOverlapMetrics:
                 dict(record) for record in self.continuation_records
             ],
         }
+
+
+def _merged_time_intervals(records, started_key, finished_key):
+    intervals = sorted(
+        (record[started_key], record[finished_key])
+        for record in records
+    )
+    merged = []
+    for started, finished in intervals:
+        if finished < started:
+            raise RuntimeError("timing interval finished before it started")
+        if merged and started <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], finished))
+        else:
+            merged.append((started, finished))
+    return merged
+
+
+def _interval_intersection_seconds(left, right):
+    total = 0.0
+    left_index = 0
+    right_index = 0
+    while left_index < len(left) and right_index < len(right):
+        left_started, left_finished = left[left_index]
+        right_started, right_finished = right[right_index]
+        total += max(
+            0.0,
+            min(left_finished, right_finished)
+            - max(left_started, right_started),
+        )
+        if left_finished <= right_finished:
+            left_index += 1
+        else:
+            right_index += 1
+    return total
 
 
 def gpu_hmm_chunk_size(sequence_count):
@@ -1412,10 +1449,12 @@ def _gpu_hmmsearch_entrypoint(continuation_pool=False):
 def _consume_gpu_candidate_chunk(spec, candidates, total_chunks, threads, fh,
                                  gpu_hmmsearch, gpu_metrics,
                                  telemetry_collector=None,
-                                 continuation_pool=None):
+                                 continuation_pool=None,
+                                 commit_progress=True):
     chunk_index, hmm_chunk, _, kwargs = spec
-    print(f"  Chunk {chunk_index}/{total_chunks} "
-          f"({len(hmm_chunk)} HMMs)...", end="", flush=True)
+    if commit_progress:
+        print(f"  Chunk {chunk_index}/{total_chunks} "
+              f"({len(hmm_chunk)} HMMs)...", end="", flush=True)
     hit_iterator = None
     hits = None
     completed = False
@@ -1480,6 +1519,7 @@ def _consume_gpu_candidate_chunk(spec, candidates, total_chunks, threads, fh,
         if gpu_metrics is not None:
             with gpu_metrics._lock:
                 gpu_metrics.continuation_seconds += finished - started
+                gpu_metrics.continuation_call_seconds += finished - started
                 gpu_metrics.continuation_records.append({
                     'chunk_index': chunk_index,
                     'profile_indices': tuple(spec[2]),
@@ -1491,10 +1531,11 @@ def _consume_gpu_candidate_chunk(spec, candidates, total_chunks, threads, fh,
                 })
         hit_iterator = None
         hits = None
-    if gpu_metrics is not None:
+    if gpu_metrics is not None and commit_progress:
         with gpu_metrics._lock:
             gpu_metrics.consumed_chunk_count += 1
-    print(" done")
+    if commit_progress:
+        print(" done")
     return started, finished
 
 
@@ -1580,7 +1621,8 @@ def _generate_gpu_profile_candidates_for_run(
 
 def _consume_gpu_candidate_chunk_for_run(
         spec, candidates, total_chunks, threads, fh, gpu_hmmsearch,
-        gpu_metrics, telemetry_collector, continuation_pools=None):
+        gpu_metrics, telemetry_collector, continuation_pools=None,
+        commit_progress=True):
     """Preserve ordinary TopHits consumption unless telemetry is explicit."""
     if telemetry_collector is None:
         return _consume_gpu_candidate_chunk(
@@ -1596,6 +1638,7 @@ def _consume_gpu_candidate_chunk_for_run(
                 if continuation_pools is None
                 else continuation_pools[id(spec[3])]
             ),
+            commit_progress=commit_progress,
         )
     return _consume_gpu_candidate_chunk(
         spec,
@@ -1611,6 +1654,7 @@ def _consume_gpu_candidate_chunk_for_run(
             if continuation_pools is None
             else continuation_pools[id(spec[3])]
         ),
+        commit_progress=commit_progress,
     )
 
 
@@ -1897,6 +1941,10 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
             raise ValueError(
                 "concurrent continuation does not support route telemetry"
             )
+        if len({id(spec[3]) for spec in chunks}) != 1:
+            raise ValueError(
+                "concurrent continuation requires one Pipeline option group"
+            )
 
     gpu_hmmsearch = _gpu_hmmsearch_entrypoint(
         continuation_pool=continuation_pools is not None
@@ -2128,27 +2176,75 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
     consumption_intervals = []
     continuation_executor = None
     pending_continuations = deque()
+    pending_pool_key = None
 
     def finish_oldest_continuation():
+        nonlocal pending_pool_key
         (
             _position,
             future,
             output_buffer,
             candidate_bytes,
-        ) = pending_continuations.popleft()
+            spec,
+        ) = pending_continuations[0]
+        continuation_error = None
+        committed_entry = False
         try:
-            interval = future.result()
+            try:
+                interval = future.result()
+            except BaseException as error:
+                if not future.done():
+                    raise
+                try:
+                    interval = future.result()
+                except BaseException as worker_error:
+                    interval = None
+                    continuation_error = worker_error
+                else:
+                    # The worker completed successfully while the coordinator
+                    # wait itself was interrupted.  Preserve the interruption
+                    # and leave the buffer owned by cleanup; never commit a
+                    # speculative partial/complete chunk after cancellation.
+                    raise error
+            committed = pending_continuations.popleft()
+            committed_entry = True
+            if committed[1] is not future:
+                raise RuntimeError(
+                    "continuation window changed canonical future order"
+                )
             rendered = output_buffer.getvalue()
             fh.write(rendered)
             if gpu_metrics is not None:
                 gpu_metrics.consumed_candidate_bytes += candidate_bytes
-                gpu_metrics.continuation_output_buffer_high_water_bytes = max(
-                    gpu_metrics.continuation_output_buffer_high_water_bytes,
+                gpu_metrics.continuation_maximum_chunk_output_bytes = max(
+                    gpu_metrics.continuation_maximum_chunk_output_bytes,
                     len(rendered.encode('utf-8')),
                 )
-            consumption_intervals.append(interval)
+            if interval is not None:
+                consumption_intervals.append(interval)
+            if continuation_error is None:
+                if gpu_metrics is not None:
+                    with gpu_metrics._lock:
+                        gpu_metrics.consumed_chunk_count += 1
+                print(
+                    f"  Chunk {spec[0]}/{len(chunks)} "
+                    f"({len(spec[1])} HMMs)... done"
+                )
         finally:
-            output_buffer.close()
+            if committed_entry:
+                output_buffer.close()
+                if not pending_continuations:
+                    pending_pool_key = None
+        if continuation_error is not None:
+            raise continuation_error
+
+    def finish_all_pending_continuations():
+        while pending_continuations:
+            finish_oldest_continuation()
+
+    def raise_after_pending_continuations(error):
+        finish_all_pending_continuations()
+        raise error
 
     try:
         if continuation_window > 1:
@@ -2160,7 +2256,10 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
         producer_started = True
         for position, spec in enumerate(chunks):
             wait_started = time.perf_counter()
-            item, ready_without_wait = next_ready()
+            try:
+                item, ready_without_wait = next_ready()
+            except BaseException as error:
+                raise_after_pending_continuations(error)
             ready_dequeued = time.perf_counter()
             wait_seconds = ready_dequeued - wait_started
             (
@@ -2177,25 +2276,38 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
             item = None
             if produced_position != position or produced_spec is not spec:
                 candidates = None
-                raise RuntimeError("GPU profile producer changed chunk order")
+                raise_after_pending_continuations(
+                    RuntimeError("GPU profile producer changed chunk order")
+                )
             if gpu_metrics is not None:
                 gpu_metrics.selection_seconds += (
                     selection_finished - selection_started
                 )
             if producer_error is not None:
-                raise producer_error
+                raise_after_pending_continuations(producer_error)
             if generation_started is None or generation_finished is None:
                 candidates = None
-                raise RuntimeError("GPU profile producer omitted generation timing")
-            if ready_byte_capacity is not None:
-                observed_candidate_bytes = _gpu_candidate_resident_bytes(
-                    candidates
+                raise_after_pending_continuations(
+                    RuntimeError(
+                        "GPU profile producer omitted generation timing"
+                    )
                 )
+            if ready_byte_capacity is not None:
+                try:
+                    observed_candidate_bytes = _gpu_candidate_resident_bytes(
+                        candidates
+                    )
+                except BaseException as error:
+                    candidates = None
+                    raise_after_pending_continuations(error)
                 if observed_candidate_bytes != candidate_bytes:
                     candidates = None
-                    raise RuntimeError(
-                        "CandidateBatch.resident_bytes changed while queued: "
-                        f"{candidate_bytes} -> {observed_candidate_bytes}"
+                    raise_after_pending_continuations(
+                        RuntimeError(
+                            "CandidateBatch.resident_bytes changed while "
+                            f"queued: {candidate_bytes} -> "
+                            f"{observed_candidate_bytes}"
+                        )
                     )
             if gpu_metrics is not None:
                 gpu_metrics.generated_chunk_count += 1
@@ -2225,7 +2337,10 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                     'ready_without_wait': ready_without_wait,
                     'candidate_resident_bytes': (
                         candidate_bytes
-                        if ready_byte_capacity is not None
+                        if (
+                            ready_byte_capacity is not None
+                            or continuation_window > 1
+                        )
                         else None
                     ),
                 })
@@ -2285,24 +2400,39 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                 candidates = None
                 consumption_intervals.append(consumption_interval)
             else:
+                pool_key = id(spec[3])
+                if (
+                    pending_pool_key is not None
+                    and pending_pool_key != pool_key
+                ):
+                    finish_all_pending_continuations()
+                if pending_pool_key is None:
+                    pending_pool_key = pool_key
                 output_buffer = io.StringIO()
-                future = continuation_executor.submit(
-                    _consume_gpu_candidate_chunk_for_run,
-                    spec,
-                    candidates,
-                    len(chunks),
-                    threads,
-                    output_buffer,
-                    gpu_hmmsearch,
-                    gpu_metrics,
-                    telemetry_collector,
-                    continuation_pools,
-                )
+                try:
+                    future = continuation_executor.submit(
+                        _consume_gpu_candidate_chunk_for_run,
+                        spec,
+                        candidates,
+                        len(chunks),
+                        threads,
+                        output_buffer,
+                        gpu_hmmsearch,
+                        gpu_metrics,
+                        telemetry_collector,
+                        continuation_pools,
+                        False,
+                    )
+                except BaseException as error:
+                    output_buffer.close()
+                    candidates = None
+                    raise_after_pending_continuations(error)
                 pending_continuations.append((
                     position,
                     future,
                     output_buffer,
                     candidate_bytes,
+                    spec,
                 ))
                 candidates = None
                 if gpu_metrics is not None:
@@ -2312,8 +2442,65 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                     )
                 if len(pending_continuations) >= continuation_window:
                     finish_oldest_continuation()
-        while pending_continuations:
-            finish_oldest_continuation()
+        finish_all_pending_continuations()
+        if continuation_executor is not None and gpu_metrics is not None:
+            with gpu_metrics._lock:
+                gpu_metrics.continuation_records.sort(
+                    key=lambda record: record['chunk_index']
+                )
+                generation_intervals = _merged_time_intervals(
+                    gpu_metrics.generation_records,
+                    'generation_started_monotonic_seconds',
+                    'generation_finished_monotonic_seconds',
+                )
+                continuation_intervals = _merged_time_intervals(
+                    gpu_metrics.continuation_records,
+                    'started_monotonic_seconds',
+                    'finished_monotonic_seconds',
+                )
+                gpu_metrics.continuation_seconds = sum(
+                    finished - started
+                    for started, finished in continuation_intervals
+                )
+                gpu_metrics.overlap_seconds = (
+                    _interval_intersection_seconds(
+                        generation_intervals,
+                        continuation_intervals,
+                    )
+                )
+                lookahead_high_water = 0
+                lookahead_start_count = 0
+                for generation_record in gpu_metrics.generation_records:
+                    position = generation_record['position']
+                    generation_started = generation_record[
+                        'generation_started_monotonic_seconds'
+                    ]
+                    generation_lookahead = 0
+                    for consumed_position, continuation_record in enumerate(
+                        gpu_metrics.continuation_records
+                    ):
+                        if consumed_position >= position:
+                            break
+                        if generation_started < continuation_record[
+                            'finished_monotonic_seconds'
+                        ]:
+                            generation_lookahead = max(
+                                generation_lookahead,
+                                position - consumed_position,
+                            )
+                    lookahead_high_water = max(
+                        lookahead_high_water,
+                        generation_lookahead,
+                    )
+                    lookahead_start_count += int(
+                        generation_lookahead >= 2
+                    )
+                gpu_metrics.producer_lookahead_high_water = (
+                    lookahead_high_water
+                )
+                gpu_metrics.producer_lookahead_start_count = (
+                    lookahead_start_count
+                )
     finally:
         active_error = sys.exc_info()[1]
         stop.set()
@@ -2344,9 +2531,19 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                     continue
                 break
         if continuation_executor is not None:
-            continuation_executor.shutdown(wait=True, cancel_futures=True)
+            while True:
+                try:
+                    continuation_executor.shutdown(
+                        wait=True,
+                        cancel_futures=True,
+                    )
+                except BaseException as error:
+                    if join_error is None:
+                        join_error = error
+                    continue
+                break
             while pending_continuations:
-                _position, future, output_buffer, _bytes = (
+                _position, future, output_buffer, _bytes, _spec = (
                     pending_continuations.popleft()
                 )
                 future.cancel()
@@ -2539,6 +2736,11 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
             raise GPUConfigurationError(
                 f"{GPU_CONTINUATION_WINDOW_ENV}>1 requires the bounded "
                 "ready-queue scheduler"
+            )
+        if telemetry_collector is not None:
+            raise GPUConfigurationError(
+                f"{GPU_CONTINUATION_WINDOW_ENV}>1 does not support route "
+                "telemetry"
             )
     continuation_threads = _gpu_continuation_worker_count(
         continuation_threads,

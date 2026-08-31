@@ -2260,6 +2260,122 @@ class GPUProfileOverlapTests(unittest.TestCase):
         self.assertEqual(snapshot["live_candidate_capacity"], 4)
         self.assertEqual(snapshot["consumed_chunk_count"], 3)
 
+    def test_continuation_window_preserves_prefix_and_failure_order(self):
+        class FirstFailure(RuntimeError):
+            pass
+
+        class LaterGenerationFailure(RuntimeError):
+            pass
+
+        class Selection:
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+
+            def close(self):
+                pass
+
+        class Session:
+            statistics = {"worker_count": 0, "host_bytes": 0}
+
+            def select(self, indices):
+                return Selection(indices)
+
+        class Candidate:
+            resident_bytes = 10
+
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+
+        pair = self.pair()
+        kwargs = {}
+        chunks = [
+            (index + 1, [pair], (index,), kwargs)
+            for index in range(2)
+        ]
+        modules, _ = synthetic_plan7_gpu(True)
+
+        class PrefixBatch:
+            def _postfilter_forward_selection(self, selection, *_args):
+                return Candidate(selection.indices)
+
+        def prefix_search(_chunk, candidates, **_options):
+            def results():
+                yield candidates.indices
+                if candidates.indices == (0,):
+                    raise FirstFailure("first-continuation-failure")
+
+            return results()
+
+        modules["plan7_gpu.astra_search"]._hmmsearch_with_continuation_pool = (
+            prefix_search
+        )
+        output = io.StringIO()
+        with (
+            mock.patch.dict(sys.modules, modules),
+            mock.patch.object(
+                search,
+                "process_hits_to_file",
+                side_effect=lambda hits, handle: handle.write(f"{hits[0]}\n"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                FirstFailure, "first-continuation-failure"
+            ):
+                search._run_gpu_profile_pipeline(
+                    chunks,
+                    Session(),
+                    PrefixBatch(),
+                    2,
+                    output,
+                    ready_queue_configuration=(1, None),
+                    continuation_pools={id(kwargs): object()},
+                    continuation_window=2,
+                )
+        self.assertEqual(output.getvalue(), "0\n")
+
+        generation_failed = threading.Event()
+
+        class LaterFailureBatch:
+            def _postfilter_forward_selection(self, selection, *_args):
+                if selection.indices == (1,):
+                    generation_failed.set()
+                    raise LaterGenerationFailure("later-generation-failure")
+                return Candidate(selection.indices)
+
+        def delayed_first_search(_chunk, candidates, **_options):
+            def results():
+                self.assertTrue(generation_failed.wait(2))
+                yield candidates.indices
+
+            return results()
+
+        modules["plan7_gpu.astra_search"]._hmmsearch_with_continuation_pool = (
+            delayed_first_search
+        )
+        output = io.StringIO()
+        with (
+            mock.patch.dict(sys.modules, modules),
+            mock.patch.object(
+                search,
+                "process_hits_to_file",
+                side_effect=lambda hits, handle: handle.write(f"{hits[0]}\n"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                LaterGenerationFailure, "later-generation-failure"
+            ):
+                search._run_gpu_profile_pipeline(
+                    chunks,
+                    Session(),
+                    LaterFailureBatch(),
+                    2,
+                    output,
+                    ready_queue_configuration=(1, None),
+                    continuation_pools={id(kwargs): object()},
+                    continuation_window=2,
+                )
+        self.assertEqual(output.getvalue(), "0\n")
+
     def test_overweight_candidate_error_remains_behind_earlier_output(self):
         pairs = [self.pair() for _ in range(3)]
         selections = []
