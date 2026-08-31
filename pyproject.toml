@@ -38,7 +38,7 @@ Repository = "https://github.com/jwestrob/aksha"
 Issues = "https://github.com/jwestrob/aksha/issues"
 
 [project.scripts]
-astra = "astra.main:main"
+astra = "astra._launcher:main"
 
 [tool.setuptools.packages.find]
 include = ["astra*"]
