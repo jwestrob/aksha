@@ -28,15 +28,22 @@ historical Astra PFAM process peak was already lower at 2.501 GiB.  The acute
 gap is therefore the long-profile KOFAM execution shape, not a universal
 Astra object leak.
 
-## Prototype
+## Production policy
 
-Commit `41d0965` adds an opt-in private `_PressedHMMStream` selected by
-`ASTRA_CPU_STREAM_PRESSED=1`.  It applies only to ordinary bulk CPU search
-with a fixed threshold policy.  The pressed database is reopened once and
-read in existing 2,000-profile chunks.  A completed chunk and all of its HMM
-objects are released before the next chunk is read.  GPU, cascade, and
-MacSyFinder paths retain their established behavior.  Public APIs are
-unchanged.
+The private `_PressedHMMStream` applies only to ordinary bulk CPU search of an
+installed pressed database under one fixed threshold policy.  A conservative
+selector enables it automatically only when the database spans more than one
+existing 2,000-profile chunk.  The pressed database is reopened once and read
+in bounded chunks; a completed chunk and all of its HMM objects are released
+before the next chunk is read.  GPU, cascade, MacSyFinder, custom/unpressed,
+multiple-cutoff-family, and tiny-database paths retain their established eager
+behavior.  Public APIs are unchanged.
+
+`ASTRA_CPU_STREAM_PRESSED=auto` is the default.  `0` disables the optimization
+and `1` explicitly requests it, but `1` cannot override any semantic or tiny-
+database guard.  Invalid values fail explicitly.  Each installed CPU database
+prints and logs a machine-readable decision containing the policy, enabled or
+fallback state, reason, cutoff family, and number of profiles inspected.
 
 The retained implementation preflights fixed GA/NC/TC availability with a
 bounded one-profile-at-a-time pass.  If a pressed database mixes profiles
@@ -45,14 +52,13 @@ before executing any query; this preserves the eager path's global cutoff
 grouping, profile/output order, and error order.  The profile-chunk generator
 and each result iterator are also closed explicitly on completion,
 cancellation, or failure, so the pressed file descriptor cannot outlive the
-search scope.  User-supplied, unpressed, cascade, MacSyFinder, GPU, and default
-non-opt-in paths remain untouched.
+search scope.  User-supplied, unpressed, cascade, MacSyFinder, GPU, and other
+ineligible paths remain untouched.
 
 The unit oracle presses five real toy HMMs, forces 2-profile chunks, and
-compares eager and streamed TSV bytes.  Both tests pass.  The existing GPU
-test module has one pre-existing mock-expectation failure at this parent
-commit because it does not expect the already-retained
-`continuation_pools=None` keyword; the streaming tests do not touch that path.
+compares eager and streamed TSV bytes.  It also covers automatic and explicit
+selection, opt-out, malformed policy, every fallback boundary above, exact
+source ordering, cutoff preflight caching, and decision telemetry.
 
 ## Focused PFAM gate
 

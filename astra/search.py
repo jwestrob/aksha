@@ -10,6 +10,7 @@ from collections import deque
 from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Condition, Event, Thread
+from typing import NamedTuple
 from tqdm import tqdm
 import pyhmmer
 from concurrent.futures import ThreadPoolExecutor
@@ -20,6 +21,7 @@ from astra import rp16 as rp16_module
 PRESSED_SUFFIXES = ('h3m', 'h3i', 'h3f', 'h3p')
 HMM_CHUNK_SIZE = 2000
 CPU_STREAM_PRESSED_ENV = "ASTRA_CPU_STREAM_PRESSED"
+CPU_STREAM_PRESSED_AUTO = "auto"
 GPU_CELL_CAP = 100_000_000
 GPU_TIMING_ENV = 'ASTRA_GPU_OVERLAP_TIMING'
 GPU_SERIAL_ENV = 'ASTRA_GPU_PROFILE_SERIAL'
@@ -36,6 +38,7 @@ GPU_READY_QUEUE_DEPTHS = (1, 2, 4)
 GPU_READY_QUEUE_MAX_BYTES = (1 << 63) - 1
 _NATIVE_TSV_ROWS_UNRESOLVED = object()
 _native_tsv_rows = _NATIVE_TSV_ROWS_UNRESOLVED
+_ASTRA_TSV_RENDERER_ABI = 2
 
 
 class GPUConfigurationError(ValueError):
@@ -1317,6 +1320,41 @@ def extract_sequences(results_or_ids, protein_dict_or_outdir, outdir=None):
                     fh.write(f">{text_seq.name}\n{text_seq.sequence}\n")
 
 
+def _gpu_astra_tsv_capability():
+    """Return the exact worker-rendered ABI objects, or ``(None, None)``."""
+    try:
+        from plan7_gpu import astra_search as gpu_search_module
+    except ImportError:
+        return None, None
+    if (
+        getattr(gpu_search_module, '_ASTRA_TSV_RENDERER_ABI', None)
+        != _ASTRA_TSV_RENDERER_ABI
+    ):
+        return None, None
+    rows_type = getattr(gpu_search_module, '_AstraTSVRows', None)
+    if not isinstance(rows_type, type):
+        return None, None
+    return gpu_search_module, rows_type
+
+
+def _gpu_hmmsearch_entrypoint(continuation_pool=False):
+    """Feature-detect the exact native sink and otherwise use public rows."""
+    from plan7_gpu import astra_search as gpu_search_module
+
+    native_module, _ = _gpu_astra_tsv_capability()
+    if continuation_pool:
+        native_name = '_hmmsearch_astra_tsv_with_continuation_pool'
+        fallback_name = '_hmmsearch_with_continuation_pool'
+    else:
+        native_name = '_hmmsearch_astra_tsv'
+        fallback_name = 'hmmsearch'
+    if native_module is not None:
+        native = getattr(native_module, native_name, None)
+        if callable(native):
+            return native
+    return getattr(gpu_search_module, fallback_name)
+
+
 def _consume_gpu_candidate_chunk(spec, candidates, total_chunks, threads, fh,
                                  gpu_hmmsearch, gpu_metrics,
                                  telemetry_collector=None,
@@ -1327,12 +1365,7 @@ def _consume_gpu_candidate_chunk(spec, candidates, total_chunks, threads, fh,
     hit_iterator = None
     hits = None
     completed = False
-    try:
-        from plan7_gpu.astra_search import _AstraTSVRows
-    except ImportError:
-        rendered_rows_type = None
-    else:
-        rendered_rows_type = _AstraTSVRows
+    _, rendered_rows_type = _gpu_astra_tsv_capability()
     started = time.perf_counter()
     try:
         continuation_options = {}
@@ -1526,21 +1559,9 @@ def _run_gpu_profile_serial(chunks, profile_session, sequence_batch,
                             sparse_journal_v3=False, ga_pruning=False,
                             continuation_pools=None):
     """Run sealed GPU-through-Forward generation as the serial control."""
-    try:
-        from plan7_gpu.astra_search import (
-            _hmmsearch_astra_tsv as gpu_hmmsearch,
-        )
-    except ImportError:
-        from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
-    if continuation_pools is not None:
-        try:
-            from plan7_gpu.astra_search import (
-                _hmmsearch_astra_tsv_with_continuation_pool as gpu_hmmsearch,
-            )
-        except ImportError:
-            from plan7_gpu.astra_search import (
-                _hmmsearch_with_continuation_pool as gpu_hmmsearch,
-            )
+    gpu_hmmsearch = _gpu_hmmsearch_entrypoint(
+        continuation_pool=continuation_pools is not None
+    )
 
     if gpu_metrics is not None:
         statistics = profile_session.statistics
@@ -1617,21 +1638,9 @@ def _run_gpu_profile_single_prefetch(chunks, profile_session, sequence_batch,
     if not chunks:
         return
 
-    try:
-        from plan7_gpu.astra_search import (
-            _hmmsearch_astra_tsv as gpu_hmmsearch,
-        )
-    except ImportError:
-        from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
-    if continuation_pools is not None:
-        try:
-            from plan7_gpu.astra_search import (
-                _hmmsearch_astra_tsv_with_continuation_pool as gpu_hmmsearch,
-            )
-        except ImportError:
-            from plan7_gpu.astra_search import (
-                _hmmsearch_with_continuation_pool as gpu_hmmsearch,
-            )
+    gpu_hmmsearch = _gpu_hmmsearch_entrypoint(
+        continuation_pool=continuation_pools is not None
+    )
 
     if gpu_metrics is not None:
         statistics = profile_session.statistics
@@ -1814,21 +1823,9 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
     if ready_depth != GPU_READY_QUEUE_CAPACITY and ready_byte_capacity is None:
         raise ValueError("deeper ready queues require an exact byte capacity")
 
-    try:
-        from plan7_gpu.astra_search import (
-            _hmmsearch_astra_tsv as gpu_hmmsearch,
-        )
-    except ImportError:
-        from plan7_gpu.astra_search import hmmsearch as gpu_hmmsearch
-    if continuation_pools is not None:
-        try:
-            from plan7_gpu.astra_search import (
-                _hmmsearch_astra_tsv_with_continuation_pool as gpu_hmmsearch,
-            )
-        except ImportError:
-            from plan7_gpu.astra_search import (
-                _hmmsearch_with_continuation_pool as gpu_hmmsearch,
-            )
+    gpu_hmmsearch = _gpu_hmmsearch_entrypoint(
+        continuation_pool=continuation_pools is not None
+    )
 
     if gpu_metrics is not None:
         statistics = profile_session.statistics
@@ -2623,18 +2620,8 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                         )
                         rendered_rows_type = None
                     else:
-                        try:
-                            from plan7_gpu.astra_search import (
-                                _AstraTSVRows,
-                                _hmmsearch_astra_tsv as gpu_hmmsearch,
-                            )
-                        except ImportError:
-                            from plan7_gpu.astra_search import (
-                                hmmsearch as gpu_hmmsearch,
-                            )
-                            rendered_rows_type = None
-                        else:
-                            rendered_rows_type = _AstraTSVRows
+                        gpu_hmmsearch = _gpu_hmmsearch_entrypoint()
+                        _, rendered_rows_type = _gpu_astra_tsv_capability()
                         if gpu_postfilter:
                             hit_iterator = gpu_hmmsearch(
                                 hmm_chunk, gpu_sequence_batch, cpus=threads,
@@ -2715,10 +2702,31 @@ def process_hits_to_file(hits, fh):
             _native_tsv_rows = None
         else:
             renderer = getattr(_pipeline, '_astra_tsv_rows_bound', None)
-            _native_tsv_rows = renderer if callable(renderer) else None
+            unsupported = getattr(
+                _pipeline, '_AstraTSVRendererUnsupported', None
+            )
+            if (
+                getattr(_pipeline, '_ASTRA_TSV_RENDERER_ABI', None)
+                == _ASTRA_TSV_RENDERER_ABI
+                and callable(renderer)
+                and isinstance(unsupported, type)
+                and issubclass(unsupported, ValueError)
+            ):
+                _native_tsv_rows = (renderer, unsupported)
+            else:
+                _native_tsv_rows = None
     if _native_tsv_rows is not None:
-        fh.write(_native_tsv_rows(hits))
-        return
+        renderer, unsupported = _native_tsv_rows
+        try:
+            rows = renderer(hits)
+        except unsupported:
+            # The native ABI deliberately covers only ordinary, sort-key
+            # ordered protein searches.  Preserve the public wrapper path for
+            # every other TopHits shape.
+            pass
+        else:
+            fh.write(rows)
+            return
 
     cog = hits.query.name
     for hit in hits:
@@ -2770,15 +2778,22 @@ def parse_single_hmm(hmm_path):
 class _PressedHMMStream:
     """Re-openable, bounded-memory view of a pressed HMM database.
 
-    This is deliberately private and used only by the opt-in CPU experiment.
-    Each iteration owns its ``HMMFile`` and releases every completed chunk
-    before reading the next one; no public Astra/PyHMMER API changes.
+    This is deliberately private and used only by the eligible installed-DB
+    CPU bulk path.  Each iteration owns its ``HMMFile`` and releases every
+    completed chunk before reading the next one; no public Astra/PyHMMER API
+    changes.
     """
 
-    __slots__ = ("pressed_base",)
+    __slots__ = (
+        "pressed_base",
+        "_cutoff_availability",
+        "_large_profile_audit",
+    )
 
     def __init__(self, pressed_base):
         self.pressed_base = os.fspath(pressed_base)
+        self._cutoff_availability = {}
+        self._large_profile_audit = None
 
     def chunks(self, chunk_size):
         if (isinstance(chunk_size, bool)
@@ -2796,22 +2811,145 @@ class _PressedHMMStream:
                 yield chunk
 
     def all_have_cutoff(self, cutoff):
+        if cutoff in self._cutoff_availability:
+            return self._cutoff_availability[cutoff]
         method_name = f"{cutoff}_available"
         with pyhmmer.plan7.HMMFile(self.pressed_base) as hmm_file:
             for hmm in hmm_file:
                 method = getattr(hmm.cutoffs, method_name, None)
                 if method is None or not method():
+                    self._cutoff_availability[cutoff] = False
                     return False
+        self._cutoff_availability[cutoff] = True
         return True
+
+    def large_enough_for_streaming(self):
+        """Return ``(large, inspected)`` for the current chunk threshold."""
+        threshold = HMM_CHUNK_SIZE
+        cached = self._large_profile_audit
+        if cached is not None and cached[0] == threshold:
+            return cached[1], cached[2]
+        inspected = 0
+        with pyhmmer.plan7.HMMFile(self.pressed_base) as hmm_file:
+            for _ in hmm_file:
+                inspected += 1
+                if inspected > threshold:
+                    result = (threshold, True, inspected)
+                    self._large_profile_audit = result
+                    return True, inspected
+        result = (threshold, False, inspected)
+        self._large_profile_audit = result
+        return False, inspected
+
+
+class _PressedCPUStreamDecision(NamedTuple):
+    """Machine-readable telemetry for installed pressed-profile routing."""
+
+    policy: str
+    enabled: bool
+    reason: str
+    cutoff: object
+    profiles_inspected: int
+
+
+def _stream_pressed_cpu_policy():
+    value = os.environ.get(CPU_STREAM_PRESSED_ENV, CPU_STREAM_PRESSED_AUTO)
+    if value not in (CPU_STREAM_PRESSED_AUTO, "0", "1"):
+        raise ValueError(
+            f"{CPU_STREAM_PRESSED_ENV} must be auto, 0, or 1"
+        )
+    return value
+
+
+def _select_pressed_cpu_stream(
+        pressed_base, options, *, installed=True, gpu=False,
+        macsyfinder=False):
+    """Select the proven bounded CPU source or explain an eager fallback.
+
+    ``ASTRA_CPU_STREAM_PRESSED=1`` requests the optimization but never forces
+    an unproven semantic path.  Both explicit and automatic selection retain
+    the eager implementation for custom/unpressed inputs, GPU execution,
+    cascade thresholds, MacSyFinder output, mixed cutoff availability, and
+    databases no larger than one ordinary profile chunk.
+    """
+    if not installed:
+        return None, _PressedCPUStreamDecision(
+            CPU_STREAM_PRESSED_AUTO, False, "custom-source", None, 0
+        )
+    policy = _stream_pressed_cpu_policy()
+    if pressed_base is None:
+        return None, _PressedCPUStreamDecision(
+            policy, False, "unpressed-source", None, 0
+        )
+    if policy == "0":
+        return None, _PressedCPUStreamDecision(
+            policy, False, "disabled-by-environment", None, 0
+        )
+    if gpu:
+        return None, _PressedCPUStreamDecision(
+            policy, False, "gpu-search", None, 0
+        )
+    if macsyfinder:
+        return None, _PressedCPUStreamDecision(
+            policy, False, "macsyfinder-output", None, 0
+        )
+    if options.get("cascade"):
+        return None, _PressedCPUStreamDecision(
+            policy, False, "cascade-thresholds", None, 0
+        )
+
+    fixed_cutoffs = tuple(
+        cutoff
+        for selected, cutoff in (
+            (options.get("cut_ga"), "gathering"),
+            (options.get("cut_nc"), "noise"),
+            (options.get("cut_tc"), "trusted"),
+        )
+        if selected
+    )
+    if len(fixed_cutoffs) > 1:
+        return None, _PressedCPUStreamDecision(
+            policy, False, "multiple-cutoff-families", None, 0
+        )
+    cutoff = fixed_cutoffs[0] if fixed_cutoffs else None
+    stream = _PressedHMMStream(pressed_base)
+    large, inspected = stream.large_enough_for_streaming()
+    if not large:
+        return None, _PressedCPUStreamDecision(
+            policy, False, "small-profile-database", cutoff, inspected
+        )
+    if cutoff is not None and not stream.all_have_cutoff(cutoff):
+        return None, _PressedCPUStreamDecision(
+            policy,
+            False,
+            f"mixed-{cutoff}-availability",
+            cutoff,
+            inspected,
+        )
+    return stream, _PressedCPUStreamDecision(
+        policy,
+        True,
+        "eligible-fixed-profile-cutoff" if cutoff else "eligible-fixed-global",
+        cutoff,
+        inspected,
+    )
+
+
+def _report_pressed_cpu_stream_decision(decision):
+    status = "enabled" if decision.enabled else "eager-fallback"
+    cutoff = decision.cutoff if decision.cutoff is not None else "global"
+    message = (
+        "CPU pressed-profile stream "
+        f"policy={decision.policy} status={status} reason={decision.reason} "
+        f"cutoff={cutoff} profiles_inspected={decision.profiles_inspected}"
+    )
+    print(f"  {message}")
+    logging.info(message)
 
 
 def _stream_pressed_cpu_enabled():
-    value = os.environ.get(CPU_STREAM_PRESSED_ENV)
-    if value is None:
-        return False
-    if value not in ("0", "1"):
-        raise ValueError(f"{CPU_STREAM_PRESSED_ENV} must be 0 or 1")
-    return value == "1"
+    """Compatibility helper reporting whether policy permits consideration."""
+    return _stream_pressed_cpu_policy() != "0"
 
 def _find_pressed_db(db_dir):
     """Check if a pressed HMM database exists in *db_dir*.
@@ -3352,18 +3490,21 @@ def main(args, *, gpu_profile_session_cache=None):
                     manifest_path = gpu_manifests.get(hmm_db)
                     if manifest_path is None:
                         pressed_base = _find_pressed_db(installation_dir)
-                        stream_pressed = (
-                            _stream_pressed_cpu_enabled()
-                            and pressed_base is not None
-                            and not args.cascade
-                            and macsyfinder_dir is None
+                        db_hmms, stream_decision = (
+                            _select_pressed_cpu_stream(
+                                pressed_base,
+                                hmmsearch_options,
+                                installed=True,
+                                gpu=False,
+                                macsyfinder=macsyfinder_dir is not None,
+                            )
                         )
-                        if stream_pressed:
+                        _report_pressed_cpu_stream_decision(stream_decision)
+                        if db_hmms is not None:
                             print(
                                 "  Streaming pressed profiles with bounded "
                                 f"residency: {pressed_base}"
                             )
-                            db_hmms = _PressedHMMStream(pressed_base)
                             db_name_map = {}
                         else:
                             db_hmms, db_name_map = parse_hmms(installation_dir)

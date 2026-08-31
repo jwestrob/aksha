@@ -381,6 +381,9 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
         native_module.SequenceBatch = CompactNativeSequenceBatch
     else:
         native_module.SequenceBatch = LegacyNativeSequenceBatch
+    astra_search_module._ASTRA_TSV_RENDERER_ABI = (
+        search._ASTRA_TSV_RENDERER_ABI
+    )
     astra_search_module.hmmsearch = api.gpu_hmmsearch
     manifest_module.validate_pressed_manifest = api.validate_pressed_manifest
     telemetry_report_module.TelemetryCollector = TelemetryCollector
@@ -1344,6 +1347,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
             (1, None),
             telemetry_collector=collector,
             sparse_journal_v3=True,
+            continuation_pools=None,
         )
         self.assertEqual(collector.expected_profile_calls, [()])
 
@@ -1528,6 +1532,85 @@ class GPUProfileOverlapTests(unittest.TestCase):
             len(output.getvalue().encode("utf-8")),
         )
         self.assertEqual(snapshot["tsv_consumer_fallback_profile_count"], 0)
+
+    def test_renderer_abi_mismatch_uses_public_source_and_counters(self):
+        class RenderedRows:
+            rows = "must-not-be-consumed\n"
+            row_count = 1
+            byte_count = len(rows)
+
+        modules, api = synthetic_plan7_gpu(True)
+        gpu_module = modules["plan7_gpu.astra_search"]
+        gpu_module._ASTRA_TSV_RENDERER_ABI = 1
+        gpu_module._AstraTSVRows = RenderedRows
+        gpu_module._hmmsearch_astra_tsv = mock.Mock(name="unsafe_native_sink")
+        api.gpu_hmmsearch.return_value = iter((RenderedRows(),))
+        metrics = search.GPUOverlapMetrics()
+        spec = (1, [self.pair()], (0,), {"F1": 0.03})
+        with (
+            mock.patch.dict(sys.modules, modules),
+            mock.patch.object(search, "process_hits_to_file") as process,
+        ):
+            entrypoint = search._gpu_hmmsearch_entrypoint()
+            self.assertIs(entrypoint, api.gpu_hmmsearch)
+            search._consume_gpu_candidate_chunk(
+                spec,
+                object(),
+                1,
+                2,
+                io.StringIO(),
+                entrypoint,
+                metrics,
+            )
+        gpu_module._hmmsearch_astra_tsv.assert_not_called()
+        process.assert_called_once()
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["tsv_worker_rendered_profile_count"], 0)
+        self.assertEqual(snapshot["tsv_worker_rendered_row_count"], 0)
+        self.assertEqual(snapshot["tsv_worker_rendered_bytes"], 0)
+        self.assertEqual(snapshot["tsv_consumer_fallback_profile_count"], 1)
+
+    def test_cpu_native_renderer_unsupported_falls_back_to_public_rows(self):
+        class Unsupported(ValueError):
+            pass
+
+        renderer = mock.Mock(side_effect=Unsupported("unsorted"))
+        alignment = SimpleNamespace(
+            target_from=3, target_to=7, hmm_from=2, hmm_to=6
+        )
+        domain = SimpleNamespace(
+            c_evalue=2.0e-5,
+            i_evalue=3.0e-5,
+            env_from=2,
+            env_to=8,
+            score=9.25,
+            alignment=alignment,
+        )
+        hit = SimpleNamespace(
+            included=True,
+            name="target",
+            score=12.5,
+            evalue=1.0e-6,
+            domains=SimpleNamespace(reported=(domain,)),
+        )
+
+        class Hits:
+            query = SimpleNamespace(name="model")
+
+            def __iter__(self):
+                return iter((hit,))
+
+        output = io.StringIO()
+        with mock.patch.object(
+            search, "_native_tsv_rows", (renderer, Unsupported)
+        ):
+            search.process_hits_to_file(Hits(), output)
+        renderer.assert_called_once()
+        self.assertEqual(
+            output.getvalue(),
+            "target\tmodel\t12.50\t1.00e-06\t2.00e-05\t3.00e-05\t"
+            "2\t8\t9.25\t3\t7\t2\t6\n",
+        )
 
     def test_bounded_queue_runs_two_ahead_in_canonical_order(self):
         pairs = [

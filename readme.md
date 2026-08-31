@@ -83,6 +83,21 @@ To perform an HMM search using custom HMM files:
 Astra search --prot_in your_fasta_file --hmm_in custom_db --installed_hmms pre_installed_db --cut_ga --outdir example_output
 ```
 
+#### CPU memory policy
+
+Large ordinary CPU searches of installed pressed databases automatically read
+profiles in bounded chunks.  Custom/unpressed databases, small databases,
+GPU, cascade, and MacSyFinder searches keep the ordinary eager path.  Set
+`ASTRA_CPU_STREAM_PRESSED=0` to disable this optimization; `auto` is the
+default and `1` requests it without overriding the safety checks.
+
+On Linux/glibc, an `astra search --threads 64` (or higher) console invocation
+also starts with a validated 24-arena allocator limit.  Existing
+`MALLOC_ARENA_MAX` values are preserved.  Set
+`ASTRA_CPU_MALLOC_ARENA_MAX=0` to opt out, or set it to a positive integer to
+choose another value.  Programmatic Astra use and lower-thread searches are
+unchanged.
+
 ## Contributing & License
 
 Contributions are welcome! Especially if you have database suggestions. Feel free to raise an issue if you'd like to add a database to the installable list. Feature requests will be considered and implemented if I have the time and ability.
