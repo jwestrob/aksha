@@ -11,9 +11,11 @@ The production CPU command now combines three independently exact changes:
    `TopHits` rows are rendered natively.  Missing, mismatched, long-target,
    unsorted, or malformed private state uses Astra's public wrapper path.
 3. The Linux/glibc console launcher sets `MALLOC_ARENA_MAX=24` before importing
-   PyHMMER for explicit CPU searches with at least 64 threads.  Existing user
-   settings win, `ASTRA_CPU_MALLOC_ARENA_MAX=0` opts out, and other platforms,
-   commands, GPU searches, small thread counts, and library calls are unchanged.
+   PyHMMER for searches with at least 64 threads. Existing user settings win,
+   `ASTRA_CPU_MALLOC_ARENA_MAX=0` opts out (the CPU-specific name is retained
+   for compatibility), and other platforms, commands, small thread counts,
+   and library calls are unchanged. GPU-manifest searches share the same
+   pre-import policy.
 
 ## Exact full-workload evidence
 
@@ -48,10 +50,10 @@ canonical SHA-256
 The retained path reduced process RSS 26.92%, whole-cgroup current memory
 26.72%, sink time 59.11%, and wall 0.32%.
 
-The allocator was also isolated on full PFAM in job 1187652.  At 24 arenas it
+The allocator was also isolated on full PFAM in job 1187652. At 24 arenas it
 reduced RSS 14.59% with a 0.59% wall difference and reproduced the exact PFAM
-oracle.  Its automatic scope remains limited to Linux/glibc CPU searches with
-an explicit thread count of at least 64.
+oracle. Its automatic scope is Linux/glibc console searches with an explicit
+thread count of at least 64, including GPU-manifest searches.
 
 ## MetaCerberus comparison
 

@@ -11,7 +11,7 @@ from unittest import mock
 from astra import _launcher as launcher
 
 
-class CPUAllocatorLauncherTests(unittest.TestCase):
+class AllocatorLauncherTests(unittest.TestCase):
     def test_linux_glibc_detection_is_conservative(self):
         with (
             mock.patch.object(sys, "platform", "darwin"),
@@ -54,24 +54,26 @@ class CPUAllocatorLauncherTests(unittest.TestCase):
         self.assertIsNone(launcher._requested_threads(("--threads",)))
         self.assertIsNone(launcher._requested_threads(("--threads=not-an-int",)))
 
-    def test_default_policy_is_cpu_search_high_thread_only(self):
+    def test_default_policy_is_all_high_thread_search_routes(self):
         accepted = (
-            "search", "--prot_in", "proteins.faa", "--threads", "64"
+            ("search", "--prot_in", "proteins.faa", "--threads", "64"),
+            ("search", "--threads", "64", "--gpu-manifest", "PFAM=x"),
+            ("search", "--threads=64", "--gpu-manifest=PFAM=x"),
+            ("search", "--threads=64", "--gpu-m=PFAM=x"),
+            ("search", "--threads=64", "--g", "PFAM=x"),
         )
         rejected = (
             (),
             ("initialize", "--threads", "64"),
             ("search", "--threads", "63"),
             ("search", "--threads", "not-an-int"),
-            ("search", "--threads", "64", "--gpu-manifest", "PFAM=x"),
-            ("search", "--threads=64", "--gpu-manifest=PFAM=x"),
-            ("search", "--threads=64", "--gpu-m=PFAM=x"),
-            ("search", "--threads=64", "--g", "PFAM=x"),
         )
-        self.assertTrue(launcher._is_cpu_search(accepted))
+        for arguments in accepted:
+            with self.subTest(arguments=arguments):
+                self.assertTrue(launcher._is_high_thread_search(arguments))
         for arguments in rejected:
             with self.subTest(arguments=arguments):
-                self.assertFalse(launcher._is_cpu_search(arguments))
+                self.assertFalse(launcher._is_high_thread_search(arguments))
 
     def test_default_reexec_environment_preserves_every_existing_value(self):
         source = {"PATH": "/bin", "TOKEN": "opaque"}
@@ -136,12 +138,11 @@ class CPUAllocatorLauncherTests(unittest.TestCase):
             self.assertIsNone(
                 launcher._reexec_environment(("initialize",), malformed)
             )
-            self.assertIsNone(
+            with self.assertRaisesRegex(ValueError, launcher._ASTRA_ARENA_ENV):
                 launcher._reexec_environment(
                     ("search", "--threads", "64", "--gpu-manifest=x"),
                     malformed,
                 )
-            )
         with mock.patch.object(launcher, "_is_linux_glibc", return_value=False):
             self.assertIsNone(
                 launcher._reexec_environment(

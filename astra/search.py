@@ -56,6 +56,8 @@ GPU_PRODUCTION_CONTINUATION_WINDOW = 4
 GPU_PRODUCTION_SHARD_TRIGGER = (3, 2)
 GPU_PRODUCTION_PIPELINE_MADVISE_WORK_HINT = 1_300_000_000
 GPU_PRODUCTION_INTRAROW_RELEASE_MIN_BYTES = 16 << 20
+GPU_PRODUCTION_FORWARD_CPU_MAX_CELLS = 200_000
+GPU_PRODUCTION_EVALUE = 1e-15
 GPU_PRODUCTION_OVERRIDE_ENVS = (
     GPU_PROFILE_CELL_CAP_ENV,
     GPU_CHUNK_LOCAL_PROFILE_PACK_ENV,
@@ -77,6 +79,15 @@ GPU_PRODUCTION_OVERRIDE_ENVS = (
     'PLAN7_GPU_FORWARD_CPU_MIN_CELLS',
     'PLAN7_GPU_FORWARD_CPU_MIN_LENGTH',
     'PLAN7_GPU_FORWARD_CPU_MAX_CELLS',
+    'PLAN7_GPU_DOMAIN_OWNERSHIP',
+    'PLAN7_GPU_SEALED_BIAS_VITERBI_SKIP',
+    'PLAN7_GPU_F1_RAW_XE',
+    'PLAN7_GPU_SSV_IDENTITY_PADDING',
+    'PLAN7_GPU_VIT_LENGTH_CACHE',
+    'PLAN7_GPU_FULL_MSV_ARITHMETIC',
+    'PLAN7_GPU_FULL_MSV_POLICY',
+    'PLAN7_GPU_SSV_LENGTH_METADATA',
+    'PLAN7_GPU_SSV_PROFILE_POLICY',
 )
 _NATIVE_TSV_ROWS_UNRESOLVED = object()
 _native_tsv_rows = _NATIVE_TSV_ROWS_UNRESOLVED
@@ -232,51 +243,69 @@ def _configure_gpu_request_page_release(request_tuning):
     intrarow_min_bytes = _gpu_intrarow_release_min_bytes(
         GPU_PRODUCTION_INTRAROW_RELEASE_MIN_BYTES if automatic else None
     )
-    configure_avx = getattr(
-        _pipeline, '_configure_avx512_tail_madvise_bound', None
+    swap_avx = getattr(
+        _pipeline, '_swap_avx512_tail_madvise_bound', None
     )
-    configure_intrarow = getattr(
-        _pipeline, '_configure_intrarow_page_release_bound', None
+    swap_intrarow = getattr(
+        _pipeline, '_swap_intrarow_page_release_bound', None
     )
+    if not automatic and intrarow_min_bytes is None:
+        return None
+    previous_avx = None
+    previous_intrarow = None
     avx_configured = False
     intrarow_configured = False
     _gpu_request_page_release_lock.acquire()
     try:
         if automatic:
-            if not callable(configure_avx):
+            if not callable(swap_avx):
                 raise GPUConfigurationError(
                     "installed plan7_gpu lacks request-scoped AVX page release"
                 )
-            configure_avx(True)
+            previous_avx = swap_avx(True)
             avx_configured = True
         if intrarow_min_bytes is not None:
-            if not callable(configure_intrarow):
+            if not callable(swap_intrarow):
                 raise GPUConfigurationError(
                     "installed plan7_gpu lacks logical intra-row page release"
                 )
-            configure_intrarow(intrarow_min_bytes)
+            previous_intrarow = swap_intrarow(intrarow_min_bytes)
             intrarow_configured = True
     except BaseException:
         try:
             if avx_configured:
-                configure_avx(None)
+                swap_avx(previous_avx)
         finally:
             _gpu_request_page_release_lock.release()
         raise
-    return configure_avx, configure_intrarow, avx_configured, intrarow_configured
+    return (
+        swap_avx,
+        swap_intrarow,
+        avx_configured,
+        intrarow_configured,
+        previous_avx,
+        previous_intrarow,
+    )
 
 
 def _restore_gpu_request_page_release(configuration):
-    configure_avx, configure_intrarow, avx_configured, intrarow_configured = (
-        configuration
-    )
+    if configuration is None:
+        return
+    (
+        swap_avx,
+        swap_intrarow,
+        avx_configured,
+        intrarow_configured,
+        previous_avx,
+        previous_intrarow,
+    ) = configuration
     try:
         if intrarow_configured:
-            configure_intrarow(0)
+            swap_intrarow(previous_intrarow)
     finally:
         try:
             if avx_configured:
-                configure_avx(None)
+                swap_avx(previous_avx)
         finally:
             _gpu_request_page_release_lock.release()
 
@@ -485,7 +514,7 @@ def gpu_production_request_tuning(
         return _disabled_gpu_request_tuning("persistent-cache")
     if any(name in os.environ for name in GPU_PRODUCTION_OVERRIDE_ENVS):
         return _disabled_gpu_request_tuning("explicit-override")
-    if not _gpu_evalue_only_options(options):
+    if not _gpu_production_evalue_options(options):
         return _disabled_gpu_request_tuning("not-evalue-only")
     if type(threads) is not int or threads != GPU_PRODUCTION_THREAD_COUNT:
         return _disabled_gpu_request_tuning("thread-count")
@@ -548,6 +577,13 @@ def _gpu_evalue_only_options(options):
     except (KeyError, TypeError, ValueError, OverflowError):
         return False
     return set(kwargs) == {'E'}
+
+
+def _gpu_production_evalue_options(options):
+    """Recognize the exact finite E=1e-15 production threshold."""
+    if not _gpu_evalue_only_options(options):
+        return False
+    return define_kwargs(options)['E'] == GPU_PRODUCTION_EVALUE
 
 
 def gpu_pressed_profile_stream_configuration(
@@ -1209,6 +1245,7 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
         )
 
     databases = {}
+    selected_request_tuning = None
     if profile_session_cache is None:
         for db_name, (
             pressed_base,
@@ -1216,14 +1253,21 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
             validation,
         ) in database_specs.items():
             profile_count = getattr(validation, 'model_count', None)
-            request_tuning = gpu_production_request_tuning(
-                pressed_base,
-                profile_count,
-                search_options,
-                threads,
-                len(all_sequences),
-                installed_attested=True,
+            request_tuning = (
+                gpu_production_request_tuning(
+                    pressed_base,
+                    profile_count,
+                    search_options,
+                    threads,
+                    len(all_sequences),
+                    installed_attested=True,
+                )
+                if len(database_specs) == 1
+                else _disabled_gpu_request_tuning(
+                    "multiple-mapped-databases"
+                )
             )
+            selected_request_tuning = request_tuning
             if request_tuning_by_db is not None:
                 request_tuning_by_db[db_name] = request_tuning
             stream_enabled, pressed_bytes = (
@@ -1281,10 +1325,17 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
             # still host-only instead of transiently doubling device memory.
             cache_reservation = profile_session_cache.reserve()
         batch_started = time.perf_counter()
-        batch = SequenceBatch(
-            all_sequences,
-            alphabet=pyhmmer.easel.Alphabet.amino(),
-        )
+        batch_arguments = {
+            "alphabet": pyhmmer.easel.Alphabet.amino(),
+        }
+        if (
+            selected_request_tuning is not None
+            and selected_request_tuning.automatic
+        ):
+            batch_arguments["_forward_cpu_max_cells"] = (
+                GPU_PRODUCTION_FORWARD_CPU_MAX_CELLS
+            )
+        batch = SequenceBatch(all_sequences, **batch_arguments)
         batch_seconds = time.perf_counter() - batch_started
         if gpu_metrics is not None:
             for metrics in gpu_metrics.values():

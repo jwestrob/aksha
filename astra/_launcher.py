@@ -1,4 +1,4 @@
-"""Minimal console launcher for Astra's high-thread CPU allocator policy.
+"""Minimal console launcher for Astra's high-thread allocator policy.
 
 This module must remain free of imports from :mod:`astra.main`, PyHMMER, or
 other allocation-heavy runtime modules.  The console entry point can then set
@@ -57,16 +57,14 @@ def _requested_threads(arguments: tuple[str, ...]) -> int | None:
         return None
 
 
-def _is_cpu_search(arguments: tuple[str, ...]) -> bool:
-    """Return whether raw arguments select the validated CPU search path."""
+def _is_high_thread_search(arguments: tuple[str, ...]) -> bool:
+    """Return whether raw arguments select a search with at least 64 threads.
+
+    The allocator policy applies before Astra can resolve CPU versus GPU
+    execution. Both routes run high-thread HMMER continuations and have
+    independently retained the 24-arena setting.
+    """
     if not arguments or arguments[0] != "search":
-        return False
-    if any(
-        len(option := argument.partition("=")[0]) > 2
-        and option.startswith("--")
-        and "--gpu-manifest".startswith(option)
-        for argument in arguments[1:]
-    ):
         return False
     threads = _requested_threads(arguments[1:])
     return threads is not None and threads >= _MINIMUM_AUTO_THREADS
@@ -110,7 +108,7 @@ def _reexec_environment(
         return None
     if _REEXEC_SENTINEL_ENV in environment:
         return None
-    if not _is_cpu_search(arguments) or not _is_linux_glibc():
+    if not _is_high_thread_search(arguments) or not _is_linux_glibc():
         return None
     arena_max = _arena_max(environment)
     if arena_max is None:
@@ -129,7 +127,7 @@ def _dispatch() -> object:
 
 
 def main() -> object:
-    """Run the Astra console command with the validated CPU arena policy."""
+    """Run the Astra console command with the high-thread arena policy."""
     arguments = tuple(sys.argv[1:])
     try:
         environment = _reexec_environment(arguments, dict(os.environ))

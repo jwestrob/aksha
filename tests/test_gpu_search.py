@@ -764,6 +764,143 @@ class GPUConfigurationTests(unittest.TestCase):
                         (False, 0),
                     )
 
+    def test_production_tuning_is_exact_shape_default_off_and_override_safe(self):
+        with tempfile.TemporaryDirectory(
+            prefix="astra-gpu-production-policy-"
+        ) as temporary:
+            base = make_pressed_members(Path(temporary), "profiles")
+            e_only = search_options(temporary, evalue="1e-15")
+            eligible = dict(
+                pressed_base=base,
+                profile_count=27_781,
+                options=e_only,
+                threads=64,
+                target_count=300_186,
+                installed_attested=True,
+            )
+            large = search.GPU_CHUNK_LOCAL_PROFILE_PACK_MIN_PRESSED_BYTES
+            with mock.patch.object(
+                search, "_pressed_profile_payload_bytes", return_value=large
+            ), mock.patch.dict(os.environ, {}, clear=True):
+                selected = search.gpu_production_request_tuning(**eligible)
+                self.assertEqual(
+                    selected,
+                    search._GPURequestTuning(
+                        True, large, "eligible-large-gpu"
+                    ),
+                )
+                self.assertFalse(search._gpu_continuation_pool_enabled())
+                self.assertEqual(search._gpu_continuation_window(), 1)
+                self.assertEqual(search.gpu_profile_cell_cap(), 100_000_000)
+                self.assertEqual(
+                    search.gpu_pressed_profile_stream_configuration(
+                        base, 27_781, e_only, 64
+                    ),
+                    (False, 0),
+                )
+                self.assertEqual(
+                    search.gpu_pressed_profile_stream_configuration(
+                        base, 27_781, e_only, 64, automatic=True
+                    ),
+                    (True, large),
+                )
+
+                ineligible = (
+                    ({"installed_attested": False}, "not-installed-attested"),
+                    ({"cache_enabled": True}, "persistent-cache"),
+                    ({"threads": 63}, "thread-count"),
+                    ({"target_count": 65_536}, "target-count"),
+                    ({"profile_count": 0}, "profile-count"),
+                    ({"options": search_options(temporary)}, "not-evalue-only"),
+                    (
+                        {"options": search_options(temporary, evalue="1e-10")},
+                        "not-evalue-only",
+                    ),
+                )
+                for changes, reason in ineligible:
+                    arguments = dict(eligible)
+                    arguments.update(changes)
+                    with self.subTest(reason=reason):
+                        self.assertEqual(
+                            search.gpu_production_request_tuning(**arguments).reason,
+                            reason,
+                        )
+
+            with mock.patch.object(
+                search,
+                "_pressed_profile_payload_bytes",
+                return_value=large - 1,
+            ), mock.patch.dict(os.environ, {}, clear=True):
+                selected = search.gpu_production_request_tuning(**eligible)
+                self.assertFalse(selected.automatic)
+                self.assertEqual(selected.reason, "pressed-payload")
+
+            for environment in search.GPU_PRODUCTION_OVERRIDE_ENVS:
+                with self.subTest(environment=environment), mock.patch.object(
+                    search,
+                    "_pressed_profile_payload_bytes",
+                    return_value=large,
+                ), mock.patch.dict(
+                    os.environ, {environment: "1"}, clear=True
+                ):
+                    selected = search.gpu_production_request_tuning(**eligible)
+                    self.assertFalse(selected.automatic)
+                    self.assertEqual(selected.reason, "explicit-override")
+
+    def test_request_page_release_is_scoped_reset_and_failure_safe(self):
+        automatic = search._GPURequestTuning(True, 4 << 30, "eligible-large-gpu")
+        modules, _ = synthetic_plan7_gpu()
+        pipeline = modules["plan7_gpu._pipeline"]
+        pipeline._swap_avx512_tail_madvise_bound = mock.Mock(
+            return_value=False
+        )
+        pipeline._swap_intrarow_page_release_bound = mock.Mock(
+            return_value=4096
+        )
+
+        with mock.patch.dict(sys.modules, modules), mock.patch.dict(
+            os.environ, {}, clear=True
+        ):
+            self.assertIsNone(
+                search._configure_gpu_request_page_release(
+                    search._disabled_gpu_request_tuning("small")
+                )
+            )
+            self.assertTrue(search._gpu_request_page_release_lock.acquire(False))
+            search._gpu_request_page_release_lock.release()
+            configuration = search._configure_gpu_request_page_release(automatic)
+            pipeline._swap_avx512_tail_madvise_bound.assert_called_once_with(True)
+            pipeline._swap_intrarow_page_release_bound.assert_called_once_with(
+                16 << 20
+            )
+            search._restore_gpu_request_page_release(configuration)
+            self.assertEqual(
+                pipeline._swap_intrarow_page_release_bound.call_args_list,
+                [mock.call(16 << 20), mock.call(4096)],
+            )
+            self.assertEqual(
+                pipeline._swap_avx512_tail_madvise_bound.call_args_list,
+                [mock.call(True), mock.call(False)],
+            )
+            self.assertTrue(search._gpu_request_page_release_lock.acquire(False))
+            search._gpu_request_page_release_lock.release()
+
+        pipeline._swap_avx512_tail_madvise_bound.reset_mock()
+        pipeline._swap_avx512_tail_madvise_bound.return_value = None
+        pipeline._swap_intrarow_page_release_bound = mock.Mock(
+            side_effect=RuntimeError("logical configuration failed")
+        )
+        with mock.patch.dict(sys.modules, modules), mock.patch.dict(
+            os.environ, {}, clear=True
+        ):
+            with self.assertRaisesRegex(RuntimeError, "logical configuration"):
+                search._configure_gpu_request_page_release(automatic)
+            pipeline._swap_avx512_tail_madvise_bound.assert_has_calls(
+                [mock.call(True), mock.call(None)]
+            )
+            self.assertTrue(search._gpu_request_page_release_lock.acquire(False))
+            search._gpu_request_page_release_lock.release()
+
     def test_profile_worker_allocation_reserves_one_control_slot(self):
         self.assertEqual(
             search.gpu_profile_worker_allocation(1, True),
@@ -4318,6 +4455,90 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
             self.assertIs(snapshot["profile_chunk_local_pack"], True)
             self.assertEqual(snapshot["profile_pressed_bytes"], 10)
             session.close()
+
+    def test_production_preflight_binds_forward_policy_only_for_one_database(self):
+        with tempfile.TemporaryDirectory(
+            prefix="astra-gpu-production-preflight-"
+        ) as temporary:
+            root = Path(temporary)
+            configuration = {"db_urls": []}
+            mappings = {}
+            for name in ("ONE", "TWO"):
+                directory = root / name
+                directory.mkdir()
+                make_pressed_members(directory, "profiles")
+                configuration["db_urls"].append({
+                    "name": name,
+                    "installed": True,
+                    "installation_dir": os.fspath(directory),
+                    "molecule_type": "protein",
+                })
+                mappings[name] = f"{name}.json"
+
+            targets = mock.MagicMock(name="targets")
+            targets.__len__.return_value = 300_186
+            options = search_options(temporary, evalue="1e-15")
+
+            modules, api = synthetic_plan7_gpu(True)
+            api.validate_pressed_manifest.return_value = SimpleNamespace(
+                model_count=27_781
+            )
+            batch = mock.Mock(name="sequence_batch")
+            batch.memory_snapshot = {"device_ordinal": 0}
+            api.SequenceBatch.return_value = batch
+            tuning = {}
+            with mock.patch.dict(sys.modules, modules), mock.patch.dict(
+                os.environ, {}, clear=True
+            ), mock.patch.object(
+                search,
+                "_pressed_profile_payload_bytes",
+                return_value=4 << 30,
+            ):
+                databases, observed_batch, _ = search.preflight_gpu_databases(
+                    {"ONE": mappings["ONE"]},
+                    ["ONE"],
+                    configuration,
+                    targets,
+                    64,
+                    search_options=options,
+                    request_tuning_by_db=tuning,
+                )
+            self.assertIs(observed_batch, batch)
+            self.assertTrue(tuning["ONE"].automatic)
+            self.assertIs(
+                type(databases["ONE"][1]), search._PressedGPUProfileStream
+            )
+            self.assertEqual(
+                api.SequenceBatch.call_args.kwargs[
+                    "_forward_cpu_max_cells"
+                ],
+                200_000,
+            )
+            databases["ONE"][1].close()
+
+            api.SequenceBatch.reset_mock()
+            api.SequenceBatch.return_value = batch
+            api.load_pressed_profiles.side_effect = [(object(),), (object(),)]
+            tuning = {}
+            with mock.patch.dict(sys.modules, modules), mock.patch.dict(
+                os.environ, {}, clear=True
+            ):
+                search.preflight_gpu_databases(
+                    mappings,
+                    ["ONE", "TWO"],
+                    configuration,
+                    targets,
+                    64,
+                    search_options=options,
+                    request_tuning_by_db=tuning,
+                )
+            self.assertEqual(
+                {value.reason for value in tuning.values()},
+                {"multiple-mapped-databases"},
+            )
+            self.assertNotIn(
+                "_forward_cpu_max_cells", api.SequenceBatch.call_args.kwargs
+            )
 
     def test_profile_cache_reuses_one_attested_session_across_preflights(self):
         with tempfile.TemporaryDirectory(prefix="astra-gpu-cache-") as temporary:
