@@ -1,4 +1,4 @@
-# GPU production integration (prepared, not promoted)
+# GPU production integration (promoted candidate)
 
 ## Source map
 
@@ -9,12 +9,18 @@ adding the measured GPU cell-cap, global continuation-window, chunk-local
 profile-pack, and pressed-profile-stream stack.
 
 The paired plan7_gpu integration starts at exact full-gate tree `ce46998` and
-adds the tested logical HMMER implementation from `e55a2dd` plus `f7e2172`.
-That patch set reproduces private PyHMMER ABI SHA-256
+adds the tested logical HMMER implementation plus request-local Forward,
+Pipeline-release, AVX-release, intra-row-release, and filter-tail SIMD control
+seams. That patch set reproduces private PyHMMER ABI SHA-256
 `282988762a47af957ed04e05e97ca49387ec2eb7e4e485cabee1f9d05ee0dffb`.
-The paired prepared core commit is `bc06307`; it supplies request-local shard,
-Pipeline-release, and AVX-release controls without changing their existing
-environment-controlled defaults.
+The runtime-qualified commits are Astra `7a03f15` and plan7_gpu `964ca98`;
+the latter is followed only by source-hygiene commit `dd40d9d`, which deletes
+an obsolete benchmark submission script. The exact validation DSOs have
+SHA-256 `61a9f2bc29723e03f0b96aa351cc1d4c1250a21a587d267e86924a7204f1ffe5`
+(`_native`) and
+`54cf18e2cbe85c1b2f0a790302d51a8842945c869fd99fbbaeb0e141ca68d477`
+(`_pipeline`). The Astra wheel has SHA-256
+`fd7b6d4c4e309a49008774a17b50b6adb52d635df93b1373b1f0a23cb5ae5022`.
 
 ## Automatic request policy
 
@@ -27,7 +33,7 @@ the normal authenticated GPU preflight boundary:
 - the four pressed files total at least 4 GiB;
 - the request has exactly 64 search threads and more than 65,536 targets;
 - persistent profile caching, serial mode, legacy overlap, and every private
-  path-affecting private tuning overrides are absent. Metrics-only profiling
+  path-affecting tuning overrides are absent. Metrics-only profiling
   controls do not alter eligibility.
 
 That immutable request-local decision selects 100,000,000 profile-target
@@ -71,6 +77,42 @@ their underlying private runtimes. Astra-managed calls serialize, save, and
 restore them. Private direct plan7_gpu/PyHMMER callers must not mutate or use
 those private release hooks concurrently with an Astra-managed tuned request.
 
-No branch in this preparation has been merged to main or pushed. A coordinated
-wheel/build and exact GPU plus PFAM/default regression gates are still required
-before promotion.
+## Promotion evidence
+
+The focused host gates passed for the automatic selectors, default-off and
+explicit-override paths, multi-database rejection, launcher precedence, CPU
+profile streaming/native sink, global-window failure ordering, request-local
+state restoration, and exact known Forward/Viterbi rows. The exact ABI-282
+SM75/SM90 build retained the qualified normalized SASS properties: the SM90
+Forward kernel used 64 registers with no local memory, stack, or spills, and
+the SM90 Viterbi kernel did the same.
+
+Full PFAM production-auto job 1189279 completed the exact gathering-cutoff
+request with output SHA-256
+`3d7cda45ab1fca27fbb3b03a58bc501936666b7419fe0b6670fe46947e9f18e6`.
+It selected Forward 200k, filter-tail SIMD, sparse journal v3, window four,
+3/2 sharding, and launcher arena 24 while leaving KOFAM-only release controls
+off. Request wall time was 218.980 seconds, process peak RSS was 6,238,016 KiB,
+cgroup peak was 6,351,958,016 bytes, and HBM peak was 1,598 MiB. This was
+1.147% faster and used 5.066% less process RSS than retained exact job 1188661.
+The Slurm step reported failure only because its completed-result summarizer
+read a stale telemetry location; replaying the corrected summarizer over the
+immutable result produced a PASS summary with SHA-256
+`4de70fee61672021f2cf2f157a9a954199b6c6ffb7b5d07bff0438cee0602b7c`.
+
+Full KOFAM production-auto job 1189282 completed the exact PLM2_5, E=1e-15
+request with raw-order output SHA-256
+`fdd134e107fcc688be6a749493082c96eec6ce71e1c8b05e9bef0b8da076abc7`.
+The real automatic route selected Forward 200k, streamed 333-profile chunks,
+sparse journal v3, window four, 3/2 sharding, Pipeline release at 1.3 billion,
+AVX release, logical 16 MiB intra-row release, the 100-million-cell cap, and
+launcher arena 24. Request wall time was 1,393.690 seconds, process peak RSS
+was 9,086,124 KiB, cgroup peak was 9,618,771,968 bytes, and HBM peak was
+2,976 MiB, all within the full-gate limits. Its Slurm step reported failure
+only after the exact result was written because the evidence wrapper counted
+its own final intra-row reset as a third swap; the production request itself
+made the expected enable-and-restore pair.
+
+These exact-output and resource gates promote the paired source trees as the
+production integration candidate. Neither integration branch has been merged
+to main or pushed.
