@@ -104,6 +104,7 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
     """Return optional-package modules suitable for CPU-only wiring tests."""
     package = ModuleType("plan7_gpu")
     package.__path__ = []
+    adapter_module = ModuleType("plan7_gpu.adapter")
     astra_search_module = ModuleType("plan7_gpu.astra_search")
     manifest_module = ModuleType("plan7_gpu.pressed_manifest")
     telemetry_report_module = ModuleType("plan7_gpu.telemetry_report")
@@ -281,6 +282,9 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
             return_value=default_batch,
         ),
         load_pressed_profiles=mock.Mock(name="load_pressed_profiles"),
+        iter_pressed_profile_chunks=mock.Mock(
+            name="iter_pressed_profile_chunks"
+        ),
         validate_pressed_manifest=mock.Mock(name="validate_pressed_manifest"),
         gpu_hmmsearch=mock.Mock(name="gpu_hmmsearch"),
         filter_scores_seam_available=None,
@@ -371,6 +375,9 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
     package.astra_search = astra_search_module
     package._native = native_module
     package._pipeline = pipeline_module
+    adapter_module._iter_pressed_profile_chunks = (
+        api.iter_pressed_profile_chunks
+    )
     if sparse_journal_v3_available and direct_sparse_v3_native_available:
         native_module.SequenceBatch = DirectSparseV3NativeSequenceBatch
     elif phase0_telemetry_available or sparse_journal_v3_available:
@@ -390,6 +397,7 @@ def synthetic_plan7_gpu(postfilter_available=None, forward_available=None,
     return (
         {
             "plan7_gpu": package,
+            "plan7_gpu.adapter": adapter_module,
             "plan7_gpu.astra_search": astra_search_module,
             "plan7_gpu.pressed_manifest": manifest_module,
             "plan7_gpu.telemetry_report": telemetry_report_module,
@@ -690,6 +698,71 @@ class GPUConfigurationTests(unittest.TestCase):
                         search.GPUConfigurationError, "exactly '0' or '1'"
                     ):
                         search.gpu_chunk_local_profile_pack_configuration(base, 3)
+
+    def test_pressed_gpu_stream_is_large_e_only_overlap_opt_in(self):
+        with tempfile.TemporaryDirectory(
+            prefix="astra-gpu-profile-stream-config-"
+        ) as temporary:
+            base = make_pressed_members(Path(temporary), "profiles")
+            for suffix, size in zip(search.PRESSED_SUFFIXES, (1, 2, 3, 4)):
+                os.truncate(f"{base}.{suffix}", size)
+            e_only = search_options(temporary, evalue="1e-15")
+            with mock.patch.object(
+                search,
+                "GPU_CHUNK_LOCAL_PROFILE_PACK_MIN_PRESSED_BYTES",
+                10,
+            ):
+                with mock.patch.dict(os.environ, {}, clear=True):
+                    self.assertEqual(
+                        search.gpu_pressed_profile_stream_configuration(
+                            base, 3, e_only, 64
+                        ),
+                        (False, 0),
+                    )
+                with mock.patch.dict(
+                    os.environ,
+                    {search.GPU_CHUNK_LOCAL_PROFILE_PACK_ENV: "1"},
+                    clear=True,
+                ):
+                    self.assertEqual(
+                        search.gpu_pressed_profile_stream_configuration(
+                            base, 3, e_only, 64
+                        ),
+                        (True, 10),
+                    )
+                    for options in (
+                        search_options(temporary),
+                        search_options(
+                            temporary, evalue="1e-15", domE="1e-3"
+                        ),
+                        search_options(temporary, cut_ga=True),
+                    ):
+                        self.assertEqual(
+                            search.gpu_pressed_profile_stream_configuration(
+                                base, 3, options, 64
+                            ),
+                            (False, 0),
+                        )
+                    self.assertEqual(
+                        search.gpu_pressed_profile_stream_configuration(
+                            base, 3, e_only, 1
+                        ),
+                        (False, 0),
+                    )
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        search.GPU_CHUNK_LOCAL_PROFILE_PACK_ENV: "1",
+                        search.GPU_SERIAL_ENV: "1",
+                    },
+                    clear=True,
+                ):
+                    self.assertEqual(
+                        search.gpu_pressed_profile_stream_configuration(
+                            base, 3, e_only, 64
+                        ),
+                        (False, 0),
+                    )
 
     def test_profile_worker_allocation_reserves_one_control_slot(self):
         self.assertEqual(
@@ -2338,6 +2411,149 @@ class GPUProfileOverlapTests(unittest.TestCase):
         self.assertEqual(snapshot["generated_candidate_bytes"], 30)
         self.assertEqual(snapshot["consumed_candidate_bytes"], 30)
         self.assertEqual(snapshot["live_candidate_capacity"], 4)
+        self.assertEqual(snapshot["consumed_chunk_count"], 3)
+
+    def test_pressed_stream_closes_each_session_before_bounded_continuation(self):
+        pairs = [
+            SimpleNamespace(ordinal=ordinal)
+            for ordinal in range(5)
+        ]
+        iterator_calls = []
+        sessions = {}
+
+        def iter_chunks(_base, chunk_size, *, manifest):
+            iterator_calls.append((chunk_size, manifest))
+            for start in range(0, len(pairs), chunk_size):
+                yield tuple(pairs[start:start + chunk_size])
+
+        class Selection:
+            def __init__(self, selected):
+                self.pairs = tuple(selected)
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+                self.pairs = None
+
+        class ChunkSession:
+            def __init__(self, selected, **kwargs):
+                self.pairs = tuple(selected)
+                self.kwargs = kwargs
+                self.closed = False
+                sessions[self.pairs[0].ordinal] = self
+
+            @property
+            def statistics(self):
+                return {
+                    "session_id": id(self),
+                    "selection_count": 0,
+                    "worker_count": 4,
+                    "build_worker_count": 4,
+                    "selection_worker_count": 0,
+                    "host_bytes": len(self.pairs) * 100,
+                    "chunk_local_pack": True,
+                    "profile_pointer_bytes": len(self.pairs) * 8,
+                    "identity_token_bytes": len(self.pairs) * 4,
+                    "background_bytes": 80,
+                }
+
+            def select(self, indices):
+                self.assert_local_indices(tuple(indices))
+                return Selection(self.pairs)
+
+            def assert_local_indices(self, indices):
+                self_outer.assertEqual(indices, tuple(range(len(self.pairs))))
+
+            def close(self):
+                self.closed = True
+                self.pairs = None
+
+        class Candidate:
+            resident_bytes = 10
+
+            def __init__(self, selected):
+                self.pairs = tuple(selected)
+                self.indices = tuple(pair.ordinal for pair in self.pairs)
+
+        class Batch:
+            def _postfilter_forward_selection(self, selection, *_args):
+                return Candidate(selection.pairs)
+
+        kwargs = {"E": 1e-15}
+        profile_stream = search._PressedGPUProfileStream(
+            "/unused/profiles",
+            "manifest.json",
+            len(pairs),
+            10,
+            4,
+            iter_chunks,
+            ChunkSession,
+        )
+        chunks = profile_stream.chunk_specs(2, kwargs)
+        observed = []
+
+        def gpu_search(hmm_chunk, candidates, **_options):
+            def results():
+                first = candidates.indices[0]
+                self.assertTrue(sessions[first].closed)
+                self.assertEqual(
+                    tuple(pair.ordinal for pair in hmm_chunk),
+                    candidates.indices,
+                )
+                observed.append(candidates.indices)
+                yield candidates.indices
+
+            return results()
+
+        self_outer = self
+        modules, _ = synthetic_plan7_gpu(True)
+        modules[
+            "plan7_gpu.astra_search"
+        ]._hmmsearch_with_continuation_pool = gpu_search
+        metrics = search.GPUOverlapMetrics()
+        output = io.StringIO()
+        with (
+            mock.patch.dict(sys.modules, modules),
+            mock.patch.object(
+                search,
+                "process_hits_to_file",
+                side_effect=lambda hits, handle: handle.write(
+                    ",".join(str(value) for value in hits) + "\n"
+                ),
+            ),
+        ):
+            search._run_gpu_profile_pipeline(
+                chunks,
+                profile_stream,
+                Batch(),
+                3,
+                output,
+                metrics,
+                ready_queue_configuration=(1, None),
+                continuation_pools={id(kwargs): object()},
+                continuation_window=2,
+            )
+        profile_stream.close()
+
+        self.assertEqual(iterator_calls, [(2, "manifest.json")])
+        self.assertEqual(observed, [(0, 1), (2, 3), (4,)])
+        self.assertEqual(output.getvalue(), "0,1\n2,3\n4\n")
+        self.assertEqual(len(sessions), 3)
+        self.assertTrue(all(session.closed for session in sessions.values()))
+        for session in sessions.values():
+            self.assertEqual(
+                session.kwargs,
+                {
+                    "build_workers": 4,
+                    "selection_workers": 0,
+                    "_chunk_local_pack": True,
+                },
+            )
+        snapshot = metrics.snapshot()
+        self.assertIs(snapshot["profile_streamed"], True)
+        self.assertEqual(snapshot["profile_stream_session_count"], 3)
+        self.assertEqual(snapshot["profile_stream_max_pairs"], 2)
+        self.assertEqual(snapshot["profile_host_bytes"], 200)
         self.assertEqual(snapshot["consumed_chunk_count"], 3)
 
     def test_continuation_window_preserves_prefix_and_failure_order(self):
@@ -4036,6 +4252,72 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
             self.assertEqual(snapshot["profile_pointer_bytes"], 48)
             self.assertEqual(snapshot["profile_identity_token_bytes"], 24)
             self.assertEqual(snapshot["profile_background_bytes"], 80)
+
+    def test_large_e_only_preflight_defers_every_profile_to_stream(self):
+        with tempfile.TemporaryDirectory(
+            prefix="astra-gpu-pressed-stream-preflight-"
+        ) as temporary:
+            root = Path(temporary)
+            db_dir = root / "GPUDB"
+            db_dir.mkdir()
+            pressed_base = make_pressed_members(db_dir, "profiles")
+            for suffix, size in zip(search.PRESSED_SUFFIXES, (1, 2, 3, 4)):
+                os.truncate(f"{pressed_base}.{suffix}", size)
+            config = {
+                "db_urls": [{
+                    "name": "GPUDB",
+                    "installed": True,
+                    "installation_dir": os.fspath(db_dir),
+                    "molecule_type": "protein",
+                }]
+            }
+            modules, api = synthetic_plan7_gpu(True)
+            api.validate_pressed_manifest.return_value = SimpleNamespace(
+                model_count=3
+            )
+            batch = mock.Mock(name="sequence_batch")
+            batch.memory_snapshot = {"device_ordinal": 0}
+            api.SequenceBatch.return_value = batch
+            metrics = {"GPUDB": search.GPUOverlapMetrics()}
+
+            with mock.patch.dict(sys.modules, modules), mock.patch.dict(
+                os.environ,
+                {search.GPU_CHUNK_LOCAL_PROFILE_PACK_ENV: "1"},
+                clear=True,
+            ), mock.patch.object(
+                search,
+                "GPU_CHUNK_LOCAL_PROFILE_PACK_MIN_PRESSED_BYTES",
+                10,
+            ):
+                databases, observed_batch, postfilter = (
+                    search.preflight_gpu_databases(
+                        {"GPUDB": "manifest.json"},
+                        ["GPUDB"],
+                        config,
+                        [object()],
+                        64,
+                        gpu_metrics=metrics,
+                        search_options=search_options(
+                            temporary, evalue="1e-15"
+                        ),
+                    )
+                )
+
+            base, profiles, session = databases["GPUDB"]
+            self.assertEqual(base, pressed_base.resolve())
+            self.assertIs(profiles, session)
+            self.assertIs(type(session), search._PressedGPUProfileStream)
+            self.assertEqual(len(session), 3)
+            self.assertIs(observed_batch, batch)
+            self.assertTrue(postfilter)
+            api.load_pressed_profiles.assert_not_called()
+            api.iter_pressed_profile_chunks.assert_not_called()
+            api.ProfileSession.assert_not_called()
+            snapshot = metrics["GPUDB"].snapshot()
+            self.assertIs(snapshot["profile_streamed"], True)
+            self.assertIs(snapshot["profile_chunk_local_pack"], True)
+            self.assertEqual(snapshot["profile_pressed_bytes"], 10)
+            session.close()
 
     def test_profile_cache_reuses_one_attested_session_across_preflights(self):
         with tempfile.TemporaryDirectory(prefix="astra-gpu-cache-") as temporary:

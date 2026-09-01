@@ -114,8 +114,8 @@ def _new_gpu_continuation_pools(chunks, threads, enabled,
         ) from error
     pools = {}
     try:
-        for spec in chunks:
-            key = id(spec[3])
+        for pipeline_options in _gpu_pipeline_option_groups(chunks):
+            key = id(pipeline_options)
             if key not in pools:
                 pools[key] = _ContinuationPool(
                     threads,
@@ -165,6 +165,9 @@ class GPUOverlapMetrics:
         self.scheduler_mode = 'none'
         self.profile_host_bytes = 0
         self.profile_chunk_local_pack = False
+        self.profile_streamed = False
+        self.profile_stream_session_count = 0
+        self.profile_stream_max_pairs = 0
         self.profile_pressed_bytes = 0
         self.profile_pointer_bytes = 0
         self.profile_identity_token_bytes = 0
@@ -237,6 +240,9 @@ class GPUOverlapMetrics:
             'scheduler_mode': self.scheduler_mode,
             'profile_host_bytes': self.profile_host_bytes,
             'profile_chunk_local_pack': self.profile_chunk_local_pack,
+            'profile_streamed': self.profile_streamed,
+            'profile_stream_session_count': self.profile_stream_session_count,
+            'profile_stream_max_pairs': self.profile_stream_max_pairs,
             'profile_pressed_bytes': self.profile_pressed_bytes,
             'profile_pointer_bytes': self.profile_pointer_bytes,
             'profile_identity_token_bytes': self.profile_identity_token_bytes,
@@ -355,6 +361,246 @@ def gpu_chunk_local_profile_pack_configuration(
         and pressed_bytes >= GPU_CHUNK_LOCAL_PROFILE_PACK_MIN_PRESSED_BYTES
     )
     return enabled, pressed_bytes
+
+
+def _gpu_evalue_only_options(options):
+    """Recognize the one fixed-threshold shape audited for GPU streaming."""
+    if type(options) is not dict:
+        return False
+    try:
+        kwargs = define_kwargs(options)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    return set(kwargs) == {'E'}
+
+
+def gpu_pressed_profile_stream_configuration(
+    pressed_base,
+    profile_count,
+    options,
+    threads,
+    *,
+    cache_enabled=False,
+):
+    """Select the private large, E-only, overlapping GPU stream shape.
+
+    The ordinary eager session remains authoritative unless every condition is
+    present.  In particular, small/PFAM databases and benchmark controls keep
+    their established profile lifetime and scheduler.
+    """
+    if not _gpu_evalue_only_options(options):
+        return False, 0
+    if (
+        isinstance(threads, bool)
+        or not isinstance(threads, int)
+        or threads < 2
+        or os.environ.get(GPU_SERIAL_ENV) == '1'
+        or GPU_LEGACY_OVERLAP_ENV in os.environ
+    ):
+        return False, 0
+    return gpu_chunk_local_profile_pack_configuration(
+        pressed_base,
+        profile_count,
+        cache_enabled=cache_enabled,
+    )
+
+
+class _PressedGPUProfileStream:
+    """A lazy attested pressed database consumed by one GPU request."""
+
+    def __init__(
+        self,
+        pressed_base,
+        manifest_path,
+        profile_count,
+        pressed_bytes,
+        build_workers,
+        iterator_factory,
+        session_factory,
+    ):
+        if isinstance(profile_count, bool) or not isinstance(profile_count, int):
+            raise TypeError("streamed profile count must be an integer")
+        if profile_count <= 0:
+            raise ValueError("streamed profile count must be positive")
+        if not callable(iterator_factory):
+            raise TypeError("pressed profile chunk iterator is unavailable")
+        if not callable(session_factory):
+            raise TypeError("profile session factory is unavailable")
+        self.pressed_base = Path(pressed_base).resolve(strict=False)
+        self.manifest_path = manifest_path
+        self.profile_count = profile_count
+        self.pressed_bytes = pressed_bytes
+        self.build_workers = build_workers
+        self._iterator_factory = iterator_factory
+        self._session_factory = session_factory
+        self._lock = Lock()
+        self._closed = False
+        self._session_count = 0
+        self._selection_count = 0
+        self._maximum_session_statistics = {
+            'host_bytes': 0,
+            'profile_pointer_bytes': 0,
+            'identity_token_bytes': 0,
+            'background_bytes': 0,
+            'worker_count': 0,
+            'build_worker_count': 0,
+            'selection_worker_count': 0,
+        }
+
+    def __len__(self):
+        return self.profile_count
+
+    @property
+    def closed(self):
+        with self._lock:
+            return self._closed
+
+    @property
+    def statistics(self):
+        with self._lock:
+            result = dict(self._maximum_session_statistics)
+            result.update({
+                'session_id': id(self),
+                'selection_count': self._selection_count,
+                'chunk_local_pack': True,
+                'streamed': True,
+                'stream_session_count': self._session_count,
+            })
+            return result
+
+    def chunk_specs(self, chunk_size, pipeline_options):
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("pressed GPU profile stream is closed")
+        return _PressedGPUProfileChunks(self, chunk_size, pipeline_options)
+
+    def open_chunk_session(self, pairs):
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("pressed GPU profile stream is closed")
+        session = self._session_factory(
+            pairs,
+            build_workers=self.build_workers,
+            selection_workers=0,
+            _chunk_local_pack=True,
+        )
+        statistics = session.statistics
+        with self._lock:
+            if self._closed:
+                session.close()
+                raise RuntimeError("pressed GPU profile stream closed during build")
+            self._session_count += 1
+            for name in self._maximum_session_statistics:
+                value = statistics.get(name, 0)
+                if type(value) is int:
+                    self._maximum_session_statistics[name] = max(
+                        self._maximum_session_statistics[name], value
+                    )
+        return session
+
+    def record_selection(self):
+        with self._lock:
+            self._selection_count += 1
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+
+
+class _PressedGPUProfileChunks:
+    """One-pass canonical chunk specs backed by a pinned lockstep stream."""
+
+    def __init__(self, owner, chunk_size, pipeline_options):
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
+            raise TypeError("GPU profile chunk size must be an integer")
+        if chunk_size <= 0:
+            raise ValueError("GPU profile chunk size must be positive")
+        if type(pipeline_options) is not dict:
+            raise TypeError("GPU profile pipeline options must be a dict")
+        self.owner = owner
+        self.chunk_size = chunk_size
+        self.pipeline_options = pipeline_options
+        self.pipeline_option_groups = (pipeline_options,)
+        self._started = False
+        self._closed = False
+        self._raw_iterator = None
+
+    def __len__(self):
+        return (
+            self.owner.profile_count + self.chunk_size - 1
+        ) // self.chunk_size
+
+    def __iter__(self):
+        if self._started:
+            raise RuntimeError("pressed GPU profile chunks are one-pass")
+        if self._closed:
+            raise RuntimeError("pressed GPU profile chunks are closed")
+        self._started = True
+        raw_iterator = self.owner._iterator_factory(
+            self.owner.pressed_base,
+            self.chunk_size,
+            manifest=self.owner.manifest_path,
+        )
+        self._raw_iterator = raw_iterator
+        expected_ordinal = 0
+        chunk_index = 0
+        try:
+            for pairs in raw_iterator:
+                pairs = tuple(pairs)
+                ordinals = tuple(pair.ordinal for pair in pairs)
+                expected = tuple(
+                    range(expected_ordinal, expected_ordinal + len(pairs))
+                )
+                if not pairs or ordinals != expected:
+                    raise RuntimeError(
+                        "pressed GPU profile stream changed canonical order"
+                    )
+                chunk_index += 1
+                if chunk_index > len(self):
+                    raise RuntimeError(
+                        "pressed GPU profile stream exceeds manifest count"
+                    )
+                yield (
+                    chunk_index,
+                    pairs,
+                    ordinals,
+                    self.pipeline_options,
+                )
+                expected_ordinal += len(pairs)
+            if expected_ordinal != self.owner.profile_count:
+                raise RuntimeError(
+                    "pressed GPU profile stream count differs from manifest"
+                )
+            if chunk_index != len(self):
+                raise RuntimeError("pressed GPU profile stream chunk count changed")
+        finally:
+            close = getattr(raw_iterator, 'close', None)
+            if close is not None:
+                close()
+            self._raw_iterator = None
+            self._closed = True
+
+    def close(self):
+        raw_iterator = self._raw_iterator
+        if raw_iterator is not None:
+            close = getattr(raw_iterator, 'close', None)
+            if close is not None:
+                close()
+            self._raw_iterator = None
+        self._closed = True
+
+
+def _gpu_pipeline_option_groups(chunks):
+    if type(chunks) is _PressedGPUProfileChunks:
+        return chunks.pipeline_option_groups
+    groups = []
+    seen = set()
+    for spec in chunks:
+        key = id(spec[3])
+        if key not in seen:
+            seen.add(key)
+            groups.append(spec[3])
+    return tuple(groups)
 
 
 def _merged_time_intervals(records, started_key, finished_key):
@@ -738,13 +984,17 @@ def validate_gpu_configuration(mappings, installed_hmm_names, parsed_json,
 
 def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
                             all_sequences, threads, gpu_metrics=None,
-                            profile_session_cache=None):
+                            profile_session_cache=None, search_options=None):
     """Load every attested mapped database and initialize one target batch."""
     if not mappings:
         return {}, None, False
 
     preflight_started = time.perf_counter()
     from plan7_gpu import ProfileSession, SequenceBatch, load_pressed_profiles
+    try:
+        from plan7_gpu.adapter import _iter_pressed_profile_chunks
+    except (ImportError, AttributeError):
+        _iter_pressed_profile_chunks = None
     from plan7_gpu.pressed_manifest import validate_pressed_manifest
 
     if profile_session_cache is not None:
@@ -764,8 +1014,12 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
             item for item in parsed_json['db_urls'] if item['name'] == db_name
         )
         pressed_base = discover_pressed_base(database['installation_dir'])
-        validate_pressed_manifest(pressed_base, manifest_path)
-        database_specs[db_name] = (pressed_base, manifest_path)
+        validation = validate_pressed_manifest(pressed_base, manifest_path)
+        database_specs[db_name] = (
+            pressed_base,
+            manifest_path,
+            validation,
+        )
 
     if profile_session_cache is not None and len(database_specs) != 1:
         raise GPUConfigurationError(
@@ -775,20 +1029,50 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
 
     databases = {}
     if profile_session_cache is None:
-        for db_name, (pressed_base, manifest_path) in database_specs.items():
+        for db_name, (
+            pressed_base,
+            manifest_path,
+            validation,
+        ) in database_specs.items():
+            profile_count = getattr(validation, 'model_count', None)
+            stream_enabled, pressed_bytes = (
+                gpu_pressed_profile_stream_configuration(
+                    pressed_base,
+                    profile_count,
+                    search_options,
+                    threads,
+                )
+            )
+            if stream_enabled:
+                if _iter_pressed_profile_chunks is None:
+                    raise GPUConfigurationError(
+                        "installed plan7_gpu lacks pressed-profile streaming"
+                    )
+                stream = _PressedGPUProfileStream(
+                    pressed_base,
+                    manifest_path,
+                    profile_count,
+                    pressed_bytes,
+                    threads,
+                    _iter_pressed_profile_chunks,
+                    ProfileSession,
+                )
+                databases[db_name] = (pressed_base, stream, stream)
+                if gpu_metrics is not None:
+                    metrics = gpu_metrics[db_name]
+                    metrics.profile_streamed = True
+                    metrics.profile_chunk_local_pack = True
+                    metrics.profile_pressed_bytes = pressed_bytes
+                continue
             load_started = time.perf_counter()
             pairs = load_pressed_profiles(pressed_base, manifest=manifest_path)
             if gpu_metrics is not None:
                 gpu_metrics[db_name].profile_load_seconds += (
                     time.perf_counter() - load_started
                 )
-            databases[db_name] = (
-                pressed_base,
-                pairs,
-                None,
-            )
+            databases[db_name] = (pressed_base, pairs, None)
     else:
-        for db_name, (pressed_base, _) in database_specs.items():
+        for db_name, (pressed_base, _, _) in database_specs.items():
             databases[db_name] = (pressed_base, (), None)
 
     postfilter = gpu_postfilter_available()
@@ -826,6 +1110,28 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
         if session_supported:
             for db_name, (pressed_base, pairs, _) in tuple(databases.items()):
                 if profile_session_cache is None:
+                    if type(pairs) is _PressedGPUProfileStream:
+                        session = pairs
+                        session_build_seconds = 0.0
+                        pressed_bytes = pairs.pressed_bytes
+                        databases[db_name] = (
+                            pressed_base,
+                            pairs,
+                            session,
+                        )
+                        if gpu_metrics is not None:
+                            metrics = gpu_metrics[db_name]
+                            session_statistics = session.statistics
+                            metrics.profile_streamed = True
+                            metrics.profile_chunk_local_pack = True
+                            metrics.profile_pressed_bytes = pressed_bytes
+                            metrics.profile_session_id = session_statistics[
+                                'session_id'
+                            ]
+                            metrics.profile_session_selection_count_start = (
+                                session_statistics['selection_count']
+                            )
+                        continue
                     if not pairs:
                         continue
                     chunk_local_pack, pressed_bytes = (
@@ -902,20 +1208,30 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
                         metrics.profile_load_seconds += (
                             session.profile_load_seconds
                         )
-        elif profile_session_cache is not None:
-            cache_reservation.close()
-            cache_reservation = None
-            for db_name, (pressed_base, _, _) in tuple(databases.items()):
+        else:
+            if profile_session_cache is not None:
+                cache_reservation.close()
+                cache_reservation = None
+            for db_name, (pressed_base, pairs, _) in tuple(databases.items()):
+                if (
+                    profile_session_cache is None
+                    and type(pairs) is not _PressedGPUProfileStream
+                ):
+                    continue
                 manifest_path = database_specs[db_name][1]
                 load_started = time.perf_counter()
-                pairs = load_pressed_profiles(
+                eager_pairs = load_pressed_profiles(
                     pressed_base, manifest=manifest_path
                 )
-                databases[db_name] = (pressed_base, pairs, None)
+                if type(pairs) is _PressedGPUProfileStream:
+                    pairs.close()
+                databases[db_name] = (pressed_base, eager_pairs, None)
                 if gpu_metrics is not None:
-                    gpu_metrics[db_name].profile_load_seconds += (
+                    metrics = gpu_metrics[db_name]
+                    metrics.profile_load_seconds += (
                         time.perf_counter() - load_started
                     )
+                    metrics.profile_streamed = False
         if gpu_metrics is not None:
             preflight_seconds = time.perf_counter() - preflight_started
             for metrics in gpu_metrics.values():
@@ -2037,7 +2353,7 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
             raise ValueError(
                 "concurrent continuation does not support route telemetry"
             )
-        if len({id(spec[3]) for spec in chunks}) != 1:
+        if len(_gpu_pipeline_option_groups(chunks)) != 1:
             raise ValueError(
                 "concurrent continuation requires one Pipeline option group"
             )
@@ -2130,17 +2446,107 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
             producer_state['ready_high_water'] = 1
         return True
 
+    streamed_profiles = type(profile_session) is _PressedGPUProfileStream
+
+    def close_generation_context(selection, chunk_session):
+        close_error = None
+        for resource in (selection, chunk_session):
+            if resource is None:
+                continue
+            try:
+                resource.close()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+        return close_error
+
+    def record_stream_session(pair_count, build_seconds):
+        if gpu_metrics is None:
+            return
+        statistics = profile_session.statistics
+        with gpu_metrics._lock:
+            gpu_metrics.profile_streamed = True
+            gpu_metrics.profile_chunk_local_pack = True
+            gpu_metrics.profile_stream_session_count = statistics[
+                'stream_session_count'
+            ]
+            gpu_metrics.profile_stream_max_pairs = max(
+                gpu_metrics.profile_stream_max_pairs,
+                pair_count,
+            )
+            gpu_metrics.session_build_seconds += build_seconds
+            gpu_metrics.profile_host_bytes = max(
+                gpu_metrics.profile_host_bytes,
+                statistics['host_bytes'],
+            )
+            gpu_metrics.profile_worker_count = max(
+                gpu_metrics.profile_worker_count,
+                statistics['worker_count'],
+            )
+            gpu_metrics.profile_build_worker_count = max(
+                gpu_metrics.profile_build_worker_count,
+                statistics.get(
+                    'build_worker_count', statistics['worker_count']
+                ),
+            )
+            gpu_metrics.profile_pointer_bytes = max(
+                gpu_metrics.profile_pointer_bytes,
+                statistics.get('profile_pointer_bytes', 0),
+            )
+            gpu_metrics.profile_identity_token_bytes = max(
+                gpu_metrics.profile_identity_token_bytes,
+                statistics.get('identity_token_bytes', 0),
+            )
+            gpu_metrics.profile_background_bytes = max(
+                gpu_metrics.profile_background_bytes,
+                statistics.get('background_bytes', 0),
+            )
+
     def produce():
         try:
             for position, spec in enumerate(chunks):
                 if stop.is_set():
                     return
+                if position >= len(chunks):
+                    raise RuntimeError(
+                        "GPU profile producer exceeded declared chunk count"
+                    )
                 selection = None
+                chunk_session = None
                 candidates = None
+                if streamed_profiles:
+                    session_started = time.perf_counter()
+                    try:
+                        chunk_session = profile_session.open_chunk_session(
+                            spec[1]
+                        )
+                    except BaseException as error:
+                        selection_finished = time.perf_counter()
+                        item = (
+                            position, spec, None, error,
+                            session_started, selection_finished, None, None, 0,
+                        )
+                        publish(item, 0)
+                        item = None
+                        return
+                    session_finished = time.perf_counter()
+                    record_stream_session(
+                        len(spec[1]), session_finished - session_started
+                    )
+                    selection_indices = range(len(spec[1]))
+                else:
+                    selection_indices = spec[2]
                 selection_started = time.perf_counter()
                 try:
-                    selection = profile_session.select(spec[2])
+                    active_session = (
+                        chunk_session if streamed_profiles else profile_session
+                    )
+                    selection = active_session.select(selection_indices)
+                    if streamed_profiles:
+                        profile_session.record_selection()
                 except BaseException as error:
+                    close_generation_context(None, chunk_session)
+                    chunk_session = None
                     selection_finished = time.perf_counter()
                     item = (
                         position, spec, None, error,
@@ -2162,11 +2568,9 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                         ga_pruning,
                     )
                 except BaseException as error:
-                    try:
-                        selection.close()
-                    except BaseException:
-                        pass
+                    close_generation_context(selection, chunk_session)
                     selection = None
+                    chunk_session = None
                     item = (
                         position, spec, None, error,
                         selection_started, selection_finished,
@@ -2175,20 +2579,21 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                     publish(item, 0)
                     item = None
                     return
-                try:
-                    selection.close()
-                except BaseException as error:
-                    selection = None
+                close_error = close_generation_context(
+                    selection, chunk_session
+                )
+                selection = None
+                chunk_session = None
+                if close_error is not None:
                     candidates = None
                     item = (
-                        position, spec, None, error,
+                        position, spec, None, close_error,
                         selection_started, selection_finished,
                         generation_started, None, 0,
                     )
                     publish(item, 0)
                     item = None
                     return
-                selection = None
                 generation_finished = time.perf_counter()
                 candidate_bytes = 0
                 if (
@@ -2234,6 +2639,13 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
         except BaseException as error:
             producer_state['terminal_error'] = error
         finally:
+            close_chunks = getattr(chunks, 'close', None)
+            if close_chunks is not None:
+                try:
+                    close_chunks()
+                except BaseException as error:
+                    if producer_state['terminal_error'] is None:
+                        producer_state['terminal_error'] = error
             producer_done.set()
 
     def next_ready():
@@ -2354,7 +2766,7 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
             )
         producer.start()
         producer_started = True
-        for position, spec in enumerate(chunks):
+        for position in range(len(chunks)):
             wait_started = time.perf_counter()
             try:
                 item, ready_without_wait = next_ready()
@@ -2374,11 +2786,22 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
                 candidate_bytes,
             ) = item
             item = None
-            if produced_position != position or produced_spec is not spec:
+            expected_spec = (
+                None if type(chunks) is _PressedGPUProfileChunks
+                else chunks[position]
+            )
+            if (
+                produced_position != position
+                or (
+                    expected_spec is not None
+                    and produced_spec is not expected_spec
+                )
+            ):
                 candidates = None
                 raise_after_pending_continuations(
                     RuntimeError("GPU profile producer changed chunk order")
                 )
+            spec = produced_spec
             if gpu_metrics is not None:
                 gpu_metrics.selection_seconds += (
                     selection_finished - selection_started
@@ -2728,6 +3151,9 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
     if type(ga_pruning) is not bool:
         raise TypeError("ga_pruning must be bool")
     hmmsearch_kwargs = define_kwargs(options)
+    streamed_gpu_profiles = (
+        type(gpu_profile_session) is _PressedGPUProfileStream
+    )
 
     if telemetry_collector is not None:
         from plan7_gpu.telemetry_report import TelemetryCollector
@@ -2761,6 +3187,10 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
         if len(gpu_profile_session) != len(hmms):
             raise GPUConfigurationError(
                 "GPU profile session does not cover the supplied profiles"
+            )
+        if streamed_gpu_profiles and hmms is not gpu_profile_session:
+            raise GPUConfigurationError(
+                "pressed GPU stream must be its supplied profile collection"
             )
     elif sparse_journal_v3:
         raise GPUConfigurationError(
@@ -2832,6 +3262,21 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
     profile_scheduler_mode = gpu_profile_scheduler_mode(
         gpu_profile_session, profile_overlap_enabled
     )
+    if streamed_gpu_profiles:
+        if profile_scheduler_mode != 'bounded-ready-queue':
+            raise GPUConfigurationError(
+                "pressed GPU profile streaming requires the bounded "
+                "ready-queue scheduler"
+            )
+        if set(hmmsearch_kwargs) != {'E'}:
+            raise GPUConfigurationError(
+                "pressed GPU profile streaming requires an E-value-only search"
+            )
+        if telemetry_collector is not None or ga_pruning:
+            raise GPUConfigurationError(
+                "pressed GPU profile streaming does not support telemetry or "
+                "GA pruning"
+            )
     ready_queue_configuration = None
     if profile_scheduler_mode == 'bounded-ready-queue':
         # Parse the experimental contract before creating output directories or
@@ -2979,36 +3424,41 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
         gc.collect()
         return tmp_dir
 
-    # Pre-compute HMM groups ONCE — grouping depends only on HMM cutoff
-    # availability, not on per-genome data.  Previously this was inside the
-    # per-genome loop, wasting len(hmms) * len(protein_dict) iterations.
-    hmm_groups = {}
-    for hmm_index, hmm in enumerate(hmms):
-        best_cutoff = get_best_cutoff(hmm)
-        hmm_groups.setdefault(best_cutoff, []).append((hmm_index, hmm))
+    if streamed_gpu_profiles:
+        # The private stream is admitted only for a single E-value policy, so
+        # grouping cannot change either thresholds or canonical model order.
+        group_kwargs_list = None
+    else:
+        # Pre-compute HMM groups ONCE — grouping depends only on HMM cutoff
+        # availability, not on per-genome data.  Previously this was inside the
+        # per-genome loop, wasting len(hmms) * len(protein_dict) iterations.
+        hmm_groups = {}
+        for hmm_index, hmm in enumerate(hmms):
+            best_cutoff = get_best_cutoff(hmm)
+            hmm_groups.setdefault(best_cutoff, []).append((hmm_index, hmm))
 
-    # Build per-group kwargs once (avoids re-copying per genome)
-    group_kwargs_list = []
-    for cutoff, indexed_hmm_group in hmm_groups.items():
-        kwargs = hmmsearch_kwargs.copy()
-        if cutoff:
-            kwargs['bit_cutoffs'] = cutoff
-        else:
-            # No bitscore threshold available for these HMMs.
-            # In cascade mode, fall back to E-value 1e-15 (the intended
-            # cascade behavior) instead of pyhmmer's permissive default (10.0).
-            if 'bit_cutoffs' in kwargs:
-                del kwargs['bit_cutoffs']
-            if options['cascade']:
-                kwargs.setdefault('E', 1e-15)
+        # Build per-group kwargs once (avoids re-copying per genome)
+        group_kwargs_list = []
+        for cutoff, indexed_hmm_group in hmm_groups.items():
+            kwargs = hmmsearch_kwargs.copy()
+            if cutoff:
+                kwargs['bit_cutoffs'] = cutoff
+            else:
+                # No bitscore threshold available for these HMMs.
+                # In cascade mode, fall back to E-value 1e-15 (the intended
+                # cascade behavior) instead of pyhmmer's permissive default (10.0).
+                if 'bit_cutoffs' in kwargs:
+                    del kwargs['bit_cutoffs']
+                if options['cascade']:
+                    kwargs.setdefault('E', 1e-15)
 
-        # Remove internal-only keys before passing to pyhmmer
-        kwargs.pop('preferred_cutoff', None)
-        group_kwargs_list.append((
-            [hmm for _, hmm in indexed_hmm_group],
-            tuple(index for index, _ in indexed_hmm_group),
-            kwargs,
-        ))
+            # Remove internal-only keys before passing to pyhmmer
+            kwargs.pop('preferred_cutoff', None)
+            group_kwargs_list.append((
+                [hmm for _, hmm in indexed_hmm_group],
+                tuple(index for index, _ in indexed_hmm_group),
+                kwargs,
+            ))
 
     # For large datasets without MacSyFinder output, flatten all sequences
     # and search once against the full pool.  This turns N_genomes * N_chunks
@@ -3025,8 +3475,13 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
             all_sequences = []
             for sequences in protein_dict.values():
                 all_sequences.extend(sequences)
+        grouped_count = (
+            len(hmms)
+            if streamed_gpu_profiles
+            else sum(len(g) for g, _, _ in group_kwargs_list)
+        )
         print(f"Bulk search: {len(all_sequences)} sequences × {len(hmms)} HMMs "
-              f"({sum(len(g) for g, _, _ in group_kwargs_list)} grouped)")
+              f"({grouped_count} grouped)")
 
         hmm_chunk_size = HMM_CHUNK_SIZE
         if gpu_sequence_batch is not None:
@@ -3034,29 +3489,43 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
 
         # Single output file — keep handle open across all chunks
         out_file = os.path.join(tmp_dir, "bulk_results.tsv")
-        total_chunks = sum(
-            (len(g) + hmm_chunk_size - 1) // hmm_chunk_size
-            for g, _, _ in group_kwargs_list
+        total_chunks = (
+            (len(hmms) + hmm_chunk_size - 1) // hmm_chunk_size
+            if streamed_gpu_profiles
+            else sum(
+                (len(g) + hmm_chunk_size - 1) // hmm_chunk_size
+                for g, _, _ in group_kwargs_list
+            )
         )
         chunk_idx = 0
         with open(out_file, 'w') as fh:
             fh.write(HEADER)
-            chunks = []
-            for hmm_group, group_indices, kwargs in group_kwargs_list:
-                for chunk_start in range(0, len(hmm_group), hmm_chunk_size):
-                    hmm_chunk = hmm_group[
-                        chunk_start:chunk_start + hmm_chunk_size
-                    ]
-                    chunk_indices = group_indices[
-                        chunk_start:chunk_start + hmm_chunk_size
-                    ]
-                    chunk_idx += 1
-                    chunks.append((
-                        chunk_idx,
-                        hmm_chunk,
-                        chunk_indices,
-                        kwargs,
-                    ))
+            if streamed_gpu_profiles:
+                chunks = gpu_profile_session.chunk_specs(
+                    hmm_chunk_size,
+                    hmmsearch_kwargs.copy(),
+                )
+                if len(chunks) != total_chunks:
+                    raise RuntimeError(
+                        "pressed GPU profile stream chunk count changed"
+                    )
+            else:
+                chunks = []
+                for hmm_group, group_indices, kwargs in group_kwargs_list:
+                    for chunk_start in range(0, len(hmm_group), hmm_chunk_size):
+                        hmm_chunk = hmm_group[
+                            chunk_start:chunk_start + hmm_chunk_size
+                        ]
+                        chunk_indices = group_indices[
+                            chunk_start:chunk_start + hmm_chunk_size
+                        ]
+                        chunk_idx += 1
+                        chunks.append((
+                            chunk_idx,
+                            hmm_chunk,
+                            chunk_indices,
+                            kwargs,
+                        ))
 
             if gpu_profile_session is not None:
                 profile_run_options = {}
@@ -3909,6 +4378,7 @@ def main(args, *, gpu_profile_session_cache=None):
             args.threads,
             gpu_metrics_by_db,
             gpu_profile_session_cache,
+            search_options=hmmsearch_options,
         )
 
     try:
