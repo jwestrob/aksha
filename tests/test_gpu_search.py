@@ -869,6 +869,7 @@ class GPUConfigurationTests(unittest.TestCase):
                 target_count=300_186,
                 installed_attested=True,
                 single_mapped_database=True,
+                profile_count=19_632,
             )
             with mock.patch.dict(os.environ, {}, clear=True):
                 self.assertTrue(
@@ -901,6 +902,11 @@ class GPUConfigurationTests(unittest.TestCase):
                     {"threads": 63},
                     {"threads": True},
                     {"target_count": 65_536},
+                    {"profile_count": 255},
+                    {"profile_count": True},
+                    {"profile_count": 256.0},
+                    {"cache_enabled": True},
+                    {"cache_enabled": 0},
                     {"options": search_options(temporary, evalue="1e-15")},
                     {"options": search_options(temporary)},
                     {
@@ -921,6 +927,11 @@ class GPUConfigurationTests(unittest.TestCase):
                         self.assertFalse(
                             search.gpu_filter_tail_simd_request(**arguments)
                         )
+                boundary = dict(eligible)
+                boundary["profile_count"] = 256
+                self.assertTrue(
+                    search.gpu_filter_tail_simd_request(**boundary)
+                )
 
             for environment in search.GPU_PRODUCTION_OVERRIDE_ENVS:
                 with self.subTest(environment=environment), mock.patch.dict(
@@ -4779,7 +4790,7 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
                 }]
             }
             modules, api = synthetic_plan7_gpu(True)
-            pairs = (object(), object())
+            pairs = tuple(object() for _ in range(256))
             underlying = mock.MagicMock(name="cached_profile_session")
             underlying.closed = False
             underlying.__len__.return_value = len(pairs)
@@ -4818,9 +4829,14 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
                 loader=api.load_pressed_profiles,
                 session_factory=api.ProfileSession,
             )
+            targets = mock.MagicMock(name="cached_pfam_targets")
+            targets.__len__.return_value = 300_186
+            filter_tail = {}
 
             observed = []
-            with mock.patch.dict(sys.modules, modules):
+            with mock.patch.dict(sys.modules, modules), mock.patch.dict(
+                os.environ, {}, clear=True
+            ):
                 for expected_batch, expected_hit in (
                     (first_batch, False),
                     (second_batch, True),
@@ -4830,10 +4846,14 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
                         {"GPUDB": "manifest.json"},
                         ["GPUDB"],
                         config,
-                        [object()],
-                        2,
+                        targets,
+                        64,
                         metrics,
                         cache,
+                        search_options=search_options(
+                            temporary, cut_ga=True
+                        ),
+                        filter_tail_simd_by_db=filter_tail,
                     )
                     _, observed_pairs, lease = databases["GPUDB"]
                     observed.append(lease)
@@ -4842,6 +4862,11 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
                     self.assertIs(observed_pairs, pairs)
                     self.assertIs(lease._entry.session, underlying)
                     self.assertIs(lease.reused, expected_hit)
+                    self.assertEqual(filter_tail, {"GPUDB": False})
+                    self.assertNotIn(
+                        "_forward_cpu_max_cells",
+                        api.SequenceBatch.call_args.kwargs,
+                    )
                     self.assertTrue(metrics["GPUDB"].profile_cache_enabled)
                     self.assertIs(
                         metrics["GPUDB"].profile_cache_hit, expected_hit
@@ -4866,7 +4891,7 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
                 pressed_base.resolve(), manifest="manifest.json"
             )
             api.ProfileSession.assert_called_once_with(
-                pairs, build_workers=2, selection_workers=0
+                pairs, build_workers=64, selection_workers=0
             )
             self.assertIsNot(observed[0], observed[1])
             underlying.close.assert_not_called()

@@ -49,12 +49,13 @@ requests, cached or multi-database sessions, non-1e-15 thresholds, and
 non-64-thread requests therefore keep their measured paths.
 
 The separate retained PFAM policy is selected only for one attested installed
-GPU database, exactly 64 threads, more than 65,536 targets, gathering cutoffs,
-and no private path override. It keeps eager profile loading and default page
-release, while enabling sparse journal v3, filter-tail SIMD, the pooled global
-continuation window of four, exact 3/2 sharding, and request-local hybrid
-Forward ownership below or equal to 200,000 cells. The explicit filter-tail
-SIMD and test-fallback environment controls both disable this automatic path.
+GPU database with at least 256 profiles, no persistent profile cache, exactly
+64 threads, more than 65,536 targets, gathering cutoffs, and no private path
+override. It keeps eager profile loading and default page release, while
+enabling sparse journal v3, filter-tail SIMD, the pooled global continuation
+window of four, exact 3/2 sharding, and request-local hybrid Forward ownership
+below or equal to 200,000 cells. The explicit filter-tail SIMD and test-fallback
+environment controls both disable this automatic path.
 
 ## Allocator launcher
 

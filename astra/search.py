@@ -137,7 +137,7 @@ def _gpu_automatic_continuation_tuning(
 
 def gpu_filter_tail_simd_request(
     options, threads, target_count, *, installed_attested=False,
-    single_mapped_database=False,
+    single_mapped_database=False, profile_count=None, cache_enabled=False,
 ):
     """Select the exact retained PFAM gathering-cutoff SIMD request shape."""
     if not installed_attested or not single_mapped_database:
@@ -145,6 +145,10 @@ def gpu_filter_tail_simd_request(
     if type(threads) is not int or threads != GPU_PRODUCTION_THREAD_COUNT:
         return False
     if type(target_count) is not int or target_count <= GPU_PRODUCTION_TARGET_MINIMUM:
+        return False
+    if type(profile_count) is not int or profile_count < 256:
+        return False
+    if cache_enabled is not False:
         return False
     if any(name in os.environ for name in GPU_PRODUCTION_OVERRIDE_ENVS):
         return False
@@ -1329,13 +1333,15 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
         )
 
     selected_filter_tail_simd = False
-    for db_name in database_specs:
+    for db_name, (_, _, validation) in database_specs.items():
         filter_tail_simd = gpu_filter_tail_simd_request(
             search_options,
             threads,
             len(all_sequences),
             installed_attested=True,
             single_mapped_database=(len(database_specs) == 1),
+            profile_count=getattr(validation, 'model_count', None),
+            cache_enabled=(profile_session_cache is not None),
         )
         selected_filter_tail_simd = (
             selected_filter_tail_simd or filter_tail_simd
