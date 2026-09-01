@@ -40,6 +40,9 @@ GPU_READY_QUEUE_BYTES_ENV = 'ASTRA_GPU_READY_QUEUE_BYTES'
 GPU_CONTINUATION_POOL_ENV = 'ASTRA_GPU_CONTINUATION_POOL'
 GPU_CONTINUATION_WINDOW_ENV = 'ASTRA_GPU_CONTINUATION_WINDOW'
 GPU_CONTINUATION_WORKERS_ENV = 'ASTRA_GPU_CONTINUATION_WORKERS'
+GPU_INTRAROW_RELEASE_MIN_BYTES_ENV = (
+    'PLAN7_GPU_INTRAROW_RELEASE_MIN_BYTES'
+)
 GPU_DOMAIN_GUARD = 2.0e-4
 GPU_READY_QUEUE_CAPACITY = 1
 GPU_PRODUCER_LOOKAHEAD_CAPACITY = GPU_READY_QUEUE_CAPACITY + 1
@@ -47,18 +50,63 @@ GPU_LIVE_CANDIDATE_CAPACITY = GPU_READY_QUEUE_CAPACITY + 2
 GPU_READY_QUEUE_DEPTHS = (1, 2, 4)
 GPU_CONTINUATION_WINDOWS = (1, 2, 4)
 GPU_READY_QUEUE_MAX_BYTES = (1 << 63) - 1
+GPU_PRODUCTION_TARGET_MINIMUM = 65_536
+GPU_PRODUCTION_THREAD_COUNT = 64
+GPU_PRODUCTION_CONTINUATION_WINDOW = 4
+GPU_PRODUCTION_SHARD_TRIGGER = (3, 2)
+GPU_PRODUCTION_PIPELINE_MADVISE_WORK_HINT = 1_300_000_000
+GPU_PRODUCTION_INTRAROW_RELEASE_MIN_BYTES = 16 << 20
+GPU_PRODUCTION_OVERRIDE_ENVS = (
+    GPU_PROFILE_CELL_CAP_ENV,
+    GPU_CHUNK_LOCAL_PROFILE_PACK_ENV,
+    GPU_SERIAL_ENV,
+    GPU_LEGACY_OVERLAP_ENV,
+    GPU_READY_QUEUE_DEPTH_ENV,
+    GPU_READY_QUEUE_BYTES_ENV,
+    GPU_CONTINUATION_POOL_ENV,
+    GPU_CONTINUATION_WINDOW_ENV,
+    GPU_CONTINUATION_WORKERS_ENV,
+    'PLAN7_GPU_CONTINUATION_SCHEDULER',
+    'PLAN7_GPU_CONTINUATION_TASK_POLICY',
+    'PLAN7_GPU_CONTINUATION_SHARD_TRIGGER',
+    'PLAN7_GPU_CONTINUATION_ONESHOT_PIPELINE_WORK_HINT',
+    'PLAN7_GPU_CONTINUATION_PIPELINE_MADVISE_WORK_HINT',
+    'PLAN7_GPU_AVX512_TAIL_MADVISE',
+    GPU_INTRAROW_RELEASE_MIN_BYTES_ENV,
+    'PLAN7_GPU_FORWARD_OWNERSHIP',
+    'PLAN7_GPU_FORWARD_CPU_MIN_CELLS',
+    'PLAN7_GPU_FORWARD_CPU_MIN_LENGTH',
+    'PLAN7_GPU_FORWARD_CPU_MAX_CELLS',
+)
 _NATIVE_TSV_ROWS_UNRESOLVED = object()
 _native_tsv_rows = _NATIVE_TSV_ROWS_UNRESOLVED
 _ASTRA_TSV_RENDERER_ABI = 2
+_gpu_request_page_release_lock = Lock()
 
 
 class GPUConfigurationError(ValueError):
     """Raised when an explicit installed-database GPU request is invalid."""
 
 
-def _gpu_continuation_pool_enabled():
+class _GPURequestTuning(NamedTuple):
+    """Immutable, request-local selection of the measured large-GPU path."""
+
+    automatic: bool
+    pressed_bytes: int
+    reason: str
+
+
+def _disabled_gpu_request_tuning(reason, pressed_bytes=0):
+    return _GPURequestTuning(False, pressed_bytes, reason)
+
+
+def _gpu_continuation_pool_enabled(default=False):
+    if type(default) is not bool:
+        raise TypeError("default continuation-pool policy must be bool")
     value = os.environ.get(GPU_CONTINUATION_POOL_ENV)
-    if value is None or value == '0':
+    if value is None:
+        return default
+    if value == '0':
         return False
     if value == '1':
         return True
@@ -67,10 +115,12 @@ def _gpu_continuation_pool_enabled():
     )
 
 
-def _gpu_continuation_window():
+def _gpu_continuation_window(default=1):
+    if default not in GPU_CONTINUATION_WINDOWS:
+        raise ValueError("default continuation window is unsupported")
     value = os.environ.get(GPU_CONTINUATION_WINDOW_ENV)
     if value is None:
-        return 1
+        return default
     if value not in tuple(str(item) for item in GPU_CONTINUATION_WINDOWS):
         allowed = ', '.join(str(item) for item in GPU_CONTINUATION_WINDOWS)
         raise GPUConfigurationError(
@@ -103,7 +153,10 @@ def _gpu_continuation_worker_count(available, profile_session, pool_enabled):
 
 
 def _new_gpu_continuation_pools(chunks, threads, enabled,
-                                continuation_window=1):
+                                continuation_window=1,
+                                task_policy=None,
+                                shard_trigger=None,
+                                pipeline_madvise_work_hint=None):
     if not enabled:
         return None
     try:
@@ -120,6 +173,11 @@ def _new_gpu_continuation_pools(chunks, threads, enabled,
                 pools[key] = _ContinuationPool(
                     threads,
                     allow_concurrent_calls=continuation_window > 1,
+                    task_policy=task_policy,
+                    shard_trigger=shard_trigger,
+                    pipeline_madvise_work_hint=(
+                        pipeline_madvise_work_hint
+                    ),
                 )
     except BaseException:
         for pool in pools.values():
@@ -145,6 +203,82 @@ def _close_gpu_continuation_pools(pools, gpu_metrics):
             gpu_metrics.continuation_pipeline_count += statistics['pipeline_count']
     if close_error is not None and not active_error:
         raise close_error
+
+
+def _gpu_intrarow_release_min_bytes(default=None):
+    value = os.environ.get(GPU_INTRAROW_RELEASE_MIN_BYTES_ENV)
+    if value is None:
+        return default
+    if not value.isascii() or not value.isdecimal():
+        raise GPUConfigurationError(
+            f"{GPU_INTRAROW_RELEASE_MIN_BYTES_ENV} must be a nonnegative "
+            "integer"
+        )
+    parsed = int(value, 10)
+    if parsed > (1 << 64) - 1:
+        raise GPUConfigurationError(
+            f"{GPU_INTRAROW_RELEASE_MIN_BYTES_ENV} exceeds uint64"
+        )
+    return parsed
+
+
+def _configure_gpu_request_page_release(request_tuning):
+    """Apply and return scoped release hooks without mutating the environment."""
+    from plan7_gpu import _pipeline
+
+    automatic = bool(
+        request_tuning is not None and request_tuning.automatic
+    )
+    intrarow_min_bytes = _gpu_intrarow_release_min_bytes(
+        GPU_PRODUCTION_INTRAROW_RELEASE_MIN_BYTES if automatic else None
+    )
+    configure_avx = getattr(
+        _pipeline, '_configure_avx512_tail_madvise_bound', None
+    )
+    configure_intrarow = getattr(
+        _pipeline, '_configure_intrarow_page_release_bound', None
+    )
+    avx_configured = False
+    intrarow_configured = False
+    _gpu_request_page_release_lock.acquire()
+    try:
+        if automatic:
+            if not callable(configure_avx):
+                raise GPUConfigurationError(
+                    "installed plan7_gpu lacks request-scoped AVX page release"
+                )
+            configure_avx(True)
+            avx_configured = True
+        if intrarow_min_bytes is not None:
+            if not callable(configure_intrarow):
+                raise GPUConfigurationError(
+                    "installed plan7_gpu lacks logical intra-row page release"
+                )
+            configure_intrarow(intrarow_min_bytes)
+            intrarow_configured = True
+    except BaseException:
+        try:
+            if avx_configured:
+                configure_avx(None)
+        finally:
+            _gpu_request_page_release_lock.release()
+        raise
+    return configure_avx, configure_intrarow, avx_configured, intrarow_configured
+
+
+def _restore_gpu_request_page_release(configuration):
+    configure_avx, configure_intrarow, avx_configured, intrarow_configured = (
+        configuration
+    )
+    try:
+        if intrarow_configured:
+            configure_intrarow(0)
+    finally:
+        try:
+            if avx_configured:
+                configure_avx(None)
+        finally:
+            _gpu_request_page_release_lock.release()
 
 
 class GPUOverlapMetrics:
@@ -327,8 +461,48 @@ def gpu_profile_cell_cap():
     return int(value)
 
 
+def _pressed_profile_payload_bytes(pressed_base):
+    return sum(
+        Path(f"{pressed_base}.{suffix}").stat().st_size
+        for suffix in PRESSED_SUFFIXES
+    )
+
+
+def gpu_production_request_tuning(
+    pressed_base,
+    profile_count,
+    options,
+    threads,
+    target_count,
+    *,
+    installed_attested=False,
+    cache_enabled=False,
+):
+    """Select only the exact large installed-GPU shape measured on KOFAM."""
+    if not installed_attested:
+        return _disabled_gpu_request_tuning("not-installed-attested")
+    if cache_enabled:
+        return _disabled_gpu_request_tuning("persistent-cache")
+    if any(name in os.environ for name in GPU_PRODUCTION_OVERRIDE_ENVS):
+        return _disabled_gpu_request_tuning("explicit-override")
+    if not _gpu_evalue_only_options(options):
+        return _disabled_gpu_request_tuning("not-evalue-only")
+    if type(threads) is not int or threads != GPU_PRODUCTION_THREAD_COUNT:
+        return _disabled_gpu_request_tuning("thread-count")
+    if type(target_count) is not int or target_count <= GPU_PRODUCTION_TARGET_MINIMUM:
+        return _disabled_gpu_request_tuning("target-count")
+    if type(profile_count) is not int or profile_count <= 0:
+        return _disabled_gpu_request_tuning("profile-count")
+    pressed_bytes = _pressed_profile_payload_bytes(pressed_base)
+    if pressed_bytes < GPU_CHUNK_LOCAL_PROFILE_PACK_MIN_PRESSED_BYTES:
+        return _disabled_gpu_request_tuning(
+            "pressed-payload", pressed_bytes
+        )
+    return _GPURequestTuning(True, pressed_bytes, "eligible-large-gpu")
+
+
 def gpu_chunk_local_profile_pack_configuration(
-    pressed_base, profile_count, *, cache_enabled=False,
+    pressed_base, profile_count, *, cache_enabled=False, automatic=False,
 ):
     """Return the private chunk-local-pack decision and pressed byte count.
 
@@ -336,10 +510,15 @@ def gpu_chunk_local_profile_pack_configuration(
     the normal path performs no extra filesystem work, while an opt-in still
     leaves PFAM and small installed databases on the established eager pack.
     """
+    if type(automatic) is not bool:
+        raise TypeError("automatic chunk-local policy must be bool")
     value = os.environ.get(GPU_CHUNK_LOCAL_PROFILE_PACK_ENV)
-    if value is None or value == '0':
+    if value is None:
+        if not automatic:
+            return False, 0
+    elif value == '0':
         return False, 0
-    if value != '1':
+    elif value != '1':
         raise GPUConfigurationError(
             f"{GPU_CHUNK_LOCAL_PROFILE_PACK_ENV} must be exactly '0' or '1'"
         )
@@ -352,10 +531,7 @@ def gpu_chunk_local_profile_pack_configuration(
         raise TypeError("profile_count must be an integer")
     if profile_count < 0:
         raise ValueError("profile_count must be nonnegative")
-    pressed_bytes = sum(
-        Path(f"{pressed_base}.{suffix}").stat().st_size
-        for suffix in PRESSED_SUFFIXES
-    )
+    pressed_bytes = _pressed_profile_payload_bytes(pressed_base)
     enabled = (
         profile_count > 0
         and pressed_bytes >= GPU_CHUNK_LOCAL_PROFILE_PACK_MIN_PRESSED_BYTES
@@ -381,6 +557,7 @@ def gpu_pressed_profile_stream_configuration(
     threads,
     *,
     cache_enabled=False,
+    automatic=False,
 ):
     """Select the private large, E-only, overlapping GPU stream shape.
 
@@ -402,6 +579,7 @@ def gpu_pressed_profile_stream_configuration(
         pressed_base,
         profile_count,
         cache_enabled=cache_enabled,
+        automatic=automatic,
     )
 
 
@@ -984,7 +1162,8 @@ def validate_gpu_configuration(mappings, installed_hmm_names, parsed_json,
 
 def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
                             all_sequences, threads, gpu_metrics=None,
-                            profile_session_cache=None, search_options=None):
+                            profile_session_cache=None, search_options=None,
+                            request_tuning_by_db=None):
     """Load every attested mapped database and initialize one target batch."""
     if not mappings:
         return {}, None, False
@@ -1004,6 +1183,8 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
             raise TypeError(
                 "profile_session_cache must be GPUProfileSessionCache or None"
             )
+    if request_tuning_by_db is not None and type(request_tuning_by_db) is not dict:
+        raise TypeError("request_tuning_by_db must be exactly dict or None")
 
     database_specs = {}
     for db_name in installed_hmm_names:
@@ -1035,12 +1216,23 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
             validation,
         ) in database_specs.items():
             profile_count = getattr(validation, 'model_count', None)
+            request_tuning = gpu_production_request_tuning(
+                pressed_base,
+                profile_count,
+                search_options,
+                threads,
+                len(all_sequences),
+                installed_attested=True,
+            )
+            if request_tuning_by_db is not None:
+                request_tuning_by_db[db_name] = request_tuning
             stream_enabled, pressed_bytes = (
                 gpu_pressed_profile_stream_configuration(
                     pressed_base,
                     profile_count,
                     search_options,
                     threads,
+                    automatic=request_tuning.automatic,
                 )
             )
             if stream_enabled:
@@ -1073,6 +1265,10 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
             databases[db_name] = (pressed_base, pairs, None)
     else:
         for db_name, (pressed_base, _, _) in database_specs.items():
+            if request_tuning_by_db is not None:
+                request_tuning_by_db[db_name] = _disabled_gpu_request_tuning(
+                    "persistent-cache"
+                )
             databases[db_name] = (pressed_base, (), None)
 
     postfilter = gpu_postfilter_available()
@@ -3144,12 +3340,20 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
               all_sequences=None, gpu_sequence_batch=None,
               gpu_postfilter=None, gpu_profile_session=None,
               gpu_metrics=None, gpu_profile_overlap=True,
+              gpu_request_tuning=None,
               telemetry_collector=None, sparse_journal_v3=False,
               ga_pruning=False):
     if type(sparse_journal_v3) is not bool:
         raise TypeError("sparse_journal_v3 must be bool")
     if type(ga_pruning) is not bool:
         raise TypeError("ga_pruning must be bool")
+    if (
+        gpu_request_tuning is not None
+        and type(gpu_request_tuning) is not _GPURequestTuning
+    ):
+        raise TypeError(
+            "gpu_request_tuning must be exactly _GPURequestTuning or None"
+        )
     hmmsearch_kwargs = define_kwargs(options)
     streamed_gpu_profiles = (
         type(gpu_profile_session) is _PressedGPUProfileStream
@@ -3291,8 +3495,16 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
             f"{GPU_READY_QUEUE_DEPTH_ENV} and {GPU_READY_QUEUE_BYTES_ENV} "
             "require the active bounded-ready-queue scheduler"
         )
-    continuation_pool_enabled = _gpu_continuation_pool_enabled()
-    continuation_window = _gpu_continuation_window()
+    automatic_gpu_tuning = bool(
+        gpu_request_tuning is not None
+        and gpu_request_tuning.automatic
+    )
+    continuation_pool_enabled = _gpu_continuation_pool_enabled(
+        automatic_gpu_tuning
+    )
+    continuation_window = _gpu_continuation_window(
+        GPU_PRODUCTION_CONTINUATION_WINDOW if automatic_gpu_tuning else 1
+    )
     if continuation_pool_enabled and gpu_profile_session is None:
         raise GPUConfigurationError(
             f"{GPU_CONTINUATION_POOL_ENV}=1 requires a GPU profile session"
@@ -3537,14 +3749,31 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                     profile_run_options['sparse_journal_v3'] = True
                 if ga_pruning:
                     profile_run_options['ga_pruning'] = True
-                continuation_pools = _new_gpu_continuation_pools(
-                    chunks,
-                    continuation_threads,
-                    continuation_pool_enabled,
-                    continuation_window,
+                release_configuration = (
+                    _configure_gpu_request_page_release(gpu_request_tuning)
                 )
-                profile_run_options['continuation_pools'] = continuation_pools
+                continuation_pools = None
                 try:
+                    continuation_pools = _new_gpu_continuation_pools(
+                        chunks,
+                        continuation_threads,
+                        continuation_pool_enabled,
+                        continuation_window,
+                        task_policy=(
+                            'sharded' if automatic_gpu_tuning else None
+                        ),
+                        shard_trigger=(
+                            GPU_PRODUCTION_SHARD_TRIGGER
+                            if automatic_gpu_tuning else None
+                        ),
+                        pipeline_madvise_work_hint=(
+                            GPU_PRODUCTION_PIPELINE_MADVISE_WORK_HINT
+                            if automatic_gpu_tuning else None
+                        ),
+                    )
+                    profile_run_options['continuation_pools'] = (
+                        continuation_pools
+                    )
                     if profile_scheduler_mode == 'bounded-ready-queue':
                         _run_gpu_profile_pipeline(
                             chunks,
@@ -3581,9 +3810,14 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                             **profile_run_options,
                         )
                 finally:
-                    _close_gpu_continuation_pools(
-                        continuation_pools, gpu_metrics
-                    )
+                    try:
+                        _close_gpu_continuation_pools(
+                            continuation_pools, gpu_metrics
+                        )
+                    finally:
+                        _restore_gpu_request_page_release(
+                            release_configuration
+                        )
             else:
                 for chunk_index, hmm_chunk, _, kwargs in chunks:
                     print(f"  Chunk {chunk_index}/{total_chunks} "
@@ -4359,6 +4593,7 @@ def main(args, *, gpu_profile_session_cache=None):
     gpu_sequence_batch = None
     gpu_postfilter = False
     gpu_metrics_by_db = None
+    gpu_request_tuning_by_db = {}
     if gpu_manifests:
         # This check must happen before constructing a CUDA SequenceBatch or
         # creating any result path. With one HMM, a larger target set already
@@ -4379,6 +4614,7 @@ def main(args, *, gpu_profile_session_cache=None):
             gpu_metrics_by_db,
             gpu_profile_session_cache,
             search_options=hmmsearch_options,
+            request_tuning_by_db=gpu_request_tuning_by_db,
         )
 
     try:
@@ -4544,6 +4780,9 @@ def main(args, *, gpu_profile_session_cache=None):
                                     else None
                                 ),
                                 gpu_profile_overlap=gpu_profile_overlap,
+                                gpu_request_tuning=(
+                                    gpu_request_tuning_by_db.get(hmm_db)
+                                ),
                             )
                             if (
                                 db_metrics is not None
