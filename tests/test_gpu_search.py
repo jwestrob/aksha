@@ -789,6 +789,12 @@ class GPUConfigurationTests(unittest.TestCase):
                         True, large, "eligible-large-gpu"
                     ),
                 )
+                self.assertTrue(
+                    search._gpu_automatic_sparse_journal_v3(selected)
+                )
+                self.assertFalse(
+                    search._gpu_automatic_sparse_journal_v3(None)
+                )
                 self.assertFalse(search._gpu_continuation_pool_enabled())
                 self.assertEqual(search._gpu_continuation_window(), 1)
                 self.assertEqual(search.gpu_profile_cell_cap(), 100_000_000)
@@ -825,6 +831,11 @@ class GPUConfigurationTests(unittest.TestCase):
                             search.gpu_production_request_tuning(**arguments).reason,
                             reason,
                         )
+                        self.assertFalse(
+                            search._gpu_automatic_sparse_journal_v3(
+                                search.gpu_production_request_tuning(**arguments)
+                            )
+                        )
 
             with mock.patch.object(
                 search,
@@ -847,6 +858,81 @@ class GPUConfigurationTests(unittest.TestCase):
                     self.assertFalse(selected.automatic)
                     self.assertEqual(selected.reason, "explicit-override")
 
+    def test_pfam_filter_tail_policy_is_exact_and_override_safe(self):
+        with tempfile.TemporaryDirectory(
+            prefix="astra-gpu-pfam-filter-policy-"
+        ) as temporary:
+            gathering = search_options(temporary, cut_ga=True)
+            eligible = dict(
+                options=gathering,
+                threads=64,
+                target_count=300_186,
+                installed_attested=True,
+                single_mapped_database=True,
+            )
+            with mock.patch.dict(os.environ, {}, clear=True):
+                self.assertTrue(
+                    search.gpu_filter_tail_simd_request(**eligible)
+                )
+                disabled = search._disabled_gpu_request_tuning(
+                    "not-evalue-only"
+                )
+                self.assertTrue(
+                    search._gpu_automatic_continuation_tuning(
+                        disabled, True
+                    )
+                )
+                self.assertTrue(
+                    search._gpu_automatic_sparse_journal_v3(
+                        disabled, True
+                    )
+                )
+                self.assertTrue(search._gpu_continuation_pool_enabled(True))
+                self.assertEqual(
+                    search._gpu_continuation_window(
+                        search.GPU_PRODUCTION_CONTINUATION_WINDOW
+                    ),
+                    4,
+                )
+
+                ineligible = (
+                    {"installed_attested": False},
+                    {"single_mapped_database": False},
+                    {"threads": 63},
+                    {"threads": True},
+                    {"target_count": 65_536},
+                    {"options": search_options(temporary, evalue="1e-15")},
+                    {"options": search_options(temporary)},
+                    {
+                        "options": search_options(
+                            temporary, cut_ga=True, domE="1e-3"
+                        )
+                    },
+                    {
+                        "options": search_options(
+                            temporary, cascade=True, cut_ga=True
+                        )
+                    },
+                )
+                for changes in ineligible:
+                    arguments = dict(eligible)
+                    arguments.update(changes)
+                    with self.subTest(changes=changes):
+                        self.assertFalse(
+                            search.gpu_filter_tail_simd_request(**arguments)
+                        )
+
+            for environment in search.GPU_PRODUCTION_OVERRIDE_ENVS:
+                with self.subTest(environment=environment), mock.patch.dict(
+                    os.environ, {environment: "1"}, clear=True
+                ):
+                    self.assertFalse(
+                        search.gpu_filter_tail_simd_request(**eligible)
+                    )
+
+            with self.assertRaisesRegex(TypeError, "filter_tail_simd"):
+                search._gpu_automatic_continuation_tuning(None, 1)
+
     def test_request_page_release_is_scoped_reset_and_failure_safe(self):
         automatic = search._GPURequestTuning(True, 4 << 30, "eligible-large-gpu")
         modules, _ = synthetic_plan7_gpu()
@@ -856,6 +942,9 @@ class GPUConfigurationTests(unittest.TestCase):
         )
         pipeline._swap_intrarow_page_release_bound = mock.Mock(
             return_value=4096
+        )
+        pipeline._swap_filter_tail_simd_bound = mock.Mock(
+            return_value=False
         )
 
         with mock.patch.dict(sys.modules, modules), mock.patch.dict(
@@ -880,6 +969,19 @@ class GPUConfigurationTests(unittest.TestCase):
             )
             self.assertEqual(
                 pipeline._swap_avx512_tail_madvise_bound.call_args_list,
+                [mock.call(True), mock.call(False)],
+            )
+            pipeline._swap_avx512_tail_madvise_bound.reset_mock()
+            pipeline._swap_intrarow_page_release_bound.reset_mock()
+            configuration = search._configure_gpu_request_page_release(
+                search._disabled_gpu_request_tuning("pfam"), True
+            )
+            pipeline._swap_filter_tail_simd_bound.assert_called_once_with(True)
+            pipeline._swap_avx512_tail_madvise_bound.assert_not_called()
+            pipeline._swap_intrarow_page_release_bound.assert_not_called()
+            search._restore_gpu_request_page_release(configuration)
+            self.assertEqual(
+                pipeline._swap_filter_tail_simd_bound.call_args_list,
                 [mock.call(True), mock.call(False)],
             )
             self.assertTrue(search._gpu_request_page_release_lock.acquire(False))
@@ -1707,6 +1809,71 @@ class GPUProfileOverlapTests(unittest.TestCase):
             continuation_pools=None,
         )
         self.assertEqual(collector.expected_profile_calls, [()])
+
+    def test_pfam_policy_selects_measured_continuation_without_page_release(self):
+        class Session:
+            closed = False
+            statistics = {"worker_count": 0, "host_bytes": 1}
+
+            def __len__(self):
+                return 0
+
+        modules, _ = synthetic_plan7_gpu(
+            True,
+            True,
+            True,
+            compact_seam_available=True,
+            sparse_journal_v3_available=True,
+        )
+        pools = object()
+        disabled = search._disabled_gpu_request_tuning("not-evalue-only")
+        with tempfile.TemporaryDirectory(
+            prefix="astra-pfam-continuation-policy-"
+        ) as temporary:
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.dict(sys.modules, modules),
+                mock.patch.object(
+                    search, "_new_gpu_continuation_pools", return_value=pools
+                ) as new_pools,
+                mock.patch.object(search, "_close_gpu_continuation_pools"),
+                mock.patch.object(
+                    search, "_configure_gpu_request_page_release",
+                    return_value="filter-only",
+                ) as configure,
+                mock.patch.object(
+                    search, "_restore_gpu_request_page_release"
+                ) as restore,
+                mock.patch.object(search, "_run_gpu_profile_pipeline") as run,
+            ):
+                search.hmmsearch(
+                    {},
+                    [],
+                    64,
+                    search_options(temporary, cut_ga=True),
+                    all_sequences=[],
+                    gpu_sequence_batch=object(),
+                    gpu_postfilter=True,
+                    gpu_profile_session=Session(),
+                    gpu_request_tuning=disabled,
+                    gpu_filter_tail_simd=True,
+                    sparse_journal_v3=True,
+                )
+
+        new_pools.assert_called_once_with(
+            [],
+            63,
+            True,
+            4,
+            task_policy="sharded",
+            shard_trigger=(3, 2),
+            pipeline_madvise_work_hint=None,
+        )
+        configure.assert_called_once_with(disabled, True)
+        restore.assert_called_once_with("filter-only")
+        self.assertEqual(run.call_args.kwargs["continuation_window"], 4)
+        self.assertIs(run.call_args.kwargs["continuation_pools"], pools)
+        self.assertIs(run.call_args.kwargs["sparse_journal_v3"], True)
 
     def test_disabled_bias_uses_the_existing_forward_selection_abi(self):
         calls = []
@@ -4538,6 +4705,63 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
             )
             self.assertNotIn(
                 "_forward_cpu_max_cells", api.SequenceBatch.call_args.kwargs
+            )
+
+    def test_pfam_preflight_binds_filter_continuation_and_forward_policy(self):
+        with tempfile.TemporaryDirectory(
+            prefix="astra-gpu-pfam-production-preflight-"
+        ) as temporary:
+            root = Path(temporary)
+            db_dir = root / "PFAM"
+            db_dir.mkdir()
+            make_pressed_members(db_dir, "profiles")
+            configuration = {
+                "db_urls": [{
+                    "name": "PFAM",
+                    "installed": True,
+                    "installation_dir": os.fspath(db_dir),
+                    "molecule_type": "protein",
+                }]
+            }
+            targets = mock.MagicMock(name="targets")
+            targets.__len__.return_value = 300_186
+            modules, api = synthetic_plan7_gpu(True)
+            api.validate_pressed_manifest.return_value = SimpleNamespace(
+                model_count=19_632
+            )
+            api.load_pressed_profiles.return_value = (object(),)
+            batch = mock.Mock(name="sequence_batch")
+            batch.memory_snapshot = {"device_ordinal": 0}
+            api.SequenceBatch.return_value = batch
+            tuning = {}
+            filter_tail = {}
+
+            with mock.patch.dict(sys.modules, modules), mock.patch.dict(
+                os.environ, {}, clear=True
+            ):
+                databases, observed_batch, _ = search.preflight_gpu_databases(
+                    {"PFAM": "PFAM.json"},
+                    ["PFAM"],
+                    configuration,
+                    targets,
+                    64,
+                    search_options=search_options(temporary, cut_ga=True),
+                    request_tuning_by_db=tuning,
+                    filter_tail_simd_by_db=filter_tail,
+                )
+
+            self.assertIs(observed_batch, batch)
+            self.assertFalse(tuning["PFAM"].automatic)
+            self.assertEqual(tuning["PFAM"].reason, "not-evalue-only")
+            self.assertEqual(filter_tail, {"PFAM": True})
+            self.assertNotIsInstance(
+                databases["PFAM"][1], search._PressedGPUProfileStream
+            )
+            self.assertEqual(
+                api.SequenceBatch.call_args.kwargs[
+                    "_forward_cpu_max_cells"
+                ],
+                200_000,
             )
 
     def test_profile_cache_reuses_one_attested_session_across_preflights(self):

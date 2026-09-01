@@ -88,6 +88,8 @@ GPU_PRODUCTION_OVERRIDE_ENVS = (
     'PLAN7_GPU_FULL_MSV_POLICY',
     'PLAN7_GPU_SSV_LENGTH_METADATA',
     'PLAN7_GPU_SSV_PROFILE_POLICY',
+    'PLAN7_GPU_FILTER_TAIL_SIMD',
+    'PLAN7_GPU_FILTER_TAIL_SIMD_TEST_FALLBACK',
 )
 _NATIVE_TSV_ROWS_UNRESOLVED = object()
 _native_tsv_rows = _NATIVE_TSV_ROWS_UNRESOLVED
@@ -109,6 +111,48 @@ class _GPURequestTuning(NamedTuple):
 
 def _disabled_gpu_request_tuning(reason, pressed_bytes=0):
     return _GPURequestTuning(False, pressed_bytes, reason)
+
+
+def _gpu_automatic_sparse_journal_v3(
+    request_tuning, filter_tail_simd=False,
+):
+    """Select sparse journal v3 only as part of the exact automatic bundle."""
+    return _gpu_automatic_continuation_tuning(
+        request_tuning, filter_tail_simd
+    )
+
+
+def _gpu_automatic_continuation_tuning(
+    request_tuning, filter_tail_simd=False,
+):
+    """Select the measured continuation stack for KOFAM or PFAM."""
+    if type(filter_tail_simd) is not bool:
+        raise TypeError("filter_tail_simd must be bool")
+    if request_tuning is None:
+        return filter_tail_simd
+    if type(request_tuning) is not _GPURequestTuning:
+        raise TypeError("request_tuning must be exactly _GPURequestTuning or None")
+    return request_tuning.automatic or filter_tail_simd
+
+
+def gpu_filter_tail_simd_request(
+    options, threads, target_count, *, installed_attested=False,
+    single_mapped_database=False,
+):
+    """Select the exact retained PFAM gathering-cutoff SIMD request shape."""
+    if not installed_attested or not single_mapped_database:
+        return False
+    if type(threads) is not int or threads != GPU_PRODUCTION_THREAD_COUNT:
+        return False
+    if type(target_count) is not int or target_count <= GPU_PRODUCTION_TARGET_MINIMUM:
+        return False
+    if any(name in os.environ for name in GPU_PRODUCTION_OVERRIDE_ENVS):
+        return False
+    try:
+        kwargs = define_kwargs(options)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    return kwargs == {'bit_cutoffs': 'gathering'}
 
 
 def _gpu_continuation_pool_enabled(default=False):
@@ -233,8 +277,12 @@ def _gpu_intrarow_release_min_bytes(default=None):
     return parsed
 
 
-def _configure_gpu_request_page_release(request_tuning):
-    """Apply and return scoped release hooks without mutating the environment."""
+def _configure_gpu_request_page_release(
+    request_tuning, filter_tail_simd=False,
+):
+    """Apply and return scoped core hooks without mutating the environment."""
+    if type(filter_tail_simd) is not bool:
+        raise TypeError("filter_tail_simd must be bool")
     from plan7_gpu import _pipeline
 
     automatic = bool(
@@ -249,12 +297,17 @@ def _configure_gpu_request_page_release(request_tuning):
     swap_intrarow = getattr(
         _pipeline, '_swap_intrarow_page_release_bound', None
     )
-    if not automatic and intrarow_min_bytes is None:
+    swap_filter_tail = getattr(
+        _pipeline, '_swap_filter_tail_simd_bound', None
+    )
+    if not automatic and intrarow_min_bytes is None and not filter_tail_simd:
         return None
     previous_avx = None
     previous_intrarow = None
+    previous_filter_tail = None
     avx_configured = False
     intrarow_configured = False
+    filter_tail_configured = False
     _gpu_request_page_release_lock.acquire()
     try:
         if automatic:
@@ -271,12 +324,27 @@ def _configure_gpu_request_page_release(request_tuning):
                 )
             previous_intrarow = swap_intrarow(intrarow_min_bytes)
             intrarow_configured = True
+        if filter_tail_simd:
+            if not callable(swap_filter_tail):
+                raise GPUConfigurationError(
+                    "installed plan7_gpu lacks request-scoped filter-tail SIMD"
+                )
+            previous_filter_tail = swap_filter_tail(True)
+            filter_tail_configured = True
     except BaseException:
         try:
-            if avx_configured:
-                swap_avx(previous_avx)
+            if filter_tail_configured:
+                swap_filter_tail(previous_filter_tail)
         finally:
-            _gpu_request_page_release_lock.release()
+            try:
+                if intrarow_configured:
+                    swap_intrarow(previous_intrarow)
+            finally:
+                try:
+                    if avx_configured:
+                        swap_avx(previous_avx)
+                finally:
+                    _gpu_request_page_release_lock.release()
         raise
     return (
         swap_avx,
@@ -285,6 +353,9 @@ def _configure_gpu_request_page_release(request_tuning):
         intrarow_configured,
         previous_avx,
         previous_intrarow,
+        swap_filter_tail,
+        filter_tail_configured,
+        previous_filter_tail,
     )
 
 
@@ -298,16 +369,23 @@ def _restore_gpu_request_page_release(configuration):
         intrarow_configured,
         previous_avx,
         previous_intrarow,
+        swap_filter_tail,
+        filter_tail_configured,
+        previous_filter_tail,
     ) = configuration
     try:
-        if intrarow_configured:
-            swap_intrarow(previous_intrarow)
+        if filter_tail_configured:
+            swap_filter_tail(previous_filter_tail)
     finally:
         try:
-            if avx_configured:
-                swap_avx(previous_avx)
+            if intrarow_configured:
+                swap_intrarow(previous_intrarow)
         finally:
-            _gpu_request_page_release_lock.release()
+            try:
+                if avx_configured:
+                    swap_avx(previous_avx)
+            finally:
+                _gpu_request_page_release_lock.release()
 
 
 class GPUOverlapMetrics:
@@ -1199,7 +1277,8 @@ def validate_gpu_configuration(mappings, installed_hmm_names, parsed_json,
 def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
                             all_sequences, threads, gpu_metrics=None,
                             profile_session_cache=None, search_options=None,
-                            request_tuning_by_db=None):
+                            request_tuning_by_db=None,
+                            filter_tail_simd_by_db=None):
     """Load every attested mapped database and initialize one target batch."""
     if not mappings:
         return {}, None, False
@@ -1221,6 +1300,11 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
             )
     if request_tuning_by_db is not None and type(request_tuning_by_db) is not dict:
         raise TypeError("request_tuning_by_db must be exactly dict or None")
+    if (
+        filter_tail_simd_by_db is not None
+        and type(filter_tail_simd_by_db) is not dict
+    ):
+        raise TypeError("filter_tail_simd_by_db must be exactly dict or None")
 
     database_specs = {}
     for db_name in installed_hmm_names:
@@ -1243,6 +1327,21 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
             "persistent GPU profile caching currently requires exactly one "
             "mapped database"
         )
+
+    selected_filter_tail_simd = False
+    for db_name in database_specs:
+        filter_tail_simd = gpu_filter_tail_simd_request(
+            search_options,
+            threads,
+            len(all_sequences),
+            installed_attested=True,
+            single_mapped_database=(len(database_specs) == 1),
+        )
+        selected_filter_tail_simd = (
+            selected_filter_tail_simd or filter_tail_simd
+        )
+        if filter_tail_simd_by_db is not None:
+            filter_tail_simd_by_db[db_name] = filter_tail_simd
 
     databases = {}
     selected_request_tuning = None
@@ -1329,8 +1428,11 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
             "alphabet": pyhmmer.easel.Alphabet.amino(),
         }
         if (
-            selected_request_tuning is not None
-            and selected_request_tuning.automatic
+            (
+                selected_request_tuning is not None
+                and selected_request_tuning.automatic
+            )
+            or selected_filter_tail_simd
         ):
             batch_arguments["_forward_cpu_max_cells"] = (
                 GPU_PRODUCTION_FORWARD_CPU_MAX_CELLS
@@ -3392,12 +3494,15 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
               gpu_postfilter=None, gpu_profile_session=None,
               gpu_metrics=None, gpu_profile_overlap=True,
               gpu_request_tuning=None,
+              gpu_filter_tail_simd=False,
               telemetry_collector=None, sparse_journal_v3=False,
               ga_pruning=False):
     if type(sparse_journal_v3) is not bool:
         raise TypeError("sparse_journal_v3 must be bool")
     if type(ga_pruning) is not bool:
         raise TypeError("ga_pruning must be bool")
+    if type(gpu_filter_tail_simd) is not bool:
+        raise TypeError("gpu_filter_tail_simd must be bool")
     if (
         gpu_request_tuning is not None
         and type(gpu_request_tuning) is not _GPURequestTuning
@@ -3453,6 +3558,10 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
         )
     if ga_pruning and not sparse_journal_v3:
         raise GPUConfigurationError("GA pruning requires sparse journal v3")
+    if gpu_filter_tail_simd and not sparse_journal_v3:
+        raise GPUConfigurationError(
+            "filter-tail SIMD requires sparse journal v3"
+        )
     if gpu_metrics is not None and not isinstance(gpu_metrics, GPUOverlapMetrics):
         raise TypeError("gpu_metrics must be GPUOverlapMetrics or None")
     if type(gpu_profile_overlap) is not bool:
@@ -3550,11 +3659,14 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
         gpu_request_tuning is not None
         and gpu_request_tuning.automatic
     )
+    continuation_tuning = _gpu_automatic_continuation_tuning(
+        gpu_request_tuning, gpu_filter_tail_simd
+    )
     continuation_pool_enabled = _gpu_continuation_pool_enabled(
-        automatic_gpu_tuning
+        continuation_tuning
     )
     continuation_window = _gpu_continuation_window(
-        GPU_PRODUCTION_CONTINUATION_WINDOW if automatic_gpu_tuning else 1
+        GPU_PRODUCTION_CONTINUATION_WINDOW if continuation_tuning else 1
     )
     if continuation_pool_enabled and gpu_profile_session is None:
         raise GPUConfigurationError(
@@ -3801,7 +3913,9 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                 if ga_pruning:
                     profile_run_options['ga_pruning'] = True
                 release_configuration = (
-                    _configure_gpu_request_page_release(gpu_request_tuning)
+                    _configure_gpu_request_page_release(
+                        gpu_request_tuning, gpu_filter_tail_simd
+                    )
                 )
                 continuation_pools = None
                 try:
@@ -3811,11 +3925,11 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                         continuation_pool_enabled,
                         continuation_window,
                         task_policy=(
-                            'sharded' if automatic_gpu_tuning else None
+                            'sharded' if continuation_tuning else None
                         ),
                         shard_trigger=(
                             GPU_PRODUCTION_SHARD_TRIGGER
-                            if automatic_gpu_tuning else None
+                            if continuation_tuning else None
                         ),
                         pipeline_madvise_work_hint=(
                             GPU_PRODUCTION_PIPELINE_MADVISE_WORK_HINT
@@ -4645,6 +4759,7 @@ def main(args, *, gpu_profile_session_cache=None):
     gpu_postfilter = False
     gpu_metrics_by_db = None
     gpu_request_tuning_by_db = {}
+    gpu_filter_tail_simd_by_db = {}
     if gpu_manifests:
         # This check must happen before constructing a CUDA SequenceBatch or
         # creating any result path. With one HMM, a larger target set already
@@ -4666,6 +4781,7 @@ def main(args, *, gpu_profile_session_cache=None):
             gpu_profile_session_cache,
             search_options=hmmsearch_options,
             request_tuning_by_db=gpu_request_tuning_by_db,
+            filter_tail_simd_by_db=gpu_filter_tail_simd_by_db,
         )
 
     try:
@@ -4818,6 +4934,14 @@ def main(args, *, gpu_profile_session_cache=None):
                                 if gpu_metrics_by_db is not None
                                 else None
                             )
+                            request_tuning = (
+                                gpu_request_tuning_by_db.get(hmm_db)
+                            )
+                            filter_tail_simd = (
+                                gpu_filter_tail_simd_by_db.get(
+                                    hmm_db, False
+                                )
+                            )
                             tmp_dir = hmmsearch(
                                 protein_dict, db_hmms, args.threads,
                                 hmmsearch_options, hmm_db,
@@ -4831,9 +4955,13 @@ def main(args, *, gpu_profile_session_cache=None):
                                     else None
                                 ),
                                 gpu_profile_overlap=gpu_profile_overlap,
-                                gpu_request_tuning=(
-                                    gpu_request_tuning_by_db.get(hmm_db)
+                                gpu_request_tuning=request_tuning,
+                                sparse_journal_v3=(
+                                    _gpu_automatic_sparse_journal_v3(
+                                        request_tuning, filter_tail_simd
+                                    )
                                 ),
+                                gpu_filter_tail_simd=filter_tail_simd,
                             )
                             if (
                                 db_metrics is not None

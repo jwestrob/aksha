@@ -34,18 +34,27 @@ That immutable request-local decision selects 100,000,000 profile-target
 cells per chunk, streamed chunk-local profile sessions, a pooled global
 continuation window of four, exact sharded continuation at ratio 3/2, a
 1,300,000,000-work-unit Pipeline page-release threshold, AVX result-page
-release, logical HMMER intra-row release at 16 MiB, and request-local hybrid
-Forward ownership below or equal to 200,000 cells. The Forward cutoff is bound
-while the shared target batch is constructed; the page-release hooks save and
+release, logical HMMER intra-row release at 16 MiB, sparse journal v3, and
+request-local hybrid Forward ownership below or equal to 200,000 cells. The
+Forward cutoff is bound while the shared target batch is constructed; the
+page-release hooks save and
 restore prior programmatic state. The policy is passed through Python objects
 and scoped extension hooks; it never writes process environment variables.
 
 Every failed predicate keeps the previous eager/profile-session scheduler and
 default core behavior. An explicit private setting disables the automatic
 bundle and remains authoritative, providing the rollback path. CPU requests,
-custom HMM inputs, PFAM/small databases, GA/cascade/domain/inclusion/bit-score
+custom HMM inputs, small databases, cascade/domain/inclusion/bit-score
 requests, cached or multi-database sessions, non-1e-15 thresholds, and
 non-64-thread requests therefore keep their measured paths.
+
+The separate retained PFAM policy is selected only for one attested installed
+GPU database, exactly 64 threads, more than 65,536 targets, gathering cutoffs,
+and no private path override. It keeps eager profile loading and default page
+release, while enabling sparse journal v3, filter-tail SIMD, the pooled global
+continuation window of four, exact 3/2 sharding, and request-local hybrid
+Forward ownership below or equal to 200,000 cells. The explicit filter-tail
+SIMD and test-fallback environment controls both disable this automatic path.
 
 ## Allocator launcher
 
@@ -55,6 +64,11 @@ GPU-manifest searches. This avoids a second FASTA parse or late allocator
 mutation. A user-supplied `MALLOC_ARENA_MAX` remains authoritative;
 `ASTRA_CPU_MALLOC_ARENA_MAX=0` remains the compatible opt-out despite its
 legacy CPU-specific name. Direct/library APIs retain their prior behavior.
+
+AVX, logical page-release, and filter-tail SIMD settings are process-global in
+their underlying private runtimes. Astra-managed calls serialize, save, and
+restore them. Private direct plan7_gpu/PyHMMER callers must not mutate or use
+those private release hooks concurrently with an Astra-managed tuned request.
 
 No branch in this preparation has been merged to main or pushed. A coordinated
 wheel/build and exact GPU plus PFAM/default regression gates are still required
