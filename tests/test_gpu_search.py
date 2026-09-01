@@ -632,6 +632,65 @@ class GPUConfigurationTests(unittest.TestCase):
                 ):
                     search.gpu_profile_cell_cap()
 
+    def test_chunk_local_profile_pack_is_private_and_shape_gated(self):
+        with tempfile.TemporaryDirectory(
+            prefix="astra-chunk-local-pack-"
+        ) as temporary:
+            base = make_pressed_members(Path(temporary), "profiles")
+            for suffix, size in zip(search.PRESSED_SUFFIXES, (1, 2, 3, 4)):
+                os.truncate(f"{base}.{suffix}", size)
+
+            with mock.patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(
+                    search.gpu_chunk_local_profile_pack_configuration(
+                        Path(temporary) / "does-not-exist", 3
+                    ),
+                    (False, 0),
+                )
+            with mock.patch.dict(
+                os.environ,
+                {search.GPU_CHUNK_LOCAL_PROFILE_PACK_ENV: "0"},
+                clear=True,
+            ):
+                self.assertEqual(
+                    search.gpu_chunk_local_profile_pack_configuration(base, 3),
+                    (False, 0),
+                )
+            with mock.patch.dict(
+                os.environ,
+                {search.GPU_CHUNK_LOCAL_PROFILE_PACK_ENV: "1"},
+                clear=True,
+            ), mock.patch.object(
+                search,
+                "GPU_CHUNK_LOCAL_PROFILE_PACK_MIN_PRESSED_BYTES",
+                10,
+            ):
+                self.assertEqual(
+                    search.gpu_chunk_local_profile_pack_configuration(base, 3),
+                    (True, 10),
+                )
+                self.assertEqual(
+                    search.gpu_chunk_local_profile_pack_configuration(base, 0),
+                    (False, 10),
+                )
+                with self.assertRaisesRegex(
+                    search.GPUConfigurationError, "persistent GPU profile"
+                ):
+                    search.gpu_chunk_local_profile_pack_configuration(
+                        base, 3, cache_enabled=True
+                    )
+
+            for invalid in ("", "yes", "2", " 1"):
+                with self.subTest(invalid=invalid), mock.patch.dict(
+                    os.environ,
+                    {search.GPU_CHUNK_LOCAL_PROFILE_PACK_ENV: invalid},
+                    clear=True,
+                ):
+                    with self.assertRaisesRegex(
+                        search.GPUConfigurationError, "exactly '0' or '1'"
+                    ):
+                        search.gpu_chunk_local_profile_pack_configuration(base, 3)
+
     def test_profile_worker_allocation_reserves_one_control_slot(self):
         self.assertEqual(
             search.gpu_profile_worker_allocation(1, True),
@@ -3442,6 +3501,87 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
             api.ProfileSession.assert_called_once_with(
                 pairs, build_workers=2, selection_workers=0
             )
+
+    def test_large_opt_in_session_uses_chunk_local_pack_and_accounts_payload(self):
+        with tempfile.TemporaryDirectory(
+            prefix="astra-gpu-chunk-local-pack-"
+        ) as temporary:
+            root = Path(temporary)
+            db_dir = root / "GPUDB"
+            db_dir.mkdir()
+            pressed_base = make_pressed_members(db_dir, "profiles")
+            for suffix, size in zip(search.PRESSED_SUFFIXES, (1, 2, 3, 4)):
+                os.truncate(f"{pressed_base}.{suffix}", size)
+            config = {
+                "db_urls": [{
+                    "name": "GPUDB",
+                    "installed": True,
+                    "installation_dir": os.fspath(db_dir),
+                    "molecule_type": "protein",
+                }]
+            }
+            modules, api = synthetic_plan7_gpu(True)
+            pairs = (object(), object(), object())
+            batch = mock.Mock(name="sequence_batch")
+            batch.memory_snapshot = {"device_ordinal": 0}
+            api.load_pressed_profiles.return_value = pairs
+            api.SequenceBatch.return_value = batch
+            api.ProfileSession.return_value.statistics = {
+                "session_id": 17,
+                "selection_count": 0,
+                "host_bytes": 152,
+                "chunk_local_pack": True,
+                "profile_pointer_bytes": 48,
+                "identity_token_bytes": 24,
+                "background_bytes": 80,
+            }
+            metrics = {"GPUDB": search.GPUOverlapMetrics()}
+
+            with mock.patch.dict(sys.modules, modules), mock.patch.dict(
+                os.environ,
+                {search.GPU_CHUNK_LOCAL_PROFILE_PACK_ENV: "1"},
+                clear=True,
+            ), mock.patch.object(
+                search,
+                "GPU_CHUNK_LOCAL_PROFILE_PACK_MIN_PRESSED_BYTES",
+                10,
+            ):
+                databases, observed_batch, postfilter = (
+                    search.preflight_gpu_databases(
+                        {"GPUDB": "manifest.json"},
+                        ["GPUDB"],
+                        config,
+                        [object()],
+                        2,
+                        gpu_metrics=metrics,
+                    )
+                )
+
+            self.assertEqual(
+                databases,
+                {
+                    "GPUDB": (
+                        pressed_base.resolve(),
+                        pairs,
+                        api.ProfileSession.return_value,
+                    )
+                },
+            )
+            self.assertIs(observed_batch, batch)
+            self.assertTrue(postfilter)
+            api.ProfileSession.assert_called_once_with(
+                pairs,
+                build_workers=2,
+                selection_workers=0,
+                _chunk_local_pack=True,
+            )
+            snapshot = metrics["GPUDB"].snapshot()
+            self.assertEqual(snapshot["profile_host_bytes"], 152)
+            self.assertIs(snapshot["profile_chunk_local_pack"], True)
+            self.assertEqual(snapshot["profile_pressed_bytes"], 10)
+            self.assertEqual(snapshot["profile_pointer_bytes"], 48)
+            self.assertEqual(snapshot["profile_identity_token_bytes"], 24)
+            self.assertEqual(snapshot["profile_background_bytes"], 80)
 
     def test_profile_cache_reuses_one_attested_session_across_preflights(self):
         with tempfile.TemporaryDirectory(prefix="astra-gpu-cache-") as temporary:

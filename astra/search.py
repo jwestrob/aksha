@@ -25,6 +25,8 @@ CPU_STREAM_PRESSED_AUTO = "auto"
 GPU_CELL_CAP = 100_000_000
 GPU_PROFILE_CELL_CAP_ENV = 'ASTRA_GPU_PROFILE_CELL_CAP'
 GPU_PROFILE_CELL_CAPS = (100_000_000, 200_000_000, 300_000_000, 400_000_000)
+GPU_CHUNK_LOCAL_PROFILE_PACK_ENV = 'ASTRA_GPU_CHUNK_LOCAL_PROFILE_PACK'
+GPU_CHUNK_LOCAL_PROFILE_PACK_MIN_PRESSED_BYTES = 4 << 30
 GPU_TIMING_ENV = 'ASTRA_GPU_OVERLAP_TIMING'
 GPU_SERIAL_ENV = 'ASTRA_GPU_PROFILE_SERIAL'
 GPU_LEGACY_OVERLAP_ENV = 'ASTRA_GPU_PROFILE_LEGACY_OVERLAP'
@@ -112,6 +114,11 @@ class GPUOverlapMetrics:
         self.profile_overlap_enabled = False
         self.scheduler_mode = 'none'
         self.profile_host_bytes = 0
+        self.profile_chunk_local_pack = False
+        self.profile_pressed_bytes = 0
+        self.profile_pointer_bytes = 0
+        self.profile_identity_token_bytes = 0
+        self.profile_background_bytes = 0
         self.chunk_count = 0
         self.generated_chunk_count = 0
         self.consumed_chunk_count = 0
@@ -171,6 +178,11 @@ class GPUOverlapMetrics:
             'profile_overlap_enabled': self.profile_overlap_enabled,
             'scheduler_mode': self.scheduler_mode,
             'profile_host_bytes': self.profile_host_bytes,
+            'profile_chunk_local_pack': self.profile_chunk_local_pack,
+            'profile_pressed_bytes': self.profile_pressed_bytes,
+            'profile_pointer_bytes': self.profile_pointer_bytes,
+            'profile_identity_token_bytes': self.profile_identity_token_bytes,
+            'profile_background_bytes': self.profile_background_bytes,
             'chunk_count': self.chunk_count,
             'generated_chunk_count': self.generated_chunk_count,
             'consumed_chunk_count': self.consumed_chunk_count,
@@ -248,6 +260,42 @@ def gpu_profile_cell_cap():
             f"{GPU_PROFILE_CELL_CAP_ENV} accepts only {', '.join(allowed)}"
         )
     return int(value)
+
+
+def gpu_chunk_local_profile_pack_configuration(
+    pressed_base, profile_count, *, cache_enabled=False,
+):
+    """Return the private chunk-local-pack decision and pressed byte count.
+
+    The experiment is both explicitly requested and shape-gated.  Consequently
+    the normal path performs no extra filesystem work, while an opt-in still
+    leaves PFAM and small installed databases on the established eager pack.
+    """
+    value = os.environ.get(GPU_CHUNK_LOCAL_PROFILE_PACK_ENV)
+    if value is None or value == '0':
+        return False, 0
+    if value != '1':
+        raise GPUConfigurationError(
+            f"{GPU_CHUNK_LOCAL_PROFILE_PACK_ENV} must be exactly '0' or '1'"
+        )
+    if cache_enabled:
+        raise GPUConfigurationError(
+            f"{GPU_CHUNK_LOCAL_PROFILE_PACK_ENV}=1 is not compatible with "
+            "persistent GPU profile caching"
+        )
+    if isinstance(profile_count, bool) or not isinstance(profile_count, int):
+        raise TypeError("profile_count must be an integer")
+    if profile_count < 0:
+        raise ValueError("profile_count must be nonnegative")
+    pressed_bytes = sum(
+        Path(f"{pressed_base}.{suffix}").stat().st_size
+        for suffix in PRESSED_SUFFIXES
+    )
+    enabled = (
+        profile_count > 0
+        and pressed_bytes >= GPU_CHUNK_LOCAL_PROFILE_PACK_MIN_PRESSED_BYTES
+    )
+    return enabled, pressed_bytes
 
 
 def gpu_hmm_chunk_size(sequence_count):
@@ -686,14 +734,29 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
                 if profile_session_cache is None:
                     if not pairs:
                         continue
-                    session_started = time.perf_counter()
-                    session = ProfileSession(
-                        pairs,
-                        build_workers=threads,
-                        selection_workers=0,
+                    chunk_local_pack, pressed_bytes = (
+                        gpu_chunk_local_profile_pack_configuration(
+                            pressed_base,
+                            len(pairs),
+                        )
                     )
+                    session_started = time.perf_counter()
+                    session_kwargs = {
+                        'build_workers': threads,
+                        'selection_workers': 0,
+                    }
+                    if chunk_local_pack:
+                        session_kwargs['_chunk_local_pack'] = True
+                    session = ProfileSession(pairs, **session_kwargs)
                     session_build_seconds = time.perf_counter() - session_started
                 else:
+                    _, pressed_bytes = (
+                        gpu_chunk_local_profile_pack_configuration(
+                            pressed_base,
+                            0,
+                            cache_enabled=True,
+                        )
+                    )
                     manifest_path = database_specs[db_name][1]
                     session = profile_session_cache.acquire(
                         pressed_base,
@@ -718,6 +781,20 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
                     metrics = gpu_metrics[db_name]
                     metrics.session_build_seconds += session_build_seconds
                     session_statistics = session.statistics
+                    metrics.profile_host_bytes = session_statistics['host_bytes']
+                    metrics.profile_chunk_local_pack = session_statistics.get(
+                        'chunk_local_pack', False
+                    )
+                    metrics.profile_pressed_bytes = pressed_bytes
+                    metrics.profile_pointer_bytes = session_statistics.get(
+                        'profile_pointer_bytes', 0
+                    )
+                    metrics.profile_identity_token_bytes = (
+                        session_statistics.get('identity_token_bytes', 0)
+                    )
+                    metrics.profile_background_bytes = session_statistics.get(
+                        'background_bytes', 0
+                    )
                     metrics.profile_session_id = session_statistics['session_id']
                     metrics.profile_session_selection_count_start = (
                         session_statistics['selection_count']
