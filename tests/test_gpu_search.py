@@ -713,6 +713,50 @@ class GPUConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "overlap_requested"):
             search.gpu_profile_worker_allocation(2, 1)
 
+    def test_continuation_worker_cap_is_private_pool_only_and_fail_closed(self):
+        environment = search.GPU_CONTINUATION_WORKERS_ENV
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                search._gpu_continuation_worker_count(63, None, False),
+                63,
+            )
+        for requested in ("63", "48", "32"):
+            with self.subTest(requested=requested), mock.patch.dict(
+                os.environ, {environment: requested}, clear=True
+            ):
+                self.assertEqual(
+                    search._gpu_continuation_worker_count(
+                        63, object(), True
+                    ),
+                    int(requested),
+                )
+        for invalid in ("", "0", "01", "+1", " 1", "1 ", "1.0"):
+            with self.subTest(invalid=invalid), mock.patch.dict(
+                os.environ, {environment: invalid}, clear=True
+            ):
+                with self.assertRaisesRegex(
+                    search.GPUConfigurationError, "canonical positive integer"
+                ):
+                    search._gpu_continuation_worker_count(63, object(), True)
+        with mock.patch.dict(os.environ, {environment: "64"}, clear=True):
+            with self.assertRaisesRegex(
+                search.GPUConfigurationError, "cannot exceed"
+            ):
+                search._gpu_continuation_worker_count(63, object(), True)
+        for session, pool_enabled in ((None, True), (object(), False)):
+            with self.subTest(
+                session=session, pool_enabled=pool_enabled
+            ), mock.patch.dict(
+                os.environ, {environment: "32"}, clear=True
+            ):
+                with self.assertRaisesRegex(
+                    search.GPUConfigurationError,
+                    "active GPU profile session and continuation pool",
+                ):
+                    search._gpu_continuation_worker_count(
+                        63, session, pool_enabled
+                    )
+
     def test_legacy_scheduler_selector_is_exact_and_overlap_only(self):
         environment = search.GPU_LEGACY_OVERLAP_ENV
         previous = os.environ.pop(environment, None)
@@ -816,6 +860,28 @@ class GPUConfigurationTests(unittest.TestCase):
                 search.GPUConfigurationError, "must be at most"
             ):
                 search.gpu_ready_queue_configuration()
+
+    def test_continuation_window_configuration_is_exact(self):
+        environment = search.GPU_CONTINUATION_WINDOW_ENV
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(search._gpu_continuation_window(), 1)
+        for value in ("1", "2", "4"):
+            with self.subTest(value=value):
+                with mock.patch.dict(
+                    os.environ, {environment: value}, clear=True
+                ):
+                    self.assertEqual(
+                        search._gpu_continuation_window(), int(value)
+                    )
+        for value in ("", "0", "01", "3", "8", "+2", " 2", "2 "):
+            with self.subTest(value=value):
+                with mock.patch.dict(
+                    os.environ, {environment: value}, clear=True
+                ):
+                    with self.assertRaisesRegex(
+                        search.GPUConfigurationError, "accepts only"
+                    ):
+                        search._gpu_continuation_window()
 
     def test_invalid_ready_queue_configuration_precedes_output_creation(self):
         pair = SimpleNamespace(cutoffs=SimpleNamespace(
@@ -1425,6 +1491,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
             None,
             True,
             (1, None),
+            continuation_window=1,
             telemetry_collector=collector,
             sparse_journal_v3=True,
             continuation_pools=None,
@@ -2183,6 +2250,393 @@ class GPUProfileOverlapTests(unittest.TestCase):
         self.assertEqual(snapshot["ready_queue_high_water"], 2)
         self.assertEqual(snapshot["ready_queue_byte_high_water"], 20)
         self.assertGreaterEqual(snapshot["producer_idle_count"], 1)
+
+    def test_continuation_window_overlaps_calls_and_writes_canonically(self):
+        pairs = [self.pair() for _ in range(3)]
+        kwargs = {}
+        active = 0
+        maximum_active = 0
+        active_lock = threading.Lock()
+        second_started = threading.Event()
+
+        class Selection:
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+
+            def close(self):
+                pass
+
+        class Session:
+            statistics = {"worker_count": 0, "host_bytes": 0}
+
+            def select(self, indices):
+                return Selection(indices)
+
+        class Candidate:
+            resident_bytes = 10
+
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+
+        class Batch:
+            def _postfilter_forward_selection(self, selection, *_args):
+                return Candidate(selection.indices)
+
+        def gpu_search(_chunk, candidates, **_options):
+            def results():
+                nonlocal active, maximum_active
+                with active_lock:
+                    active += 1
+                    maximum_active = max(maximum_active, active)
+                try:
+                    if candidates.indices == (0,):
+                        self.assertTrue(second_started.wait(2))
+                    elif candidates.indices == (1,):
+                        second_started.set()
+                    yield candidates.indices
+                finally:
+                    with active_lock:
+                        active -= 1
+
+            return results()
+
+        chunks = [
+            (index + 1, [pair], (index,), kwargs)
+            for index, pair in enumerate(pairs)
+        ]
+        modules, _ = synthetic_plan7_gpu(True)
+        modules["plan7_gpu.astra_search"]._hmmsearch_with_continuation_pool = (
+            gpu_search
+        )
+        metrics = search.GPUOverlapMetrics()
+        output = io.StringIO()
+        with (
+            mock.patch.dict(sys.modules, modules),
+            mock.patch.object(
+                search,
+                "process_hits_to_file",
+                side_effect=lambda hits, handle: handle.write(f"{hits[0]}\n"),
+            ),
+        ):
+            search._run_gpu_profile_pipeline(
+                chunks,
+                Session(),
+                Batch(),
+                2,
+                output,
+                metrics,
+                ready_queue_configuration=(1, None),
+                continuation_pools={id(kwargs): object()},
+                continuation_window=2,
+            )
+
+        self.assertEqual(output.getvalue(), "0\n1\n2\n")
+        self.assertGreaterEqual(maximum_active, 2)
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["continuation_window"], 2)
+        self.assertEqual(snapshot["continuation_window_high_water"], 2)
+        self.assertEqual(snapshot["generated_candidate_bytes"], 30)
+        self.assertEqual(snapshot["consumed_candidate_bytes"], 30)
+        self.assertEqual(snapshot["live_candidate_capacity"], 4)
+        self.assertEqual(snapshot["consumed_chunk_count"], 3)
+
+    def test_continuation_window_preserves_prefix_and_failure_order(self):
+        class FirstFailure(RuntimeError):
+            pass
+
+        class LaterGenerationFailure(RuntimeError):
+            pass
+
+        class Selection:
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+
+            def close(self):
+                pass
+
+        class Session:
+            statistics = {"worker_count": 0, "host_bytes": 0}
+
+            def select(self, indices):
+                return Selection(indices)
+
+        class Candidate:
+            resident_bytes = 10
+
+            def __init__(self, indices):
+                self.indices = tuple(indices)
+
+        pair = self.pair()
+        kwargs = {}
+        chunks = [
+            (index + 1, [pair], (index,), kwargs)
+            for index in range(2)
+        ]
+        modules, _ = synthetic_plan7_gpu(True)
+
+        class PrefixBatch:
+            def _postfilter_forward_selection(self, selection, *_args):
+                return Candidate(selection.indices)
+
+        def prefix_search(_chunk, candidates, **_options):
+            def results():
+                yield candidates.indices
+                if candidates.indices == (0,):
+                    raise FirstFailure("first-continuation-failure")
+
+            return results()
+
+        modules["plan7_gpu.astra_search"]._hmmsearch_with_continuation_pool = (
+            prefix_search
+        )
+        output = io.StringIO()
+        with (
+            mock.patch.dict(sys.modules, modules),
+            mock.patch.object(
+                search,
+                "process_hits_to_file",
+                side_effect=lambda hits, handle: handle.write(f"{hits[0]}\n"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                FirstFailure, "first-continuation-failure"
+            ):
+                search._run_gpu_profile_pipeline(
+                    chunks,
+                    Session(),
+                    PrefixBatch(),
+                    2,
+                    output,
+                    ready_queue_configuration=(1, None),
+                    continuation_pools={id(kwargs): object()},
+                    continuation_window=2,
+                )
+        self.assertEqual(output.getvalue(), "0\n")
+
+        generation_failed = threading.Event()
+
+        class LaterFailureBatch:
+            def _postfilter_forward_selection(self, selection, *_args):
+                if selection.indices == (1,):
+                    generation_failed.set()
+                    raise LaterGenerationFailure("later-generation-failure")
+                return Candidate(selection.indices)
+
+        def delayed_first_search(_chunk, candidates, **_options):
+            def results():
+                self.assertTrue(generation_failed.wait(2))
+                yield candidates.indices
+
+            return results()
+
+        modules["plan7_gpu.astra_search"]._hmmsearch_with_continuation_pool = (
+            delayed_first_search
+        )
+        output = io.StringIO()
+        with (
+            mock.patch.dict(sys.modules, modules),
+            mock.patch.object(
+                search,
+                "process_hits_to_file",
+                side_effect=lambda hits, handle: handle.write(f"{hits[0]}\n"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                LaterGenerationFailure, "later-generation-failure"
+            ):
+                search._run_gpu_profile_pipeline(
+                    chunks,
+                    Session(),
+                    LaterFailureBatch(),
+                    2,
+                    output,
+                    ready_queue_configuration=(1, None),
+                    continuation_pools={id(kwargs): object()},
+                    continuation_window=2,
+                )
+        self.assertEqual(output.getvalue(), "0\n")
+
+    def test_continuation_wait_interrupt_retires_future_before_buffer(self):
+        class CoordinatorInterrupt(KeyboardInterrupt):
+            pass
+
+        class CleanupInterrupt(RuntimeError):
+            pass
+
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        worker_terminal = threading.Event()
+        buffers = []
+
+        class TrackedBuffer(io.StringIO):
+            def __init__(self):
+                super().__init__()
+                self.read_before_terminal = False
+                self.close_before_terminal = False
+                self.close_count = 0
+                buffers.append(self)
+
+            def getvalue(self):
+                self.read_before_terminal |= not worker_terminal.is_set()
+                return super().getvalue()
+
+            def close(self):
+                self.close_before_terminal |= not worker_terminal.is_set()
+                self.close_count += 1
+                super().close()
+
+        class InterruptingFuture:
+            def __init__(self, function, args, kwargs):
+                self._done = threading.Event()
+                self._result = None
+                self._error = None
+                self.result_calls = 0
+                self.cancel_calls = 0
+                self.thread = threading.Thread(target=self._run)
+                self._function = function
+                self._args = args
+                self._kwargs = kwargs
+                self.thread.start()
+
+            def _run(self):
+                try:
+                    self._result = self._function(
+                        *self._args, **self._kwargs
+                    )
+                except BaseException as error:
+                    self._error = error
+                finally:
+                    worker_terminal.set()
+                    self._done.set()
+
+            def result(self, timeout=None):
+                self.result_calls += 1
+                if self.result_calls == 1:
+                    self_outer.assertTrue(worker_started.wait(2))
+                    self_outer.assertFalse(self.done())
+                    raise CoordinatorInterrupt("coordinator wait interrupted")
+                release_worker.set()
+                if not self._done.wait(timeout):
+                    raise TimeoutError()
+                if self._error is not None:
+                    raise self._error
+                return self._result
+
+            def cancel(self):
+                self.cancel_calls += 1
+                return False
+
+            def done(self):
+                return self._done.is_set()
+
+        class InterruptingExecutor:
+            instances = []
+
+            def __init__(self, *_args, **_kwargs):
+                self.futures = []
+                self.shutdown_calls = 0
+                self.instances.append(self)
+
+            def submit(self, function, *args, **kwargs):
+                future = InterruptingFuture(function, args, kwargs)
+                self.futures.append(future)
+                return future
+
+            def shutdown(self, **_kwargs):
+                self.shutdown_calls += 1
+                if self.shutdown_calls == 1:
+                    raise CleanupInterrupt("executor shutdown interrupted")
+
+        class Selection:
+            indices = (0,)
+
+            def close(self):
+                pass
+
+        class Session:
+            statistics = {"worker_count": 0, "host_bytes": 0}
+
+            def select(self, _indices):
+                return Selection()
+
+        class Candidate:
+            resident_bytes = 10
+            indices = (0,)
+
+        class Batch:
+            def _postfilter_forward_selection(self, *_args):
+                return Candidate()
+
+        def gpu_search(_chunk, candidates, **_options):
+            def results():
+                worker_started.set()
+                self.assertTrue(release_worker.wait(2))
+                yield candidates.indices
+
+            return results()
+
+        pair = self.pair()
+        kwargs = {}
+        modules, _ = synthetic_plan7_gpu(True)
+        modules["plan7_gpu.astra_search"]._hmmsearch_with_continuation_pool = (
+            gpu_search
+        )
+        output = io.StringIO()
+        self_outer = self
+        try:
+            with (
+                mock.patch.dict(sys.modules, modules),
+                mock.patch.object(
+                    search, "ThreadPoolExecutor", InterruptingExecutor
+                ),
+                mock.patch.object(
+                    search,
+                    "io",
+                    SimpleNamespace(StringIO=TrackedBuffer),
+                ),
+                mock.patch.object(
+                    search,
+                    "process_hits_to_file",
+                    side_effect=lambda hits, handle: handle.write(
+                        f"{hits[0]}\n"
+                    ),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    CoordinatorInterrupt, "coordinator wait interrupted"
+                ):
+                    search._run_gpu_profile_pipeline(
+                        [(1, [pair], (0,), kwargs)],
+                        Session(),
+                        Batch(),
+                        2,
+                        output,
+                        ready_queue_configuration=(1, None),
+                        continuation_pools={id(kwargs): object()},
+                        continuation_window=2,
+                    )
+        finally:
+            release_worker.set()
+            for executor in InterruptingExecutor.instances:
+                for future in executor.futures:
+                    future.thread.join(2)
+
+        self.assertEqual(output.getvalue(), "")
+        self.assertTrue(worker_terminal.is_set())
+        self.assertEqual(len(InterruptingExecutor.instances), 1)
+        executor = InterruptingExecutor.instances[0]
+        self.assertEqual(executor.shutdown_calls, 2)
+        self.assertEqual(len(executor.futures), 1)
+        future = executor.futures[0]
+        self.assertEqual(future.result_calls, 2)
+        self.assertEqual(future.cancel_calls, 1)
+        self.assertTrue(future.done())
+        self.assertEqual(len(buffers), 1)
+        buffer = buffers[0]
+        self.assertFalse(buffer.read_before_terminal)
+        self.assertFalse(buffer.close_before_terminal)
+        self.assertEqual(buffer.close_count, 1)
+        self.assertTrue(buffer.closed)
 
     def test_overweight_candidate_error_remains_behind_earlier_output(self):
         pairs = [self.pair() for _ in range(3)]
