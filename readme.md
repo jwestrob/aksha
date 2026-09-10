@@ -15,15 +15,17 @@ Aksha outperformed MetaCerberus 1.4 in our Pfam benchmarks on both CPU and GPU.
 
 The recorded PLM2_5 workload contained 300,186 proteins and 27,481 Pfam models.
 
-| Tool / configuration | Pfam runtime | Speedup over MetaCerberus |
-| --- | ---: | ---: |
-| MetaCerberus 1.4, CPU | 11m 34s | — |
-| Aksha, CPU | 4m 46s | 2.43× |
-| Aksha, H200 GPU + CPU | 3m 39s | 3.17× |
+| Tool / configuration | Physical CPU cores | Pfam runtime | Speedup over MetaCerberus |
+| --- | ---: | ---: | ---: |
+| MetaCerberus 1.4, CPU | 64 | 11m 34s | — |
+| Aksha, CPU | 64 | 4m 46s | 2.43× |
+| Aksha, 1 H200 GPU + CPU | 64 host cores | 3m 39s | 3.17× |
 
-Aksha's CPU and GPU outputs matched exactly in these runs. CPU comparisons
-used the same machine; the GPU run used a separate H200 node with 64 host
-cores. MetaCerberus timing covers its HMM search/filter/parse pipeline, not
+Aksha's CPU and GPU outputs matched exactly in these runs. Both CPU-only
+runs used 64 physical cores on the same Xeon 6787P machine. The GPU run used
+one H200 plus 64 physical Xeon Platinum 8480+ host cores on a separate node.
+Core counts are allocated physical cores, not CPU sockets or SMT threads.
+MetaCerberus timing covers its HMM search/filter/parse pipeline, not
 additional reporting; its thresholds and output rules differ, so this is a
 workflow comparison, not identical-work benchmarking. Measurements predate
 wheel packaging. [CPU evidence](https://github.com/jwestrob/aksha/blob/main/docs/development/CPU_PRODUCTION_INTEGRATION.md)
