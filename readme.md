@@ -1,19 +1,39 @@
 # Aksha
 
-Aksha searches biological sequences against collections of protein-family
-models, helping you annotate genes and find sequences of interest. It uses
-[HMMER](http://hmmer.org/) through [PyHMMER](https://pyhmmer.readthedocs.io/),
-with optional NVIDIA GPU acceleration for protein searches.
+**Big metagenomes. Fast answers.**
 
-## Why use Aksha?
+Aksha accelerates HMM-based sequence searches so you can spend more time on
+biology and less time waiting for annotations. Built on [HMMER](http://hmmer.org/)
+and [PyHMMER](https://pyhmmer.readthedocs.io/), it combines fast CPU searches,
+optional NVIDIA GPU acceleration, database management and sequence retrieval
+in one command-line tool.
 
-Aksha brings database setup, sequence searches and result collection into one
-command-line tool. It is designed for researchers working with genomes and
-metagenomes who want HMMER-based annotation with less setup and custom scripting.
+## How fast?
+
+**300,186 proteins. 27,481 Pfam models. 3 minutes 39 seconds.**
+
+That's a complete PLM2_5 metagenome search using Aksha's production GPU path
+on one NVIDIA H200. No GPU? The retained CPU benchmark was **2.43× faster
+than MetaCerberus 1.4 on the same 64 physical CPU cores**.
+
+| Tool / configuration | Pfam runtime | Speedup over MetaCerberus |
+| --- | ---: | ---: |
+| MetaCerberus 1.4, CPU | 11m 34s | — |
+| Aksha, CPU | 4m 46s | 2.43× |
+| Aksha, H200 GPU + CPU | 3m 39s | 3.17× |
+
+Aksha's CPU and GPU outputs matched exactly in these runs. CPU comparisons
+used the same machine; the GPU run used a separate H200 node with 64 host
+cores. MetaCerberus timing covers its HMM search/filter/parse pipeline, not
+additional reporting; its thresholds and output rules differ, so this is a
+workflow comparison, not identical-work benchmarking. Measurements predate
+wheel packaging. [CPU evidence](https://github.com/jwestrob/aksha/blob/main/docs/development/CPU_PRODUCTION_INTEGRATION.md)
+and [GPU evidence](https://github.com/jwestrob/aksha/blob/main/docs/development/GPU_PRODUCTION_INTEGRATION.md).
+
+## More than a fast search
 
 - Search proteins or nucleotide sequences using supported databases or your own HMMs.
 - Download and manage databases such as Pfam and KOfam from the same tool.
-- Run large protein searches with multiple CPU cores or optional GPU acceleration; no GPU is required.
 - Use a database's recommended cutoffs, or choose your own score and E-value thresholds.
 - Export tabular results and optionally retrieve matching sequences for downstream analysis.
 
