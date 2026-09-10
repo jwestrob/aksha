@@ -5,6 +5,18 @@ models, helping you annotate genes and find sequences of interest. It uses
 [HMMER](http://hmmer.org/) through [PyHMMER](https://pyhmmer.readthedocs.io/),
 with optional NVIDIA GPU acceleration for protein searches.
 
+## Why use Aksha?
+
+Aksha brings database setup, sequence searches and result collection into one
+command-line tool. It is designed for researchers working with genomes and
+metagenomes who want HMMER-based annotation with less setup and custom scripting.
+
+- Search proteins or nucleotide sequences using supported databases or your own HMMs.
+- Download and manage databases such as Pfam and KOfam from the same tool.
+- Run large protein searches with multiple CPU cores or optional GPU acceleration; no GPU is required.
+- Use a database's recommended cutoffs, or choose your own score and E-value thresholds.
+- Export tabular results and optionally retrieve matching sequences for downstream analysis.
+
 ## Installation
 
 The PyPI release is being prepared. Once published:
