@@ -30,7 +30,7 @@ aksha search --prot_in proteins.faa --installed_hmms PFAM --cut_ga --outdir resu
 ```
 
 Use `--hmm_in` for your own HMMs. No biological database is bundled.
-See the [database setup guide](https://github.com/jwestrob/aksha/blob/main/initialize_usage_guide.md)
+See the [database setup guide](https://github.com/jwestrob/aksha/blob/main/docs/database-setup.md)
 for choosing storage, reusing existing files and the destructive `--force` option.
 The GPU extra makes the backend available; enable it with a local manifest:
 

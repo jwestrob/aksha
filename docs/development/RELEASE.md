@@ -39,7 +39,7 @@ source files without a second checkout or native compilation.
 The stable handoff remains
 `/groups/banfield/projects/environmental/sr/srvp2020/Jacob/hmmer_gpu/build/pip-release-candidate-v4/release-bundle`.
 Its manifest records `READY_FOR_USER_UPLOAD`, meaning local wheel readiness,
-not publication on PyPI. See [publication instructions](release/PUBLISH.md)
+not publication on PyPI. See [publication instructions](../../release/PUBLISH.md)
 for the user's commands. The original v4
 artifacts/evidence remain untouched outside this refreshed handoff directory.
 

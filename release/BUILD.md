@@ -53,3 +53,15 @@ attach that evidence without rebuilding or changing the tested wheels.
 Check wheel/source metadata with `python -m twine check` before the user
 publishes; see [PUBLISH.md](PUBLISH.md). Recipes never read ~/.pypirc or upload.
 Full benchmarks and ARM builds are separate work.
+
+## Internal compatibility
+
+Private module/library names (`astra_pyhmmer`, `plan7_gpu`, `libastra_hmmer.so`
+and `libastra_easel.so`) and existing `ASTRA_*` tuning variables remain stable.
+These include `ASTRA_CPU_STREAM_PRESSED` and `ASTRA_CPU_MALLOC_ARENA_MAX`;
+existing `MALLOC_ARENA_MAX` values are respected. Stock PyHMMER can coexist,
+but its native objects are not interchangeable with the private runtime's.
+
+Historical integration, tuning and release-handoff records are archived in
+[docs/development](../docs/development/). They retain their original names,
+paths and measurements and are excluded from new source distributions.

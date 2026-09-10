@@ -82,6 +82,6 @@ the replacement.** Back up anything needed and check the location with
 `--show_installed` first; a failed download does not restore the old files.
 
 GPU searches additionally require the optional backend and a local manifest
-for the installed, pressed database. See the [installation guide](release/INSTALL.md)
+for the installed, pressed database. See the [installation guide](../release/INSTALL.md)
 for those commands. Regenerate the manifest after replacing database files or
 changing the native runtime.
