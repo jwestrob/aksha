@@ -1,6 +1,6 @@
 # Aksha
 
-**Big metagenomes. Fast answers.**
+**Fast HMM-based annotation for genomes and metagenomes.**
 
 Aksha accelerates HMM-based sequence searches so you can spend more time on
 biology and less time waiting for annotations. Built on [HMMER](http://hmmer.org/)
@@ -8,13 +8,12 @@ and [PyHMMER](https://pyhmmer.readthedocs.io/), it combines fast CPU searches,
 optional NVIDIA GPU acceleration, database management and sequence retrieval
 in one command-line tool.
 
-## How fast?
+Aksha outperformed MetaCerberus 1.4 in our Pfam benchmarks on both CPU and GPU.
 
-**300,186 proteins. 27,481 Pfam models. 3 minutes 39 seconds.**
+<details>
+<summary>Benchmark results and comparison conditions</summary>
 
-That's a complete PLM2_5 metagenome search using Aksha's production GPU path
-on one NVIDIA H200. No GPU? The retained CPU benchmark was **2.43× faster
-than MetaCerberus 1.4 on the same 64 physical CPU cores**.
+The recorded PLM2_5 workload contained 300,186 proteins and 27,481 Pfam models.
 
 | Tool / configuration | Pfam runtime | Speedup over MetaCerberus |
 | --- | ---: | ---: |
@@ -29,6 +28,8 @@ additional reporting; its thresholds and output rules differ, so this is a
 workflow comparison, not identical-work benchmarking. Measurements predate
 wheel packaging. [CPU evidence](https://github.com/jwestrob/aksha/blob/main/docs/development/CPU_PRODUCTION_INTEGRATION.md)
 and [GPU evidence](https://github.com/jwestrob/aksha/blob/main/docs/development/GPU_PRODUCTION_INTEGRATION.md).
+
+</details>
 
 ## More than a fast search
 
