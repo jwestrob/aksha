@@ -13,13 +13,13 @@ from queue import Empty, Full, Queue
 from threading import Condition, Event, Lock, Thread
 from typing import NamedTuple
 from tqdm import tqdm
-import pyhmmer
+import astra_pyhmmer
 from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FutureTimeoutError,
 )
-from astra import initialize
-from astra import rp16 as rp16_module
+from aksha import initialize
+from aksha import rp16 as rp16_module
 
 
 PRESSED_SUFFIXES = ('h3m', 'h3i', 'h3f', 'h3p')
@@ -935,7 +935,7 @@ def _interval_intersection_seconds(left, right):
 
 
 def gpu_hmm_chunk_size(sequence_count):
-    """Bound one GPU candidate matrix while retaining Astra's 2,000-HMM cap."""
+    """Bound one GPU candidate matrix while retaining Aksha's 2,000-HMM cap."""
     if sequence_count > GPU_CELL_CAP:
         raise GPUConfigurationError(
             f"explicit GPU search supports at most {GPU_CELL_CAP:,} targets; "
@@ -949,9 +949,9 @@ def gpu_hmm_chunk_size(sequence_count):
 
 
 def gpu_profile_worker_allocation(threads, overlap_requested):
-    """Return overlap and compute-worker slots under Astra's CLI convention.
+    """Return overlap and compute-worker slots under Aksha's CLI convention.
 
-    ``--threads`` counts compute/search workers, as in Astra's CPU path; the
+    ``--threads`` counts compute/search workers, as in Aksha's CPU path; the
     common main writer is excluded. Serial control reserves the same producer
     slot as overlap so the continuation width remains identical.
     """
@@ -1186,7 +1186,7 @@ def parse_gpu_manifest_mappings(entries):
 def discover_pressed_base(installation_dir):
     """Return the unambiguous complete pressed base in an installation directory.
 
-    Astra's own press operation normally names the base after the directory.
+    Aksha's own press operation normally names the base after the directory.
     Older installations such as HydDB instead keep a source-derived base name,
     so they are accepted when exactly one complete pressed set is present.
     """
@@ -1296,7 +1296,7 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
     from plan7_gpu.pressed_manifest import validate_pressed_manifest
 
     if profile_session_cache is not None:
-        from astra.gpu_profile_cache import GPUProfileSessionCache
+        from aksha.gpu_profile_cache import GPUProfileSessionCache
 
         if not isinstance(profile_session_cache, GPUProfileSessionCache):
             raise TypeError(
@@ -1431,7 +1431,7 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
             cache_reservation = profile_session_cache.reserve()
         batch_started = time.perf_counter()
         batch_arguments = {
-            "alphabet": pyhmmer.easel.Alphabet.amino(),
+            "alphabet": astra_pyhmmer.easel.Alphabet.amino(),
         }
         if (
             (
@@ -2040,7 +2040,7 @@ def write_macsyfinder_hit(hits, macsyfinder_dir, hmm_name_to_filename=None):
 
     MacSyFinder's ``--previous-run`` expects per-gene ``.search_hmm.out`` files
     inside an ``hmmer_results/`` directory.  This function writes a minimal but
-    parser-compatible file from a pyhmmer ``TopHits`` object.
+    parser-compatible file from a astra_pyhmmer ``TopHits`` object.
 
     Called once per HMM per input FASTA file.  When ``prot_in`` is a directory
     with multiple ``.faa`` files, the same HMM file is appended to across
@@ -2049,7 +2049,7 @@ def write_macsyfinder_hit(hits, macsyfinder_dir, hmm_name_to_filename=None):
 
     Parameters
     ----------
-    hits : pyhmmer.plan7.TopHits
+    hits : astra_pyhmmer.plan7.TopHits
         Results of searching one HMM against the sequence database.
     macsyfinder_dir : str
         Path to the output directory (will contain ``hmmer_results/``).
@@ -2077,7 +2077,7 @@ def write_macsyfinder_hit(hits, macsyfinder_dir, hmm_name_to_filename=None):
         # Write header only on first call for this HMM
         if not file_exists:
             fh.write("# hmmsearch :: search profile(s) against a sequence database\n")
-            fh.write("# HMMER 3.4 (pyhmmer); http://hmmer.org/\n")
+            fh.write("# HMMER 3.4 (astra_pyhmmer); http://hmmer.org/\n")
             fh.write("# - - - - - - - - - - - - - - - - - - - - - - - - - - - - -\n")
             fh.write(f"Query:       {hmm_name}  [M={hmm_length}]\n\n")
 
@@ -2148,8 +2148,8 @@ def extract_sequences(results_or_ids, protein_dict_or_outdir, outdir=None):
                 hits_fasta = os.path.join(fastas_dir, f"{hmm_name}.faa")
                 with open(hits_fasta, 'a') as fh:
                     # Legacy path: re-read from disk (scan.py doesn't keep seqs in memory)
-                    with pyhmmer.easel.SequenceFile(genome_file, digital=True,
-                                                     alphabet=pyhmmer.easel.Alphabet.amino()) as sf:
+                    with astra_pyhmmer.easel.SequenceFile(genome_file, digital=True,
+                                                     alphabet=astra_pyhmmer.easel.Alphabet.amino()) as sf:
                         for seq in sf:
                             if seq.name in ids:
                                 text_seq = seq.textize()
@@ -2338,7 +2338,7 @@ def _generate_gpu_profile_candidates(sequence_batch, selection, kwargs,
         # This configuration-only pipeline is private to the producer call.
         # CPU continuation workers still create and exclusively own their
         # search pipelines lazily inside plan7_gpu.astra_search.
-        generation_pipeline = pyhmmer.plan7.Pipeline(
+        generation_pipeline = astra_pyhmmer.plan7.Pipeline(
             sequence_batch.alphabet,
             **kwargs,
         )
@@ -2552,7 +2552,7 @@ def _run_gpu_profile_single_prefetch(chunks, profile_session, sequence_batch,
     pipeline_started = time.perf_counter()
     executor = ThreadPoolExecutor(
         max_workers=1,
-        thread_name_prefix='astra-gpu-generate',
+        thread_name_prefix='aksha-gpu-generate',
     )
     pending_future = None
     pending_error = None
@@ -3032,7 +3032,7 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
     pipeline_started = time.perf_counter()
     producer = Thread(
         target=produce,
-        name='astra-gpu-generate_0',
+        name='aksha-gpu-generate_0',
         daemon=False,
     )
     producer_started = False
@@ -3117,7 +3117,7 @@ def _run_gpu_profile_pipeline(chunks, profile_session, sequence_batch,
         if continuation_window > 1:
             continuation_executor = ThreadPoolExecutor(
                 max_workers=continuation_window,
-                thread_name_prefix='astra-gpu-continue',
+                thread_name_prefix='aksha-gpu-continue',
             )
         producer.start()
         producer_started = True
@@ -3756,7 +3756,7 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                 "  Pressed profile stream has mixed cutoff availability; "
                 "using the ordinary eager CPU path"
             )
-            with pyhmmer.plan7.HMMFile(hmms.pressed_base) as hmm_file:
+            with astra_pyhmmer.plan7.HMMFile(hmms.pressed_base) as hmm_file:
                 eager_hmms = list(hmm_file)
             return hmmsearch(
                 protein_dict,
@@ -3784,7 +3784,7 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                         end="",
                         flush=True,
                     )
-                    hit_iterator = pyhmmer.hmmsearch(
+                    hit_iterator = astra_pyhmmer.hmmsearch(
                         hmm_chunk, all_sequences, cpus=threads, **kwargs
                     )
                     hits = None
@@ -3827,13 +3827,13 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
             else:
                 # No bitscore threshold available for these HMMs.
                 # In cascade mode, fall back to E-value 1e-15 (the intended
-                # cascade behavior) instead of pyhmmer's permissive default (10.0).
+                # cascade behavior) instead of astra_pyhmmer's permissive default (10.0).
                 if 'bit_cutoffs' in kwargs:
                     del kwargs['bit_cutoffs']
                 if options['cascade']:
                     kwargs.setdefault('E', 1e-15)
 
-            # Remove internal-only keys before passing to pyhmmer
+            # Remove internal-only keys before passing to astra_pyhmmer
             kwargs.pop('preferred_cutoff', None)
             group_kwargs_list.append((
                 [hmm for _, hmm in indexed_hmm_group],
@@ -3843,7 +3843,7 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
 
     # For large datasets without MacSyFinder output, flatten all sequences
     # and search once against the full pool.  This turns N_genomes * N_chunks
-    # pyhmmer.hmmsearch() calls into just N_chunks calls — e.g. 54 instead of
+    # astra_pyhmmer.hmmsearch() calls into just N_chunks calls — e.g. 54 instead of
     # 192,456 for KOFAM on DPANN (3,564 genomes × 54 chunks).
     bulk_mode = not macsyfinder_dir
 
@@ -3994,7 +3994,7 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                     print(f"  Chunk {chunk_index}/{total_chunks} "
                           f"({len(hmm_chunk)} HMMs)...", end="", flush=True)
                     if gpu_sequence_batch is None:
-                        hit_iterator = pyhmmer.hmmsearch(
+                        hit_iterator = astra_pyhmmer.hmmsearch(
                             hmm_chunk, all_sequences, cpus=threads, **kwargs
                         )
                         rendered_rows_type = None
@@ -4062,7 +4062,7 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                 for hmm_group, _, kwargs in group_kwargs_list:
                     for chunk_start in range(0, len(hmm_group), HMM_CHUNK_SIZE):
                         hmm_chunk = hmm_group[chunk_start:chunk_start + HMM_CHUNK_SIZE]
-                        for hits in pyhmmer.hmmsearch(hmm_chunk, sequences,
+                        for hits in astra_pyhmmer.hmmsearch(hmm_chunk, sequences,
                                                       cpus=threads, **kwargs):
                             process_hits_to_file(hits, fh)
                             write_macsyfinder_hit(hits, macsyfinder_dir, hmm_name_to_filename)
@@ -4150,7 +4150,7 @@ def cleanup_temp_files(temp_dir):
 
 def parse_single_hmm(hmm_path):
     """Single-file parser for fallback when no pressed DB exists."""
-    with pyhmmer.plan7.HMMFile(hmm_path) as hmm_file:
+    with astra_pyhmmer.plan7.HMMFile(hmm_path) as hmm_file:
         return hmm_file.read()
 
 
@@ -4159,7 +4159,7 @@ class _PressedHMMStream:
 
     This is deliberately private and used only by the eligible installed-DB
     CPU bulk path.  Each iteration owns its ``HMMFile`` and releases every
-    completed chunk before reading the next one; no public Astra/PyHMMER API
+    completed chunk before reading the next one; no public Aksha/PyHMMER API
     changes.
     """
 
@@ -4179,7 +4179,7 @@ class _PressedHMMStream:
                 or not isinstance(chunk_size, int)
                 or chunk_size <= 0):
             raise ValueError("chunk_size must be a positive integer")
-        with pyhmmer.plan7.HMMFile(self.pressed_base) as hmm_file:
+        with astra_pyhmmer.plan7.HMMFile(self.pressed_base) as hmm_file:
             chunk = []
             for hmm in hmm_file:
                 chunk.append(hmm)
@@ -4193,7 +4193,7 @@ class _PressedHMMStream:
         if cutoff in self._cutoff_availability:
             return self._cutoff_availability[cutoff]
         method_name = f"{cutoff}_available"
-        with pyhmmer.plan7.HMMFile(self.pressed_base) as hmm_file:
+        with astra_pyhmmer.plan7.HMMFile(self.pressed_base) as hmm_file:
             for hmm in hmm_file:
                 method = getattr(hmm.cutoffs, method_name, None)
                 if method is None or not method():
@@ -4209,7 +4209,7 @@ class _PressedHMMStream:
         if cached is not None and cached[0] == threshold:
             return cached[1], cached[2]
         inspected = 0
-        with pyhmmer.plan7.HMMFile(self.pressed_base) as hmm_file:
+        with astra_pyhmmer.plan7.HMMFile(self.pressed_base) as hmm_file:
             for _ in hmm_file:
                 inspected += 1
                 if inspected > threshold:
@@ -4366,7 +4366,7 @@ def parse_hmms(hmm_in):
         pressed_base = _find_pressed_db(hmm_in)
         if pressed_base:
             print(f"  Loading from pressed database: {pressed_base}")
-            with pyhmmer.plan7.HMMFile(pressed_base) as hmm_file:
+            with astra_pyhmmer.plan7.HMMFile(pressed_base) as hmm_file:
                 hmms = list(hmm_file)
             elapsed = time.perf_counter() - t0
             print(f"HMMs parsed: {len(hmms)} models in {elapsed:.1f}s (pressed DB)")
@@ -4381,7 +4381,7 @@ def parse_hmms(hmm_in):
             #Only one HMM file in input directory
             #Get full path to file
             hmm_path = os.path.join(hmm_in, hmm_files[0])
-            with pyhmmer.plan7.HMMFile(hmm_path) as hmm_file:
+            with astra_pyhmmer.plan7.HMMFile(hmm_path) as hmm_file:
                 #Works in case of single-model or multi-model HMM file
                 hmms = list(hmm_file)
 
@@ -4408,7 +4408,7 @@ def parse_hmms(hmm_in):
             logging.info('hmm_in file is empty.')
             sys.exit(1)
         # Parse the single HMM file; handles multi-model files
-        with pyhmmer.plan7.HMMFile(hmm_in) as hmm_file:
+        with astra_pyhmmer.plan7.HMMFile(hmm_in) as hmm_file:
             hmms = list(hmm_file)
     else:
         print("Invalid HMM input.")
@@ -4428,7 +4428,7 @@ def parse_hmms(hmm_in):
 
 def process_fasta(fasta_file):
     # Function to handle each file for parallelism
-    with pyhmmer.easel.SequenceFile(fasta_file, digital=True, alphabet=pyhmmer.easel.Alphabet.amino()) as seq_file:
+    with astra_pyhmmer.easel.SequenceFile(fasta_file, digital=True, alphabet=astra_pyhmmer.easel.Alphabet.amino()) as seq_file:
         sequences = seq_file.read_block()
     return fasta_file, sequences
 
@@ -4448,8 +4448,8 @@ def parse_protein_input(prot_in, threads):
 
         fasta_paths = [os.path.join(prot_in, x) for x in os.listdir(prot_in)]
 
-        # pyhmmer sequence objects can't pickle (no ProcessPoolExecutor), but
-        # the GIL is released during pyhmmer's C-level I/O, so threads work.
+        # astra_pyhmmer sequence objects can't pickle (no ProcessPoolExecutor), but
+        # the GIL is released during astra_pyhmmer's C-level I/O, so threads work.
         # For small file counts the overhead isn't worth it; threshold at 8.
         if len(fasta_paths) >= 8:
             n_workers = min(threads, len(fasta_paths))
@@ -4469,7 +4469,7 @@ def parse_protein_input(prot_in, threads):
             logging.info("prot_in file is empty.")
             sys.exit(1)
         # Parse the single protein FASTA file
-        with pyhmmer.easel.SequenceFile(prot_in, digital=True) as seq_file:
+        with astra_pyhmmer.easel.SequenceFile(prot_in, digital=True) as seq_file:
             sequences = seq_file.read_block()
         protein_dict[prot_in] = sequences
     else:

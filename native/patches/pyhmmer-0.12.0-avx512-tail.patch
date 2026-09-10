@@ -1,0 +1,213 @@
+--- a/vendor/hmmer/src/hmmer.h
++++ b/vendor/hmmer/src/hmmer.h
+@@ -2036,0 +2037,8 @@
++extern int p7_PipelineFromFilterForwardAndBackwardScores(
++    P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg,
++    const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *th,
++    float usc, float filtersc, float vfsc, float fwdsc,
++    const float *forward_xmx, uint64_t forward_xmx_count,
++    float backward_score, const float *backward_xmx,
++    uint64_t backward_xmx_count, float backward_totscale,
++    int backward_has_own_scales);
+--- a/vendor/hmmer/src/p7_pipeline.c
++++ b/vendor/hmmer/src/p7_pipeline.c
+@@ -726,0 +727,8 @@
++pipeline_validate_backward_specials(const P7_OPROFILE *om, const ESL_SQ *sq,
++                                    const float *forward_xmx,
++                                    const float *backward_xmx,
++                                    uint64_t backward_xmx_count,
++                                    float backward_score,
++                                    float backward_totscale,
++                                    int backward_has_own_scales);
++static int
+@@ -856,0 +865,106 @@
++/* Continue an authenticated F3 survivor from exact external Forward and
++ * Backward parsing trajectories. This private entry is used only after the
++ * four-candidate AVX-512 Backward primitive has produced bit-identical
++ * E/N/J/B/C/SCALE rows. All filter gates and both trajectories are validated
++ * before survivor counters or reusable domain state are mutated. */
++int
++p7_PipelineFromFilterForwardAndBackwardScores(
++    P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg,
++    const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *hitlist,
++    float usc, float filtersc, float vfsc, float fwdsc,
++    const float *forward_xmx, uint64_t forward_xmx_count,
++    float backward_score, const float *backward_xmx,
++    uint64_t backward_xmx_count, float backward_totscale,
++    int backward_has_own_scales)
++{
++  float  forward_totscale = 0.0f;
++  float  nullsc;
++  float  seq_score;
++  double P;
++  int    status;
++
++  if (pli == NULL || om == NULL || bg == NULL || sq == NULL ||
++      hitlist == NULL || ntsq != NULL || pli->mode != p7_SEARCH_SEQS ||
++      pli->long_targets || pli->oxf == NULL || pli->oxb == NULL ||
++      pli->fwd == NULL || pli->bck == NULL || pli->ddef == NULL)
++    return eslEINVAL;
++  if (sq->n <= 0 || sq->n > 100000 ||
++      ! pipeline_profile_configuration_is_exact(om, sq->n) ||
++      ! pipeline_background_configuration_is_exact(bg, sq->n) ||
++      ! pipeline_float_environment_is_exact() ||
++      ! isfinite(usc) || ! isfinite(fwdsc) ||
++      (pli->do_biasfilter && ! isfinite(filtersc)))
++    return eslEINVAL;
++  if (pli->ddef->dcl == NULL || pli->ddef->ndom != 0 ||
++      pli->ddef->nregions != 0 || pli->ddef->nclustered != 0 ||
++      pli->ddef->noverlaps != 0 || pli->ddef->nenvelopes != 0)
++    return eslEINVAL;
++
++  status = p7_bg_NullOne(bg, sq->dsq, sq->n, &nullsc);
++  if (status != eslOK) return status;
++  seq_score = (usc-nullsc) / eslCONST_LOG2;
++  P = esl_gumbel_surv(
++      seq_score, om->evparam[p7_MMU], om->evparam[p7_MLAMBDA]);
++  if (P > pli->F1) return eslEINVAL;
++  if (pli->do_biasfilter)
++    {
++      seq_score = (usc-filtersc) / eslCONST_LOG2;
++      P = esl_gumbel_surv(
++          seq_score, om->evparam[p7_MMU], om->evparam[p7_MLAMBDA]);
++      if (P > pli->F1) return eslEINVAL;
++    }
++  else filtersc = nullsc;
++  if (P > pli->F2)
++    {
++      if (isnan(vfsc) || (isinf(vfsc) && vfsc < 0.0f)) return eslEINVAL;
++      seq_score = (vfsc-filtersc) / eslCONST_LOG2;
++      P = esl_gumbel_surv(
++          seq_score, om->evparam[p7_VMU], om->evparam[p7_VLAMBDA]);
++      if (P > pli->F2) return eslEINVAL;
++    }
++  seq_score = (fwdsc-filtersc) / eslCONST_LOG2;
++  P = esl_exp_surv(
++      seq_score, om->evparam[p7_FTAU], om->evparam[p7_FLAMBDA]);
++  if (P > pli->F3) return eslEINVAL;
++
++  status = pipeline_validate_forward_specials(
++      om, sq, fwdsc, forward_xmx, forward_xmx_count,
++      &forward_totscale);
++  if (status != eslOK) return status;
++  status = pipeline_validate_backward_specials(
++      om, sq, forward_xmx, backward_xmx, backward_xmx_count,
++      backward_score, backward_totscale, backward_has_own_scales);
++  if (status != eslOK) return status;
++
++  status = p7_omx_GrowTo(pli->oxf, om->M, 0, sq->n);
++  if (status != eslOK) return status;
++  status = p7_omx_GrowTo(pli->oxb, om->M, 0, sq->n);
++  if (status != eslOK) return status;
++  memcpy(
++      pli->oxf->xmx, forward_xmx,
++      sizeof(float) * (size_t) (sq->n+1) * p7X_NXCELLS);
++  pli->oxf->M = om->M;
++  pli->oxf->L = sq->n;
++  pli->oxf->has_own_scales = TRUE;
++  pli->oxf->totscale = forward_totscale;
++  memcpy(
++      pli->oxb->xmx, backward_xmx,
++      sizeof(float) * (size_t) (sq->n+1) * p7X_NXCELLS);
++  pli->oxb->M = om->M;
++  pli->oxb->L = sq->n;
++  pli->oxb->has_own_scales = backward_has_own_scales;
++  pli->oxb->totscale = backward_totscale;
++
++  pli->n_past_msv++;
++  pli->n_past_bias++;
++  pli->n_past_vit++;
++  pli->n_past_fwd++;
++  status = p7_domaindef_ByPosteriorHeuristics(
++      sq, ntsq, om, pli->oxf, pli->oxb, pli->fwd, pli->bck,
++      pli->ddef, bg, FALSE, NULL, NULL, NULL);
++  if (status != eslOK)
++    ESL_FAIL(status, pli->errbuf, "domain definition workflow failure");
++  return pipeline_post_domains(
++      pli, om, bg, sq, hitlist, nullsc, fwdsc);
++}
++
+@@ -1373,0 +1488,83 @@
++}
++
++static int
++pipeline_validate_backward_specials(
++    const P7_OPROFILE *om, const ESL_SQ *sq,
++    const float *forward_xmx, const float *backward_xmx,
++    uint64_t backward_xmx_count, float backward_score,
++    float backward_totscale, int backward_has_own_scales)
++{
++  union { float value; uint32_t bits; } expected, supplied;
++  const uint64_t expected_count =
++      ((uint64_t) sq->n + 1) * p7X_NXCELLS;
++  float scale;
++  float xC;
++  float xE;
++  float reconstructed;
++  int i;
++  int s;
++
++  if (forward_xmx == NULL || backward_xmx == NULL ||
++      backward_xmx_count != expected_count ||
++      (backward_has_own_scales != FALSE &&
++       backward_has_own_scales != TRUE) ||
++      ! isfinite(backward_score) || ! isfinite(backward_totscale) ||
++      backward_totscale < 0.0f)
++    return eslEINVAL;
++  for (i = 0; i <= sq->n; i++)
++    {
++      for (s = 0; s < p7X_NXCELLS; s++)
++        if (! isfinite(backward_xmx[i*p7X_NXCELLS+s]) ||
++            backward_xmx[i*p7X_NXCELLS+s] < 0.0f)
++          return eslEINVAL;
++      scale = backward_xmx[i*p7X_NXCELLS+p7X_SCALE];
++      if (scale != 1.0f && scale <= 1.0e4f) return eslEINVAL;
++      if (! backward_has_own_scales)
++        {
++          expected.value = forward_xmx[i*p7X_NXCELLS+p7X_SCALE];
++          supplied.value = scale;
++          if (expected.bits != supplied.bits) return eslEINVAL;
++        }
++    }
++
++  expected.value = 0.0f;
++  supplied.value = backward_xmx[p7X_E];
++  if (expected.bits != supplied.bits) return eslEINVAL;
++  supplied.value = backward_xmx[p7X_J];
++  if (expected.bits != supplied.bits) return eslEINVAL;
++  supplied.value = backward_xmx[p7X_C];
++  if (expected.bits != supplied.bits) return eslEINVAL;
++  expected.value = 1.0f;
++  supplied.value = backward_xmx[p7X_SCALE];
++  if (expected.bits != supplied.bits) return eslEINVAL;
++  if (backward_xmx[p7X_N] <= 0.0f) return eslEINVAL;
++
++  scale = forward_xmx[sq->n*p7X_NXCELLS+p7X_SCALE];
++  xC = om->xf[p7O_C][p7O_MOVE];
++  xE = xC * om->xf[p7O_E][p7O_MOVE];
++  if (scale > 1.0f)
++    {
++      xC /= scale;
++      xE /= scale;
++    }
++  expected.value = xE;
++  supplied.value = backward_xmx[sq->n*p7X_NXCELLS+p7X_E];
++  if (expected.bits != supplied.bits) return eslEINVAL;
++  expected.value = 0.0f;
++  supplied.value = backward_xmx[sq->n*p7X_NXCELLS+p7X_N];
++  if (expected.bits != supplied.bits) return eslEINVAL;
++  supplied.value = backward_xmx[sq->n*p7X_NXCELLS+p7X_J];
++  if (expected.bits != supplied.bits) return eslEINVAL;
++  supplied.value = backward_xmx[sq->n*p7X_NXCELLS+p7X_B];
++  if (expected.bits != supplied.bits) return eslEINVAL;
++  expected.value = xC;
++  supplied.value = backward_xmx[sq->n*p7X_NXCELLS+p7X_C];
++  if (expected.bits != supplied.bits) return eslEINVAL;
++  expected.value = scale;
++  supplied.value = backward_xmx[sq->n*p7X_NXCELLS+p7X_SCALE];
++  if (expected.bits != supplied.bits) return eslEINVAL;
++
++  reconstructed = backward_totscale + log(backward_xmx[p7X_N]);
++  expected.value = reconstructed;
++  supplied.value = backward_score;
++  return expected.bits == supplied.bits ? eslOK : eslEINVAL;

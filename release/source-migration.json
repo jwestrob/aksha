@@ -1,0 +1,275 @@
+{
+  "schema": "aksha-source-migration-v1",
+  "native_repository": "https://github.com/jwestrob/astra-gpu",
+  "native_revision": "dd40d9d208dda762fd6423a16b93a2bb46e60173",
+  "application_revision": "7a7bfa1b6127ce76a4a0724f6307e6479e44a1ed",
+  "original_preparation_sha256": "0a364bfc69d91069370d17109158e361b6436c7155a54136121c1f28397cb670",
+  "files": [
+    {
+      "path": "aksha/__init__.py",
+      "sha256": "1ea2bc95431e8dcd8d8fa9440e873f8224403354b0d7c9f26e7206d3d4b7ce1d",
+      "prepared_path": "astra/astra/__init__.py",
+      "prepared_sha256": "63ccfe0cc0026c771162463c466951f6d7affd1f7970d9a91e12ebd526d1f7ad",
+      "change": "app namespace/branding only"
+    },
+    {
+      "path": "aksha/_launcher.py",
+      "sha256": "5040f912175d7426a6c7f03253e0db2dd211f5ac2ed3ca997566322cbd55345c",
+      "prepared_path": "astra/astra/_launcher.py",
+      "prepared_sha256": "20a687379520af40a30b0cac83fd08e567578d672866914e41e0db124b4180d2",
+      "change": "app namespace/branding only"
+    },
+    {
+      "path": "aksha/gpu_profile_cache.py",
+      "sha256": "1769dd777b1690d08b14a421a5e2d97874316ed84a10444987796fba7e659e64",
+      "prepared_path": "astra/astra/gpu_profile_cache.py",
+      "prepared_sha256": "d3086df4138c84433f7267a49fe8300ce2e6a707d9e5e9fe0a019f5e0a8f4ddc",
+      "change": "app namespace/branding only"
+    },
+    {
+      "path": "aksha/hmm_databases.json",
+      "sha256": "a0273ab23cf0e47e2a85568451e28dd721cc35f17de05ebb20fabd721179571a",
+      "prepared_path": "astra/astra/hmm_databases.json",
+      "prepared_sha256": "a0273ab23cf0e47e2a85568451e28dd721cc35f17de05ebb20fabd721179571a",
+      "change": "app namespace/branding only"
+    },
+    {
+      "path": "aksha/initialize.py",
+      "sha256": "8b435e2c2441f1201b46f7761b60759ca91cc6eda8a44eb4d58eb0e9f674401f",
+      "prepared_path": "astra/astra/initialize.py",
+      "prepared_sha256": "cd5d480d9a149cc053440c3d058c5cbc53bba0843bc159ddddade94cefaa7995",
+      "change": "app namespace/branding only"
+    },
+    {
+      "path": "aksha/jackhmmer.py",
+      "sha256": "3e860657f5fe610d3600e71077e0faf30466631d716066ce51592c6f649821a3",
+      "prepared_path": "astra/astra/jackhmmer.py",
+      "prepared_sha256": "3e860657f5fe610d3600e71077e0faf30466631d716066ce51592c6f649821a3",
+      "change": "app namespace/branding only"
+    },
+    {
+      "path": "aksha/main.py",
+      "sha256": "ad5549d7e1b6dfd476cccd41ea9afb5d1dc0534b11b01550ff3659e1e5c2d7cb",
+      "prepared_path": "astra/astra/main.py",
+      "prepared_sha256": "acb29ae7d3ad6534f811480d411f9f83d47c0980a5e1e8aafc0421ce8ba826f3",
+      "change": "app namespace/branding only"
+    },
+    {
+      "path": "aksha/nucsearch.py",
+      "sha256": "46b6e68a9b12c14b3079de6ae6dcbd61e03263508dababc7c928bf33419e51bb",
+      "prepared_path": "astra/astra/nucsearch.py",
+      "prepared_sha256": "865d8916177cf3208ab4b179e0fbd3dd3096f0926c896188d7555757cdacf1a4",
+      "change": "app namespace/branding only"
+    },
+    {
+      "path": "aksha/phmmer.py",
+      "sha256": "b872b7ec56e840bdea935abfba57951fe1ccb4420961427bc9fbdb582a0becc4",
+      "prepared_path": "astra/astra/phmmer.py",
+      "prepared_sha256": "b872b7ec56e840bdea935abfba57951fe1ccb4420961427bc9fbdb582a0becc4",
+      "change": "app namespace/branding only"
+    },
+    {
+      "path": "aksha/rp16.py",
+      "sha256": "4b6072d9b2fcb086dbb606a5cd748ca8c3e4a4e9ab882f16ae2cb1f0aba6fb80",
+      "prepared_path": "astra/astra/rp16.py",
+      "prepared_sha256": "c18a8914eb9ef95d0015327b44309b45dcf547e3e514da478b7dbbaa138748e8",
+      "change": "app namespace/branding only"
+    },
+    {
+      "path": "aksha/scan.py",
+      "sha256": "8d257a091a83103186ae650df65e8b89fe3685c6f0538e988694c79c3e015c61",
+      "prepared_path": "astra/astra/scan.py",
+      "prepared_sha256": "d6f8d78cbc74f192aa8848a5d122efea2c918773aa88d8f950b92e473e5d7607",
+      "change": "app namespace/branding only"
+    },
+    {
+      "path": "aksha/search.py",
+      "sha256": "ae6eb6a1935857053068d29679e68f9bc21e27429288ed177998a73f52160081",
+      "prepared_path": "astra/astra/search.py",
+      "prepared_sha256": "76e8cb1623a208974660c7b95789f5f60f16d848bd7209e37c815c542049544d",
+      "change": "app namespace/branding only"
+    },
+    {
+      "path": "native/cpu/avx512_tail.h",
+      "sha256": "b1ccf90b7730324084a9c9212b92ffcfd97f29d4193dd1a3c8e655a6be6347de",
+      "prepared_path": "native/cpu/avx512_tail.h",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/cuda/README.md",
+      "sha256": "d956e7db86fdd2282f2fb36e96baa1b2d9142d03f52d552c03c649b2c0bef79e",
+      "prepared_path": "native/cuda/README.md",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/cuda/backward_domain_cuda.cu",
+      "sha256": "c5e5b94c1c88a4321c193cec9f8fbf76982b13adbc7604781017d71da243f869",
+      "prepared_path": "native/cuda/backward_domain_cuda.cu",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/cuda/backward_domain_cuda.h",
+      "sha256": "0ff1e7f2f903f7cc5ee715232450b235b25a327a05aed8f0d0714592f108f045",
+      "prepared_path": "native/cuda/backward_domain_cuda.h",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/cuda/bias_cuda.cu",
+      "sha256": "255bd047bfa14f86ebd27711ae6b648a0dbdd18917633eea8268ae1efdcd7ddf",
+      "prepared_path": "native/cuda/bias_cuda.cu",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/cuda/bias_cuda.h",
+      "sha256": "8141ce5100f23b320b4d7f1283a47579df1befd7bc8d5d4464d0d1009c2af0eb",
+      "prepared_path": "native/cuda/bias_cuda.h",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/cuda/continuation_journal.h",
+      "sha256": "94b9d471be7a596fb55f78f4b6a5f7fc7ce3baf2c690d5948b39d9b72af5a214",
+      "prepared_path": "native/cuda/continuation_journal.h",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/cuda/domain_rescore_cuda.cu",
+      "sha256": "ef44d1723027b4cd78f2fb7e77a76754e06190041b60f60fbbc0aa372944a104",
+      "prepared_path": "native/cuda/domain_rescore_cuda.cu",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/cuda/domain_rescore_cuda.h",
+      "sha256": "b0ae291369fe97a8071e81d140e53223bb5045848bd5d774a5fd1c77987842e9",
+      "prepared_path": "native/cuda/domain_rescore_cuda.h",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/cuda/f3_threshold.cc",
+      "sha256": "747f351c52b832c0fc67150f60dce11479690d89ce98bf67d95c85d64e14118b",
+      "prepared_path": "native/cuda/f3_threshold.cc",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/cuda/f3_threshold.h",
+      "sha256": "05eaf440e3c2b5d7f0d766819cd370ecf5ee0b2f5f5cd722cf2926431c76568e",
+      "prepared_path": "native/cuda/f3_threshold.h",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/cuda/forward_cuda.cu",
+      "sha256": "4d1def06b278fb62755ea2f19ae84486f92ca77c85a21da480bfb70f6b7601ab",
+      "prepared_path": "native/cuda/forward_cuda.cu",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/cuda/forward_cuda.h",
+      "sha256": "f79b42e09974dc58dc97eee7f0fca8b785455c498ab02682358314bca7c2ecbb",
+      "prepared_path": "native/cuda/forward_cuda.h",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/cuda/postfilter_cuda.cu",
+      "sha256": "d22eb3ae1c9f623fdc92c6fbcedb294ac2659b8f983b140a6dcca1f1fa44df0a",
+      "prepared_path": "native/cuda/postfilter_cuda.cu",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/cuda/postfilter_cuda.h",
+      "sha256": "de3073eabd7a177138d7147c42517bd51eecd1e8ef53538c7f01be405a1ab934",
+      "prepared_path": "native/cuda/postfilter_cuda.h",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/cuda/ssv_cuda.cu",
+      "sha256": "504be6628c9e5818a25967540a243c9c772e089b644e6c15f90379de9ff9fe03",
+      "prepared_path": "native/cuda/ssv_cuda.cu",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/cuda/ssv_cuda.h",
+      "sha256": "e8a31699f73b28ad8a6f54a36506ca7c8cdcc65ee66dd23dd62724f3ba2b192d",
+      "prepared_path": "native/cuda/ssv_cuda.h",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/cpu/forward4_avx512.cpp",
+      "sha256": "99fa819994686706242cf32a74dd1bcc0a1d3224bfe5fdb6538d36cec2b6c61b",
+      "prepared_path": "native/experiments/post448_forward4_avx512.cpp",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/python/plan7_gpu/__init__.py",
+      "sha256": "68fc32d1ea6abb223bb5c42afbf89bb2bc1894438ac0c423c1dfa7b633e2274b",
+      "prepared_path": "native/python/plan7_gpu/__init__.py",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/python/plan7_gpu/_abi.py",
+      "sha256": "aed1324c78e72310afd6f63d8b6c3bf6debe601e3f8c39fb501493c9b6989cd1",
+      "prepared_path": "native/python/plan7_gpu/_abi.py",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/python/plan7_gpu/_fingerprint.py",
+      "sha256": "0afe9d73a34a1f81f7332a9799ffedd9e908361023baee10ba7da9d8b501ed2a",
+      "prepared_path": "native/python/plan7_gpu/_fingerprint.py",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/python/plan7_gpu/_mandatory_seed.py",
+      "sha256": "bafbc579ebd4aaa648e08d73b31aa5d659bfd4a9bd0f1e6682ce6bae4f9b60f9",
+      "prepared_path": "native/python/plan7_gpu/_mandatory_seed.py",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/python/plan7_gpu/_native.pyx",
+      "sha256": "ea1d296ee8c5903c7ba3e0dd8c4bc539e0c24ed334760bcb40e18a2d2eeadb2a",
+      "prepared_path": "native/python/plan7_gpu/_native.pyx",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/python/plan7_gpu/_pipeline.pyx",
+      "sha256": "b115e77f56dbe522ebe8e98b2fe6aa9f15a8cb454bd7acfcc3da6b7d08ccfc24",
+      "prepared_path": "native/python/plan7_gpu/_pipeline.pyx",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/python/plan7_gpu/_private_tuning.py",
+      "sha256": "fef6ace1c3b79f79cf06b97c6b4aaa056153d075692f4a830340f5c3b532b3af",
+      "prepared_path": "native/python/plan7_gpu/_private_tuning.py",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/python/plan7_gpu/_telemetry.py",
+      "sha256": "d2b867e5f691c0415bf03431ff45d35f3623b7ef9270e0dbb0146869e0282b36",
+      "prepared_path": "native/python/plan7_gpu/_telemetry.py",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/python/plan7_gpu/adapter.py",
+      "sha256": "76ca0d9e27652458a9ffa57f22c3893f4acfbd7db03c1f4d34fbb436f5668be3",
+      "prepared_path": "native/python/plan7_gpu/adapter.py",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/python/plan7_gpu/astra_search.py",
+      "sha256": "dca727ecbb796b196f8c2660b3daa1692c1ec77ab448ff430532c377d366ef10",
+      "prepared_path": "native/python/plan7_gpu/astra_search.py",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/python/plan7_gpu/pressed_manifest.py",
+      "sha256": "52645c3077ded60e9a524b834bf615fb2f8c8bdedea1695452423567bfcb64b2",
+      "prepared_path": "native/python/plan7_gpu/pressed_manifest.py",
+      "change": "byte-identical native source"
+    },
+    {
+      "path": "native/python/plan7_gpu/telemetry_report.py",
+      "sha256": "598f220480e00bd1b802809afbed32bb5bacf62b720875501c0a3b69085ff8ee",
+      "prepared_path": "native/python/plan7_gpu/telemetry_report.py",
+      "change": "byte-identical native source"
+    }
+  ],
+  "native_implementation_changed": false,
+  "scope": "one canonical checkout; original repository histories preserved; no publication"
+}

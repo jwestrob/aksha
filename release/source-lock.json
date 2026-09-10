@@ -1,0 +1,36 @@
+{
+  "astra_revision": "7a7bfa1b6127ce76a4a0724f6307e6479e44a1ed",
+  "gpu_version": "0.1.0",
+  "native_revision": "dd40d9d208dda762fd6423a16b93a2bb46e60173",
+  "patches": [
+    [
+      "pyhmmer-0.12.0-plan7gpu.patch",
+      "7149f322adc571f50af0a6453a6faa482febcaa70f6f9f4514f789d901270828"
+    ],
+    [
+      "pyhmmer-0.12.0-simple-regions.patch",
+      "88e1e12149e6ec452161ada7756ebb1797fd798421b3071592e0648e6d850475"
+    ],
+    [
+      "pyhmmer-0.12.0-compact-domains.patch",
+      "ee3bcba58902f2e661b06dbaf1354eeebc3a28487113898832c10752247c68d3"
+    ],
+    [
+      "pyhmmer-0.12.0-avx512-tail.patch",
+      "7bdf484da92f900e9bd61a35254e6c4c0490155037a67aaf30c21ff35f9670b1"
+    ],
+    [
+      "pyhmmer-0.12.0-intrarow-release.patch",
+      "89249a2b679cf44f0e13e2a06a0443d9227b0407891df3da79e8dd5160139597"
+    ]
+  ],
+  "runtime_version": "0.1.0",
+  "schema": "aksha-consolidated-source-v1",
+  "sdist_sha256": "27cdfd3cdf72abcc7a6670825fc0195e8ff01d4820efd0f99aec03d3972a922e",
+  "sdist_url": "https://files.pythonhosted.org/packages/b7/55/44372be1e0883df7c056bbfb979d329c033db6a1b5b304144fbaebdd55e7/pyhmmer-0.12.0.tar.gz",
+  "upstream_version": "0.12.0",
+  "app_name": "aksha",
+  "runtime_name": "aksha-runtime",
+  "gpu_name": "aksha-cuda12",
+  "app_version": "0.2.0"
+}

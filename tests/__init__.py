@@ -1,1 +1,1 @@
-"""Astra test suite."""
+"""Aksha test suite."""

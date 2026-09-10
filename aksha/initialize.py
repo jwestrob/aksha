@@ -10,8 +10,8 @@ import textwrap
 import time
 from datetime import datetime
 from email.utils import parsedate_to_datetime
-import pyhmmer.plan7
-import pyhmmer.hmmer
+import astra_pyhmmer.plan7
+import astra_pyhmmer.hmmer
 from tqdm import tqdm
 import urllib.request
 from platformdirs import user_config_dir
@@ -30,13 +30,13 @@ class TqdmUpTo(tqdm):
             self.total = tsize
         self.update(b * bsize - self.n)
 
-APP_NAME = "Astra"
+APP_NAME = "Aksha"
 
 
 def astra_config_dir():
     """Directory holding hmm_databases.json and, by default, the databases.
 
-    On Linux this is ``~/.config/Astra``, which is where Astra has always put
+    On Linux this is ``~/.config/Aksha``, which is where Aksha has always put
     it; platformdirs picks the right equivalent on macOS and Windows.
     """
     return user_config_dir(APP_NAME)
@@ -65,7 +65,7 @@ def initialize_config():
     with open(default_db_json_path, 'r') as f:
         hmm_databases = json.load(f)
 
-    # A user config written by an older Astra won't know about databases added
+    # A user config written by an older Aksha won't know about databases added
     # since. Merge in any new entries so they become installable without the
     # user having to blow away their config (and their 'installed' flags).
     repo_db_json_path = os.path.join(package_dir, 'hmm_databases.json')
@@ -196,7 +196,7 @@ def press_hmm_database(db_dir, db_name=None):
         # Single multi-model file — press directly
         src = os.path.join(db_dir, hmm_files[0])
         print(f"  Pressing {hmm_files[0]} ({db_name})...")
-        with pyhmmer.plan7.HMMFile(src) as hf:
+        with astra_pyhmmer.plan7.HMMFile(src) as hf:
             hmms = list(hf)
     else:
         # Many individual files — read all into memory, then press
@@ -204,11 +204,11 @@ def press_hmm_database(db_dir, db_name=None):
         hmms = []
         for fname in tqdm(hmm_files, desc="  Loading HMMs"):
             fpath = os.path.join(db_dir, fname)
-            with pyhmmer.plan7.HMMFile(fpath) as hf:
+            with astra_pyhmmer.plan7.HMMFile(fpath) as hf:
                 hmms.append(hf.read())
 
     print(f"  Pressing {len(hmms)} HMMs → {pressed_base}.h3{{m,i,f,p}}...")
-    pyhmmer.hmmer.hmmpress(hmms, pressed_base)
+    astra_pyhmmer.hmmer.hmmpress(hmms, pressed_base)
 
     elapsed = time.perf_counter() - t0
     print(f"  Done pressing {db_name} ({elapsed:.1f}s)")
@@ -218,7 +218,7 @@ def press_hmm_database(db_dir, db_name=None):
 def remote_version(url):
     """Release identifier for a download: the source file's Last-Modified date.
 
-    Most of the databases Astra installs publish no version string at all, but
+    Most of the databases Aksha installs publish no version string at all, but
     every HTTP source exposes a modification date, which is enough to tell two
     installs of the same database apart. Returns None if the server won't say.
     """
@@ -243,7 +243,7 @@ def hmm_build_date(hmm_path):
     """The build date in an HMM's DATE field, as YYYY-MM-DD.
 
     Lets us identify which release a profile came from when the config has no
-    version recorded for it (e.g. it was installed by an older Astra).
+    version recorded for it (e.g. it was installed by an older Aksha).
     """
     try:
         with open(hmm_path) as handle:
@@ -396,7 +396,7 @@ def add_threshold(hmm_file_path, threshold):
         # let's just ignore it and not add bad thresholds
         return
 
-    with pyhmmer.plan7.HMMFile(hmm_file_path) as hmm_file:
+    with astra_pyhmmer.plan7.HMMFile(hmm_file_path) as hmm_file:
         hmm = hmm_file.read()
 
     hmm.cutoffs.gathering = threshold, threshold
@@ -419,7 +419,7 @@ def add_hyddb_thresholds(hmm_file_path, ga_threshold, nc_threshold):
 
     # Read all HMMs from the file
     hmms = []
-    with pyhmmer.plan7.HMMFile(hmm_file_path) as hmm_file:
+    with astra_pyhmmer.plan7.HMMFile(hmm_file_path) as hmm_file:
         for hmm in hmm_file:
             hmm.cutoffs.gathering = ga_threshold, ga_threshold
             hmm.cutoffs.noise = nc_threshold, nc_threshold
@@ -524,10 +524,10 @@ def fetch_ko_thresholds(db_path, kos):
 
 
 def install_RP16():
-    """Install the 16 ribosomal-protein markers used by ``astra search --16rp``.
+    """Install the 16 ribosomal-protein markers used by ``aksha search --16rp``.
 
     All 16 markers are KOfam KOs, so rather than vendoring profiles into the
-    package they are lifted out of the KOFAM database Astra already knows how
+    package they are lifted out of the KOFAM database Aksha already knows how
     to install.  If KOFAM isn't installed, the profiles are pulled from
     upstream instead; KOfam ships thresholds in ``ko_list`` rather than in the
     profiles themselves, so those get their cutoffs injected here (an
@@ -536,7 +536,7 @@ def install_RP16():
     RP16 inherits its version from whichever KOFAM release it was built from,
     which is recorded in the config alongside the profiles.
     """
-    from astra import rp16
+    from aksha import rp16
 
     db_name = 'RP16'
     parsed_json = load_config()
@@ -585,7 +585,7 @@ def install_RP16():
         return
 
     if source_version is None:
-        # A KOFAM installed before Astra tracked versions won't have one
+        # A KOFAM installed before Aksha tracked versions won't have one
         # recorded, but the profiles themselves carry their build date.
         source_version = hmm_build_date(os.path.join(target_folder, sorted(expected)[0]))
 

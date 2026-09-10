@@ -1,127 +1,80 @@
+# Aksha: HMM-based sequence search and retrieval
 
-# Astra: Scalable HMM-based Sequence Search and Retrieval
-
-<img src="img/astra_logo.png" width="50%">
-	
-## Overview
-
-Astra is a Python package designed to facilitate bioinformatic workflows involving Hidden Markov Models (HMMs). It serves as a wrapper around [PyHMMER](https://pyhmmer.readthedocs.io/en/stable/index.html) and [HMMER](http://hmmer.org/), as well as a compendium of downloadable HMM databases. It automates the process of downloading and searching with custom or pre-installed HMM databases. Astra aims to streamline bioinformatic analyses, allowing for greater flexibility and ease of use. I intend to make Astra into a capable command-line tool as well as a python library.
-
-## Features
-
-(Just what I've implemented so far! This list will grow!)
-
-- **Initialize**: Download and install HMM databases directly from various sources with a simple command.
-- **Search**: Perform advanced HMM searches on sequence data with customizable options.
+Aksha combines HMM database installation, protein sequence search, and exact
+CPU/GPU acceleration of [PyHMMER](https://pyhmmer.readthedocs.io/) and HMMER 3.4.
+Previously developed as Astra and Astra-GPU, it now has one production source
+repository containing the application, native backend, and release recipes.
 
 ## Installation
 
-To install the package, use pip:
+The prepared versions are `aksha==0.2.0`, `aksha-runtime==0.1.0` and optional
+`aksha-cuda12==0.1.0`. PyPI publication is pending; after upload:
 
 ```bash
-pip install astra-hmm
+python -m pip install aksha
+# Optional NVIDIA backend:
+python -m pip install 'aksha[gpu]'
 ```
 
-The distribution is named `astra-hmm` because `astra` was already taken on
-PyPI; the command and the importable package are both still `astra`.
+Before publication, add `--find-links /path/to/release-bundle`.
+Pip selects matching native wheels and ordinary dependencies automatically.
+No source checkout, compiler, CUDA toolkit, container or environment image
+is needed. The command and Python package are both named `aksha`.
 
-To install from a clone:
-
-```bash
-pip install -e .
-```
-
-Dependencies (all installed automatically via pip):
-
-- [pyhmmer](https://pyhmmer.readthedocs.io/) >= 0.10
-- pandas >= 2.0
-- tqdm
-- requests
-- platformdirs
-
-Python 3.9 or newer. No external binaries are required — HMMER itself comes
-bundled with PyHMMER.
+Current wheels support Linux x86-64, CPython 3.12 and SSE4.1 CPUs; AVX-512 is
+optional. GPU execution requires a compatible NVIDIA GPU/driver; H200 was
+tested. ARM, macOS, Windows and other Python versions are not yet supported.
+See the [installation guide](https://github.com/jwestrob/aksha/blob/main/release/INSTALL.md)
+for support details.
 
 ## Usage
 
-### Initialization
-
-This is not necessary if you have locally installed HMMs. You can specify those without ever running 'Astra initialize'.
-
-If you would like to view the available HMM databases for install:
 ```bash
-Astra initialize --show_available
+aksha --help
+aksha initialize --show_available
+aksha initialize --hmms PFAM
+aksha search --prot_in proteins.faa --installed_hmms PFAM --cut_ga --outdir results
 ```
 
+Use `--hmm_in` for custom HMMs instead of downloading a database. Cutoff
+options depend on the database; PFAM provides curated gathering thresholds.
+See the [database setup guide](https://github.com/jwestrob/aksha/blob/main/initialize_usage_guide.md)
+for storage locations, existing databases and reinstalling safely.
+GPU installation does not automatically enable GPU searches: use a local
+pressed-database manifest and `--gpu-manifest DB=PATH`, documented in
+the [installation guide](https://github.com/jwestrob/aksha/blob/main/release/INSTALL.md).
 
-To initialize and download one of these databases:
+Large eligible CPU searches stream pressed profiles in bounded chunks. The
+qualified allocator policy applies to console searches using 64 or more
+threads. Legacy `ASTRA_*` tuning variables remain unchanged, including
+`ASTRA_CPU_STREAM_PRESSED` and `ASTRA_CPU_MALLOC_ARENA_MAX`; existing
+`MALLOC_ARENA_MAX` values are respected. No numerical policy changed.
 
-```bash
-Astra initialize --hmms database_name
-```
+## Source and development
 
-Or to install them all (takes quite a bit of time!):
+- `aksha/`: application, CLI, database setup and output.
+- `native/`: production CPU/CUDA sources, private bindings and five upstream patches.
+- `release/`: single-checkout recipes, provenance and checks.
 
-```bash
-Astra initialize --hmms all_prot
-```
+The root pyproject directly declares the matching runtime and GPU extra.
+Editable installs use that same contract; there is no second app variant or
+hidden dependency rewrite. Private names `astra_pyhmmer`, `plan7_gpu`,
+`libastra_hmmer.so` and `libastra_easel.so` remain stable for ABI compatibility.
+Stock `pyhmmer` may coexist but its native objects are not interchangeable.
 
+See the [release notes](https://github.com/jwestrob/aksha/blob/main/RELEASE.md)
+and [build guide](https://github.com/jwestrob/aksha/blob/main/release/BUILD.md). This
+naming release promotes no experimental algorithms or new benchmark claims.
+The root CPU/GPU integration, audit and experiment documents are historical
+engineering records; their old names, paths and timings are not current
+installation instructions.
 
-### Search
+## License and contributions
 
-To perform an HMM search:
-
-```bash
-Astra search --prot_in your_fasta_file --installed_hmms database_name  --cut_ga --outdir example_output
-```
-
-#### Combined Search
-
-To perform an HMM search using custom HMM files:
-
-```bash
-Astra search --prot_in your_fasta_file --hmm_in custom_db --installed_hmms pre_installed_db --cut_ga --outdir example_output
-```
-
-#### CPU memory policy
-
-Large ordinary CPU searches of installed pressed databases automatically read
-profiles in bounded chunks.  Custom/unpressed databases, small databases,
-GPU, cascade, and MacSyFinder searches keep the ordinary eager path.  Set
-`ASTRA_CPU_STREAM_PRESSED=0` to disable this optimization; `auto` is the
-default and `1` requests it without overriding the safety checks.
-
-On Linux/glibc, an `astra search --threads 64` (or higher) console invocation
-also starts with a validated 24-arena allocator limit.  Existing
-`MALLOC_ARENA_MAX` values are preserved.  Set
-`ASTRA_CPU_MALLOC_ARENA_MAX=0` to opt out, or set it to a positive integer to
-choose another value.  Programmatic Astra use and lower-thread searches are
-unchanged.
-
-## Contributing & License
-
-Contributions are welcome! Especially if you have database suggestions. Feel free to raise an issue if you'd like to add a database to the installable list. Feature requests will be considered and implemented if I have the time and ability.
-
----
-
-MIT License
-
-Copyright (c) 2023 Jacob West-Roberts
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+Original application code uses [MIT](https://github.com/jwestrob/aksha/blob/main/LICENSE);
+original native additions carry their MIT grant in the
+[native README](https://github.com/jwestrob/aksha/blob/main/native/README.md).
+Upstream notices remain intact: [inventory](https://github.com/jwestrob/aksha/blob/main/release/THIRD_PARTY_NOTICES.md).
+Contributions and database suggestions are welcome. Future upstream work
+with Martin Larralde starts with cleanup, a narrow reusable interface proposal
+and existing evidence, not the experimental development tree.

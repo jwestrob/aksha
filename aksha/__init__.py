@@ -1,9 +1,9 @@
-# astra/__init__.py
+# aksha/__init__.py
 
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description='Astra: A suite of sequence analysis tools.')
+    parser = argparse.ArgumentParser(description='Aksha: A suite of sequence analysis tools.')
     parser.add_argument('command', choices=['search', 'initialize', 'nucsearch', 'phmmer', 'jackhmmer'],
                         help='Subcommand to run')
 

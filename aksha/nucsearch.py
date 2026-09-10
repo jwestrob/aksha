@@ -6,11 +6,11 @@ import sys
 import time
 import shutil
 
-import pyhmmer
+import astra_pyhmmer
 from tqdm import tqdm
 
-from astra import initialize
-from astra.search import parse_hmms
+from aksha import initialize
+from aksha.search import parse_hmms
 
 
 HEADER = "sequence_id\thmm_name\tbitscore\tevalue\tenv_from\tenv_to\n"
@@ -41,7 +41,7 @@ def nucsearch(all_sequences, hmms, threads, options, outdir, db_name=None):
     out_file = os.path.join(tmp_dir, "nhmmer_results.tsv")
     with open(out_file, 'w') as fh:
         fh.write(HEADER)
-        for hits in pyhmmer.nhmmer(hmms, all_sequences, cpus=threads, **nucsearch_kwargs):
+        for hits in astra_pyhmmer.nhmmer(hmms, all_sequences, cpus=threads, **nucsearch_kwargs):
             process_nhmmer_hits(hits, fh)
 
     gc.collect()
@@ -87,15 +87,15 @@ def parse_nuc_input(nuc_in, threads):
 
         fasta_paths = [os.path.join(nuc_in, x) for x in os.listdir(nuc_in)]
         for fasta_file in tqdm(fasta_paths):
-            with pyhmmer.easel.SequenceFile(fasta_file, digital=True,
-                                             alphabet=pyhmmer.easel.Alphabet.dna()) as seq_file:
+            with astra_pyhmmer.easel.SequenceFile(fasta_file, digital=True,
+                                             alphabet=astra_pyhmmer.easel.Alphabet.dna()) as seq_file:
                 nuc_dict[fasta_file] = seq_file.read_block()
     elif os.path.isfile(nuc_in):
         if os.path.getsize(nuc_in) == 0:
             print("nuc_in file is empty.")
             sys.exit(1)
-        with pyhmmer.easel.SequenceFile(nuc_in, digital=True,
-                                         alphabet=pyhmmer.easel.Alphabet.dna()) as seq_file:
+        with astra_pyhmmer.easel.SequenceFile(nuc_in, digital=True,
+                                         alphabet=astra_pyhmmer.easel.Alphabet.dna()) as seq_file:
             nuc_dict[nuc_in] = seq_file.read_block()
     else:
         print(f"Invalid input for nuc_in: {nuc_in}")

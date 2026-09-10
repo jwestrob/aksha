@@ -1,6 +1,6 @@
-"""Minimal console launcher for Astra's high-thread allocator policy.
+"""Minimal console launcher for Aksha's high-thread allocator policy.
 
-This module must remain free of imports from :mod:`astra.main`, PyHMMER, or
+This module must remain free of imports from :mod:`aksha.main`, PyHMMER, or
 other allocation-heavy runtime modules.  The console entry point can then set
 the glibc arena limit and replace itself with a fresh interpreter before any
 of those modules are imported.  Programmatic/library entry points bypass this
@@ -35,7 +35,7 @@ def _is_linux_glibc() -> bool:
 def _requested_threads(arguments: tuple[str, ...]) -> int | None:
     """Return the CLI worker count, or ``None`` for malformed input.
 
-    Astra's parser owns diagnostics for malformed ``--threads`` arguments.
+    Aksha's parser owns diagnostics for malformed ``--threads`` arguments.
     The launcher simply declines to re-exec in that case so it cannot mask the
     existing command-line error or alter its ordering.
     """
@@ -60,7 +60,7 @@ def _requested_threads(arguments: tuple[str, ...]) -> int | None:
 def _is_high_thread_search(arguments: tuple[str, ...]) -> bool:
     """Return whether raw arguments select a search with at least 64 threads.
 
-    The allocator policy applies before Astra can resolve CPU versus GPU
+    The allocator policy applies before Aksha can resolve CPU versus GPU
     execution. Both routes run high-thread HMMER continuations and have
     independently retained the 24-arena setting.
     """
@@ -71,7 +71,7 @@ def _is_high_thread_search(arguments: tuple[str, ...]) -> bool:
 
 
 def _arena_max(environment: dict[str, str]) -> int | None:
-    """Parse the Astra-specific arena control.
+    """Parse the Aksha-specific arena control.
 
     Zero is an explicit opt-out.  A standard ``MALLOC_ARENA_MAX`` value is
     handled by the caller before this parser and always takes precedence.
@@ -127,7 +127,7 @@ def _dispatch() -> object:
 
 
 def main() -> object:
-    """Run the Astra console command with the high-thread arena policy."""
+    """Run the Aksha console command with the high-thread arena policy."""
     arguments = tuple(sys.argv[1:])
     try:
         environment = _reexec_environment(arguments, dict(os.environ))
@@ -136,7 +136,7 @@ def main() -> object:
     if environment is not None:
         os.execvpe(
             sys.executable,
-            [sys.executable, "-m", "astra.main", *arguments],
+            [sys.executable, "-m", "aksha.main", *arguments],
             environment,
         )
         raise RuntimeError("os.execvpe returned unexpectedly")

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["scikit-build-core==0.11.6", "Cython==3.2.4"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "aksha-runtime"
+version = "@VERSION@"
+description = "Private, coordinated CPU runtime for Aksha"
+readme = "ASTRA_RUNTIME.md"
+requires-python = ">=3.12,<3.13"
+license-files = ["COPYING", "vendor/hmmer/LICENSE", "vendor/easel/LICENSE"]
+dependencies = ["psutil>=5,<8"]
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+build-dir = "build/{build_type}"
+wheel.packages = ["src/astra_pyhmmer"]
+# Deliberately cp312-cp312: the companion extension uses CPython's full API.
+install.strip = false
+
+[tool.scikit-build.cmake.define]
+PYHMMER_INSTALL_LIBS = true
+BUILD_SHARED_LIBS = true

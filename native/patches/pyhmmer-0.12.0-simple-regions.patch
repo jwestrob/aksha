@@ -1,0 +1,353 @@
+--- a/vendor/hmmer/src/hmmer.h
++++ b/vendor/hmmer/src/hmmer.h
+@@ -1824,0 +1825,11 @@
++enum p7_pipeline_domain_route_e {
++  p7_DOMAIN_CPU_REQUIRED = 0,
++  p7_DOMAIN_NO_REGIONS   = 1,
++  p7_DOMAIN_SIMPLE       = 2
++};
++
++typedef struct p7_pipeline_simple_region_s {
++  uint32_t i;
++  uint32_t j;
++} P7_PIPELINE_SIMPLE_REGION;
++
+@@ -1830,0 +1842,12 @@
++extern int p7_PipelineFromFilterAndForwardSimpleRegions(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg,
++                                                        const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *th,
++                                                        float usc, float filtersc, float vfsc, float fwdsc,
++                                                        uint64_t generation_f1_bits, uint64_t generation_f2_bits,
++                                                        uint64_t generation_f3_bits, int generation_bias_filter,
++                                                        enum p7_pipeline_domain_route_e route, float nexpected,
++                                                        const P7_PIPELINE_SIMPLE_REGION *regions, uint64_t region_count);
++/* Trusted internal worker for the validated pipeline seam above. */
++extern int p7_domaindef_ByExternalSimpleRegions(const ESL_SQ *sq, const ESL_SQ *ntsq, P7_OPROFILE *om,
++                                                P7_OMX *fwd, P7_OMX *bck, P7_DOMAINDEF *ddef, P7_BG *bg,
++                                                float nexpected, const P7_PIPELINE_SIMPLE_REGION *regions,
++                                                uint64_t region_count);
+--- a/vendor/hmmer/src/p7_pipeline.c
++++ b/vendor/hmmer/src/p7_pipeline.c
+@@ -710,0 +711,8 @@
++pipeline_post_domains(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg,
++                      const ESL_SQ *sq, P7_TOPHITS *hitlist,
++                      float nullsc, float fwdsc);
++static int
++pipeline_profile_configuration_is_exact(const P7_OPROFILE *om, int L);
++static int
++pipeline_background_configuration_is_exact(const P7_BG *bg, int L);
++static int
+@@ -843,0 +852,175 @@
++/* Continue an F3 survivor from a guarded external domain route.  This seam is
++ * intentionally protein/search-mode only.  It accepts either no regions or a
++ * sorted set of nonoverlapping simple regions; clustered and uncertain rows
++ * must use p7_PipelineFromFilterAndForwardScores instead. */
++int
++p7_PipelineFromFilterAndForwardSimpleRegions(
++    P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg,
++    const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *hitlist,
++    float usc, float filtersc, float vfsc, float fwdsc,
++    uint64_t generation_f1_bits, uint64_t generation_f2_bits,
++    uint64_t generation_f3_bits, int generation_bias_filter,
++    enum p7_pipeline_domain_route_e route, float nexpected,
++    const P7_PIPELINE_SIMPLE_REGION *regions, uint64_t region_count)
++{
++  union { double value; uint64_t bits; } live;
++  float  nullsc;
++  float  seq_score;
++  double P;
++  int    status;
++  uint64_t r;
++
++  /* Complete validation precedes all pipeline, profile, matrix, domaindef,
++   * counter, and hit-list mutation. */
++  if (pli == NULL || om == NULL || bg == NULL || sq == NULL || hitlist == NULL)
++    return eslEINVAL;
++  if (pli->mode != p7_SEARCH_SEQS || pli->long_targets || ntsq != NULL)
++    return eslEINVAL;
++  if (sq->n == 0 || sq->n > 100000 ||
++      ! pipeline_profile_configuration_is_exact(om, sq->n) ||
++      ! pipeline_background_configuration_is_exact(bg, sq->n))
++    return eslEINVAL;
++  if (! pipeline_float_environment_is_exact()) return eslEINVAL;
++  if (! isfinite(pli->F1) || pli->F1 < 0.0 || pli->F1 > 1.0 ||
++      ! isfinite(pli->F2) || pli->F2 < 0.0 || pli->F2 > 1.0 ||
++      ! isfinite(pli->F3) || pli->F3 < 0.0 || pli->F3 > 1.0 ||
++      ! isfinite(om->evparam[p7_MMU]) ||
++      ! isfinite(om->evparam[p7_MLAMBDA]) || om->evparam[p7_MLAMBDA] <= 0.0f ||
++      ! isfinite(om->evparam[p7_VMU]) ||
++      ! isfinite(om->evparam[p7_VLAMBDA]) || om->evparam[p7_VLAMBDA] <= 0.0f ||
++      ! isfinite(om->evparam[p7_FTAU]) ||
++      ! isfinite(om->evparam[p7_FLAMBDA]) || om->evparam[p7_FLAMBDA] <= 0.0f ||
++      ! isfinite(bg->omega) || bg->omega <= 0.0f || bg->omega >= 1.0f)
++    return eslEINVAL;
++  if (! isfinite(usc) || ! isfinite(fwdsc) ||
++      ! isfinite(nexpected) || nexpected < 0.0f || nexpected > (float) sq->n)
++    return eslEINVAL;
++  if (generation_bias_filter != FALSE && generation_bias_filter != TRUE)
++    return eslEINVAL;
++  if (pli->do_biasfilter && ! isfinite(filtersc)) return eslEINVAL;
++
++  live.value = pli->F1; if (live.bits != generation_f1_bits) return eslEINVAL;
++  live.value = pli->F2; if (live.bits != generation_f2_bits) return eslEINVAL;
++  live.value = pli->F3; if (live.bits != generation_f3_bits) return eslEINVAL;
++  if (pli->do_biasfilter != generation_bias_filter) return eslEINVAL;
++
++  if (route == p7_DOMAIN_NO_REGIONS)
++    {
++      if (region_count != 0 || regions != NULL) return eslEINVAL;
++    }
++  else if (route == p7_DOMAIN_SIMPLE)
++    {
++      if (region_count == 0 || region_count > (uint64_t) sq->n ||
++          regions == NULL)
++        return eslEINVAL;
++    }
++  else return eslEINVAL;
++
++  for (r = 0; r < region_count; r++)
++    {
++      if (regions[r].i == 0 || regions[r].i > regions[r].j ||
++          regions[r].j > (uint32_t) sq->n)
++        return eslEINVAL;
++      if (r != 0 && regions[r].i <= regions[r-1].j) return eslEINVAL;
++    }
++  if (pli->fwd == NULL || pli->bck == NULL ||
++      pli->ddef == NULL || pli->ddef->dcl == NULL ||
++      pli->ddef->ndom != 0 || pli->ddef->nregions != 0 ||
++      pli->ddef->nclustered != 0 || pli->ddef->noverlaps != 0 ||
++      pli->ddef->nenvelopes != 0)
++    return eslEINVAL;
++
++  status = p7_bg_NullOne(bg, sq->dsq, sq->n, &nullsc);
++  if (status != eslOK) return status;
++  seq_score = (usc-nullsc) / eslCONST_LOG2;
++  P = esl_gumbel_surv(seq_score, om->evparam[p7_MMU], om->evparam[p7_MLAMBDA]);
++  if (P > pli->F1) return eslEINVAL;
++  if (pli->do_biasfilter)
++    {
++      seq_score = (usc-filtersc) / eslCONST_LOG2;
++      P = esl_gumbel_surv(seq_score, om->evparam[p7_MMU], om->evparam[p7_MLAMBDA]);
++      if (P > pli->F1) return eslEINVAL;
++    }
++  else filtersc = nullsc;
++  if (P > pli->F2)
++    {
++      if (isnan(vfsc) || (isinf(vfsc) && vfsc < 0.0f)) return eslEINVAL;
++      seq_score = (vfsc-filtersc) / eslCONST_LOG2;
++      P = esl_gumbel_surv(seq_score, om->evparam[p7_VMU], om->evparam[p7_VLAMBDA]);
++      if (P > pli->F2) return eslEINVAL;
++    }
++  seq_score = (fwdsc-filtersc) / eslCONST_LOG2;
++  P = esl_exp_surv(seq_score, om->evparam[p7_FTAU], om->evparam[p7_FLAMBDA]);
++  if (P > pli->F3) return eslEINVAL;
++
++  pli->n_past_msv++;
++  pli->n_past_bias++;
++  pli->n_past_vit++;
++  pli->n_past_fwd++;
++  if (route == p7_DOMAIN_NO_REGIONS)
++    {
++      pli->ddef->L = sq->n;
++      pli->ddef->nexpected = nexpected;
++      return eslOK;
++    }
++  status = p7_domaindef_ByExternalSimpleRegions(
++      sq, ntsq, om, pli->fwd, pli->bck, pli->ddef, bg,
++      nexpected, regions, region_count);
++  if (status != eslOK)
++    ESL_FAIL(status, pli->errbuf, "external simple-region workflow failure");
++  return pipeline_post_domains(pli, om, bg, sq, hitlist, nullsc, fwdsc);
++}
++
++/* A normal protein comparison enters the post-Forward workflow with the
++ * optimized profile in multihit-local mode and fully reconfigured for the
++ * current target length.  om->mode and om->L alone are insufficient:
++ * ReconfigUnihit() deliberately changes nj/xf without changing mode. */
++static int
++pipeline_profile_configuration_is_exact(const P7_OPROFILE *om, int L)
++{
++  union { float value; uint32_t bits; } expected, live;
++  float pmove;
++  float ploop;
++  int x;
++
++  if (om == NULL || L <= 0 || om->mode != p7_LOCAL || om->L != L)
++    return FALSE;
++  expected.value = 1.0f; live.value = om->nj;
++  if (expected.bits != live.bits) return FALSE;
++  expected.value = 0.5f; live.value = om->xf[p7O_E][p7O_MOVE];
++  if (expected.bits != live.bits) return FALSE;
++  live.value = om->xf[p7O_E][p7O_LOOP];
++  if (expected.bits != live.bits) return FALSE;
++
++  pmove = 3.0f / ((float) L + 3.0f);
++  ploop = 1.0f - pmove;
++  for (x = p7O_N; x <= p7O_C; x++)
++    {
++      expected.value = pmove; live.value = om->xf[x][p7O_MOVE];
++      if (expected.bits != live.bits) return FALSE;
++      expected.value = ploop; live.value = om->xf[x][p7O_LOOP];
++      if (expected.bits != live.bits) return FALSE;
++    }
++  return TRUE;
++}
++
++/* Null1 uses bg->p1, while the filter HMM caches the same length model.
++ * Require the exact state produced by p7_bg_SetLength(bg, L). */
++static int
++pipeline_background_configuration_is_exact(const P7_BG *bg, int L)
++{
++  union { float value; uint32_t bits; } expected, live;
++
++  if (bg == NULL || bg->fhmm == NULL || bg->fhmm->t == NULL ||
++      bg->fhmm->t[0] == NULL || L <= 0)
++    return FALSE;
++  expected.value = (float) L / (float) (L + 1);
++  live.value = bg->p1;
++  if (expected.bits != live.bits) return FALSE;
++  live.value = bg->fhmm->t[0][0];
++  if (expected.bits != live.bits) return FALSE;
++  expected.value = 1.0f - expected.value;
++  live.value = bg->fhmm->t[0][1];
++  return expected.bits == live.bits;
++}
++
+@@ -981,2 +1163,0 @@
+-  P7_HIT          *hit     = NULL;
+-  float            seqbias;
+@@ -984,2 +1164,0 @@
+-  float            sum_score;
+-  float            pre_score, pre2_score;
+@@ -987,3 +1165,0 @@
+-  double           lnP;
+-  int              Ld;
+-  int              d;
+@@ -1016,0 +1193,21 @@
++  return pipeline_post_domains(pli, om, bg, sq, hitlist, nullsc, fwdsc);
++}
++
++/* Shared ordinary post-Forward hit construction.  Both posterior domain
++ * discovery and the guarded simple-region seam enter here after populating
++ * pli->ddef through the same isolated-domain rescore path. */
++static int
++pipeline_post_domains(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg,
++                      const ESL_SQ *sq, P7_TOPHITS *hitlist,
++                      float nullsc, float fwdsc)
++{
++  P7_HIT          *hit = NULL;
++  float            seqbias;
++  float            seq_score;
++  float            sum_score;
++  float            pre_score, pre2_score;
++  double           lnP;
++  int              Ld;
++  int              d;
++  int              status;
++
+--- a/vendor/hmmer/src/p7_domaindef.c
++++ b/vendor/hmmer/src/p7_domaindef.c
+@@ -495,0 +496,85 @@
++/* Continue domain definition from externally supplied regions that have
++ * already been classified as simple.  This deliberately exposes no posterior
++ * arrays: each interval is rescored by the ordinary Forward/Backward,
++ * posterior-decoding, null2, optimal-accuracy, and display path above. */
++int
++p7_domaindef_ByExternalSimpleRegions(const ESL_SQ *sq, const ESL_SQ *ntsq,
++                                     P7_OPROFILE *om, P7_OMX *fwd,
++                                     P7_OMX *bck, P7_DOMAINDEF *ddef,
++                                     P7_BG *bg, float nexpected,
++                                     const P7_PIPELINE_SIMPLE_REGION *regions,
++                                     uint64_t region_count)
++{
++  int      saveL;
++  int      save_mode;
++  int      status;
++  int      restore_status;
++  uint64_t r;
++
++  /* Trusted internal worker: the public pipeline seam validates generation
++   * provenance and the exact live profile/background configuration first. */
++  if (sq == NULL || ntsq != NULL || om == NULL || fwd == NULL || bck == NULL ||
++      ddef == NULL || bg == NULL || sq->n <= 0 || sq->n > 100000 ||
++      om->L != sq->n || om->mode != p7_LOCAL)
++    return eslEINVAL;
++  if (! isfinite(nexpected) || nexpected < 0.0f ||
++      nexpected > (float) sq->n)
++    return eslEINVAL;
++  if (region_count > (uint64_t) sq->n) return eslEINVAL;
++  if (region_count != 0 && regions == NULL) return eslEINVAL;
++  if (ddef->dcl == NULL || ddef->ndom != 0 || ddef->nregions != 0 ||
++      ddef->nclustered != 0 || ddef->noverlaps != 0 ||
++      ddef->nenvelopes != 0)
++    return eslEINVAL;
++  for (r = 0; r < region_count; r++)
++    {
++      if (regions[r].i == 0 || regions[r].i > regions[r].j ||
++          regions[r].j > (uint32_t) sq->n)
++        return eslEINVAL;
++      if (r != 0 && regions[r].i <= regions[r-1].j) return eslEINVAL;
++    }
++
++  status = p7_domaindef_GrowTo(ddef, sq->n);
++  if (status != eslOK) return status;
++  esl_vec_FSet(ddef->n2sc, sq->n+1, 0.0f);
++  ddef->L          = sq->n;
++  ddef->nexpected  = nexpected;
++  ddef->nregions   = 0;
++  ddef->nclustered = 0;
++  ddef->noverlaps  = 0;
++  ddef->nenvelopes = 0;
++
++  saveL     = om->L;
++  save_mode = om->mode;
++  status = p7_oprofile_ReconfigUnihit(om, saveL);
++  if (status != eslOK) return status;
++
++  for (r = 0; r < region_count; r++)
++    {
++      int i = (int) regions[r].i;
++      int j = (int) regions[r].j;
++      int L = j-i+1;
++
++      status = p7_omx_GrowTo(fwd, om->M, L, L);
++      if (status != eslOK) goto RESTORE;
++      status = p7_omx_GrowTo(bck, om->M, L, L);
++      if (status != eslOK) goto RESTORE;
++      ddef->nregions++;
++      ddef->nenvelopes++;
++      (void) rescore_isolated_domain(ddef, om, sq, ntsq, fwd, bck,
++                                     i, j, FALSE, bg, FALSE,
++                                     NULL, NULL, NULL);
++    }
++
++  status = eslOK;
++
++ RESTORE:
++  if (p7_IsMulti(save_mode))
++    restore_status = p7_oprofile_ReconfigMultihit(om, saveL);
++  else
++    restore_status = p7_oprofile_ReconfigUnihit(om, saveL);
++  if (status == eslOK) status = restore_status;
++  return status;
++}
++
++
+@@ -1271 +1355,0 @@
+-
+--- a/include/libhmmer/p7_pipeline.pxd
++++ b/include/libhmmer/p7_pipeline.pxd
+@@ -1 +1 @@
+-from libc.stdint cimport uint64_t, int64_t
++from libc.stdint cimport uint32_t, uint64_t, int64_t
+@@ -50,0 +51,9 @@
++    cdef enum p7_pipeline_domain_route_e:
++        p7_DOMAIN_CPU_REQUIRED = 0
++        p7_DOMAIN_NO_REGIONS = 1
++        p7_DOMAIN_SIMPLE = 2
++
++    ctypedef struct P7_PIPELINE_SIMPLE_REGION:
++        uint32_t i
++        uint32_t j
++
+@@ -138,0 +148 @@
++    int p7_PipelineFromFilterAndForwardSimpleRegions(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *th, float usc, float filtersc, float vfsc, float fwdsc, uint64_t generation_f1_bits, uint64_t generation_f2_bits, uint64_t generation_f3_bits, int generation_bias_filter, p7_pipeline_domain_route_e route, float nexpected, const P7_PIPELINE_SIMPLE_REGION *regions, uint64_t region_count)

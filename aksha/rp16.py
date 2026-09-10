@@ -1,7 +1,7 @@
-"""16-ribosomal-protein (RP16) marker handling for ``astra search --16rp``.
+"""16-ribosomal-protein (RP16) marker handling for ``aksha search --16rp``.
 
 The ``--16rp`` flag runs the RP16 marker set (16 KOfam KOs, installed with
-``astra initialize --hmms RP16``) against a set of per-genome protein FASTAs
+``aksha initialize --hmms RP16``) against a set of per-genome protein FASTAs
 and produces, for each of the 16 markers, a single genome-labelled multifasta
 containing the best-scoring hit per genome -- ready for per-marker alignment
 and concatenation.
@@ -22,7 +22,7 @@ markers inside that block are written to the per-marker fastas.
 import os
 import logging
 
-# KOfam KO (== HMM NAME field == pyhmmer ``hits.query.name``, the value
+# KOfam KO (== HMM NAME field == astra_pyhmmer ``hits.query.name``, the value
 # written to the hits TSV) -> canonical ribosomal-protein label.
 RP16_MARKERS = {
     "K02886": "L2",
@@ -65,11 +65,11 @@ def profile_filename(ko):
 def rp16_hmm_dir():
     """Absolute path to the installed RP16 marker set.
 
-    RP16 is a regular Astra database (``astra initialize --hmms RP16``) rather
+    RP16 is a regular Aksha database (``aksha initialize --hmms RP16``) rather
     than data vendored into the package, so it resolves through the same
     config as PFAM/KOFAM.
     """
-    from astra import initialize
+    from aksha import initialize
 
     parsed_json = initialize.load_config()
     for db in parsed_json['db_urls']:
@@ -80,7 +80,7 @@ def rp16_hmm_dir():
 
     raise FileNotFoundError(
         "The RP16 marker set is not installed. Install it with:\n"
-        "    astra initialize --hmms RP16")
+        "    aksha initialize --hmms RP16")
 
 
 def genome_id_from_path(path):

@@ -1,6 +1,6 @@
 """Explicit, bounded reuse of immutable plan7 GPU profile sessions.
 
-The cache is deliberately process-local and opt-in.  A normal one-shot Astra
+The cache is deliberately process-local and opt-in.  A normal one-shot Aksha
 CLI invocation therefore retains its existing ownership and cleanup behavior.
 Long-lived callers may own one cache, pass it to successive searches, and close
 it deterministically when the worker retires.
@@ -72,7 +72,7 @@ def plan7_runtime_identity() -> Plan7RuntimeIdentity:
     adapter and native extension artifacts makes its compatibility contract
     explicit and auditable instead of relying only on a package version.
     """
-    import pyhmmer
+    import astra_pyhmmer
     from plan7_gpu import _native, _pipeline
     from plan7_gpu import adapter
     from plan7_gpu._abi import pyhmmer_abi_fingerprint
@@ -84,7 +84,7 @@ def plan7_runtime_identity() -> Plan7RuntimeIdentity:
         return _sha256_file(Path(origin).resolve(strict=True))
 
     return Plan7RuntimeIdentity(
-        pyhmmer_version=str(pyhmmer.__version__),
+        pyhmmer_version=str(astra_pyhmmer.__version__),
         pyhmmer_private_abi_sha256=pyhmmer_abi_fingerprint(),
         adapter_sha256=module_digest(adapter),
         native_extension_sha256=module_digest(_native),

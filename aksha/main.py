@@ -1,5 +1,5 @@
 import argparse
-from astra import search, initialize, nucsearch, phmmer, jackhmmer, scan
+from aksha import search, initialize, nucsearch, phmmer, jackhmmer, scan
 
 class CustomHelpFormatter(argparse.HelpFormatter):
     def _format_action(self, action):
@@ -9,7 +9,7 @@ class CustomHelpFormatter(argparse.HelpFormatter):
         return parts
 
 def main():
-    parser = argparse.ArgumentParser(description='Astra: A scalable tool for various sequence searching tasks.', formatter_class=CustomHelpFormatter)
+    parser = argparse.ArgumentParser(description='Aksha: A scalable tool for various sequence searching tasks.', formatter_class=CustomHelpFormatter)
     subparsers = parser.add_subparsers(dest='command', help='\nAvailable subroutines:')
 
 
@@ -21,7 +21,7 @@ def main():
     # INITIALIZE #
     ##############
     
-    # Astra initialize sub-command
+    # Aksha initialize sub-command
     parser_initialize = subparsers.add_parser('initialize', help='Downloads provided HMM databases.')
     parser_initialize.add_argument('--show_installed', action='store_true', help='Show installed databases.')
     parser_initialize.add_argument('--show_available', action='store_true', help='Show available databases.')
@@ -35,12 +35,12 @@ def main():
     ##########
 
 
-    # Astra search sub-command
+    # Aksha search sub-command
     parser_search = subparsers.add_parser('search', description='Search protein sequences with HMM profiles.')
     parser_search.add_argument('--hmm_in', default=None, help='Input file/directory for HMM profiles.')
     parser_search.add_argument('--prot_in', required=True, help='Input file for protein sequences.')
     parser_search.add_argument('--outdir', required=True, help='Output directory for results.')
-    parser_search.add_argument('--installed_hmms', default=None, type=str, help='Comma-separated list of installed HMM databases to use. If you specify a database that is not installed, Astra will not utilize it here. Go install it with initialize')
+    parser_search.add_argument('--installed_hmms', default=None, type=str, help='Comma-separated list of installed HMM databases to use. If you specify a database that is not installed, Aksha will not utilize it here. Go install it with initialize')
     parser_search.add_argument(
         '--gpu-manifest', action='append', default=[], metavar='DB=PATH',
         help=('Use plan7_gpu for the named installed protein database, '
@@ -48,7 +48,7 @@ def main():
     )
 
     #16rp 
-    parser_search.add_argument('--16rp', action='store_true', default=False, help='Retrieve 16 ribosomal protein markers for concatenated phylogenetic analysis [BACTERIA + ARCHAEA]. Requires the RP16 database (astra initialize --hmms RP16).')
+    parser_search.add_argument('--16rp', action='store_true', default=False, help='Retrieve 16 ribosomal protein markers for concatenated phylogenetic analysis [BACTERIA + ARCHAEA]. Requires the RP16 database (aksha initialize --hmms RP16).')
     parser_search.add_argument('--15rp', action='store_true', default=False, help='Retrieve 15 ribosomal protein markers for concatenated phylogenetic analysis [ARCHAEA ONLY]')
     parser_search.add_argument('--synteny', type=float, default=None, help='[16/15RP ONLY] Percentage of RP markers that must be present in a syntenic block (max gap 3 ORFs) to include the genome in the final alignment. (e.g. 0.5)')
 
@@ -92,7 +92,7 @@ def main():
     parser_scan.add_argument('--hmm_in', default=None, help='Input file/directory for HMM profiles.')
     parser_scan.add_argument('--prot_in', required=True, help='Input file for protein sequences.')
     parser_scan.add_argument('--outdir', required=True, help='Output directory for results.')
-    parser_scan.add_argument('--installed_hmms', default=None, type=str, help='Comma-separated list of installed HMM databases to use. If you specify a database that is not installed, Astra will not utilize it here. Go install it with initialize')
+    parser_scan.add_argument('--installed_hmms', default=None, type=str, help='Comma-separated list of installed HMM databases to use. If you specify a database that is not installed, Aksha will not utilize it here. Go install it with initialize')
 
     # Optional arguments
     parser_scan.add_argument("--evalue", type=str, default=None, help="Custom e-value threshold for HMM search.")
@@ -122,7 +122,7 @@ def main():
     parser_scan.add_argument('--threads', type=int, help="Number of threads to use for HMMsearch. Default behavior: Choose appropriate number of threads based on psutil.cpu_count and number of query sequences", default=0) 
     # ... other arguments for scan
 
-    # Astra nucsearch sub-command
+    # Aksha nucsearch sub-command
     parser_nucsearch = subparsers.add_parser('nucsearch', help='Performs nhmmer search on nucleotide sequences.')
     parser_nucsearch.add_argument('--nuc_in', required=True, help='Input nucleotide FASTA file or directory.')
     parser_nucsearch.add_argument('--hmm_in', default=None, help='Input file/directory for nucleotide HMM profiles.')
@@ -135,7 +135,7 @@ def main():
     parser_nucsearch.add_argument("--cut_nc", action="store_true", default=False, help="Use built-in NC thresholds.")
     parser_nucsearch.add_argument("--cut_tc", action="store_true", default=False, help="Use built-in TC thresholds.")
 
-    # Astra phmmer sub-command
+    # Aksha phmmer sub-command
     parser_phmmer = subparsers.add_parser('phmmer', help='Performs phmmer search.')
     parser_phmmer.add_argument('--query_seqs', required=True, help='Query sequences for jackhmmer. [FASTA]')
     parser_phmmer.add_argument('--subject_seqs', required=True, help='Subject sequences (database) for jackhmmer. [FASTA]')
@@ -143,7 +143,7 @@ def main():
     parser_phmmer.add_argument('--outdir', required=True, help='Output directory for results.')
     # ... other arguments for phmmer
 
-    # Astra jackhmmer sub-command
+    # Aksha jackhmmer sub-command
     parser_jackhmmer = subparsers.add_parser('jackhmmer', help='Performs jackhmmer search. Accepts either nucleotide or amino acid input, but the query and subject sequence alphabets must match.')
     parser_jackhmmer.add_argument('--query_seqs', required=True, help='Query sequences for jackhmmer. [FASTA]')
     parser_jackhmmer.add_argument('--subject_seqs', required=True, help='Subject sequences (database) for jackhmmer. [FASTA]')

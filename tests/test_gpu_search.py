@@ -17,16 +17,16 @@ from queue import Empty, Full
 from types import ModuleType, SimpleNamespace
 from unittest import mock
 
-import pyhmmer
+import astra_pyhmmer
 
-from astra import search
-from astra.gpu_profile_cache import (
+from aksha import search
+from aksha.gpu_profile_cache import (
     GPUProfileCacheBusyError,
     GPUProfileSessionCache,
     Plan7RuntimeIdentity,
 )
 
-astra_main = importlib.import_module("astra.main")
+astra_main = importlib.import_module("aksha.main")
 
 
 def search_options(outdir, **overrides):
@@ -425,7 +425,7 @@ class GPUConfigurationTests(unittest.TestCase):
             phase0_telemetry_available=True,
         )
         with tempfile.TemporaryDirectory(
-            prefix="astra-sparse-v3-preflight-"
+            prefix="aksha-sparse-v3-preflight-"
         ) as temporary:
             root = Path(temporary)
             with self.assertRaisesRegex(TypeError, "must be bool"):
@@ -467,7 +467,7 @@ class GPUConfigurationTests(unittest.TestCase):
         modules, api = synthetic_plan7_gpu(True, True, True)
         collector = api.TelemetryCollector()
         with tempfile.TemporaryDirectory(
-            prefix="astra-route-telemetry-preflight-"
+            prefix="aksha-route-telemetry-preflight-"
         ) as temporary:
             root = Path(temporary)
             with mock.patch.dict(sys.modules, modules):
@@ -489,7 +489,7 @@ class GPUConfigurationTests(unittest.TestCase):
 
     def test_search_cli_collects_repeatable_gpu_manifest_values(self):
         argv = [
-            "astra",
+            "aksha",
             "search",
             "--prot_in",
             "proteins.faa",
@@ -580,7 +580,7 @@ class GPUConfigurationTests(unittest.TestCase):
             )
 
     def test_pressed_base_accepts_conventional_or_unique_source_named_set(self):
-        with tempfile.TemporaryDirectory(prefix="astra-pressed-base-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-pressed-base-") as temporary:
             root = Path(temporary)
             conventional_dir = root / "PFAM"
             conventional_dir.mkdir()
@@ -595,7 +595,7 @@ class GPUConfigurationTests(unittest.TestCase):
             self.assertEqual(search.discover_pressed_base(hyd_dir), hyd_base.resolve())
 
     def test_pressed_base_rejects_missing_and_ambiguous_sets(self):
-        with tempfile.TemporaryDirectory(prefix="astra-pressed-errors-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-pressed-errors-") as temporary:
             root = Path(temporary)
             missing = root / "missing"
             missing.mkdir()
@@ -642,7 +642,7 @@ class GPUConfigurationTests(unittest.TestCase):
 
     def test_chunk_local_profile_pack_is_private_and_shape_gated(self):
         with tempfile.TemporaryDirectory(
-            prefix="astra-chunk-local-pack-"
+            prefix="aksha-chunk-local-pack-"
         ) as temporary:
             base = make_pressed_members(Path(temporary), "profiles")
             for suffix, size in zip(search.PRESSED_SUFFIXES, (1, 2, 3, 4)):
@@ -701,7 +701,7 @@ class GPUConfigurationTests(unittest.TestCase):
 
     def test_pressed_gpu_stream_is_large_e_only_overlap_opt_in(self):
         with tempfile.TemporaryDirectory(
-            prefix="astra-gpu-profile-stream-config-"
+            prefix="aksha-gpu-profile-stream-config-"
         ) as temporary:
             base = make_pressed_members(Path(temporary), "profiles")
             for suffix, size in zip(search.PRESSED_SUFFIXES, (1, 2, 3, 4)):
@@ -766,7 +766,7 @@ class GPUConfigurationTests(unittest.TestCase):
 
     def test_production_tuning_is_exact_shape_default_off_and_override_safe(self):
         with tempfile.TemporaryDirectory(
-            prefix="astra-gpu-production-policy-"
+            prefix="aksha-gpu-production-policy-"
         ) as temporary:
             base = make_pressed_members(Path(temporary), "profiles")
             e_only = search_options(temporary, evalue="1e-15")
@@ -860,7 +860,7 @@ class GPUConfigurationTests(unittest.TestCase):
 
     def test_pfam_filter_tail_policy_is_exact_and_override_safe(self):
         with tempfile.TemporaryDirectory(
-            prefix="astra-gpu-pfam-filter-policy-"
+            prefix="aksha-gpu-pfam-filter-policy-"
         ) as temporary:
             gathering = search_options(temporary, cut_ga=True)
             eligible = dict(
@@ -1219,7 +1219,7 @@ class GPUConfigurationTests(unittest.TestCase):
                 return 1
 
         with tempfile.TemporaryDirectory(
-            prefix="astra-gpu-ready-config-"
+            prefix="aksha-gpu-ready-config-"
         ) as temporary:
             outdir = Path(temporary) / "output"
             with mock.patch.dict(
@@ -1328,7 +1328,7 @@ class GPUByteBoundedQueueTests(unittest.TestCase):
                     )
 
     def test_oversized_gpu_target_set_is_rejected_before_preflight_or_output(self):
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-cap-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-gpu-cap-") as temporary:
             root = Path(temporary)
             outdir = root / "out"
             config = {
@@ -1369,11 +1369,11 @@ class GPUByteBoundedQueueTests(unittest.TestCase):
 class CPUPathTests(unittest.TestCase):
     def test_cpu_collection_boundaries_are_unchanged(self):
         hmms = [SimpleNamespace(cutoffs=SimpleNamespace()) for _ in range(3)]
-        with tempfile.TemporaryDirectory(prefix="astra-cpu-gc-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-cpu-gc-") as temporary:
             with (
                 mock.patch.object(search, "HMM_CHUNK_SIZE", 2),
                 mock.patch.object(
-                    search.pyhmmer,
+                    search.astra_pyhmmer,
                     "hmmsearch",
                     side_effect=lambda *_args, **_kwargs: iter(()),
                 ),
@@ -1399,14 +1399,14 @@ class CPUPathTests(unittest.TestCase):
                 self.assertEqual(collect.call_count, 2)
 
     def test_bulk_cpu_path_still_calls_only_pyhmmer_with_same_arguments(self):
-        alphabet = pyhmmer.easel.Alphabet.amino()
-        background = pyhmmer.plan7.Background(alphabet)
-        builder = pyhmmer.plan7.Builder(alphabet, seed=7)
-        query = pyhmmer.easel.TextSequence(
+        alphabet = astra_pyhmmer.easel.Alphabet.amino()
+        background = astra_pyhmmer.plan7.Background(alphabet)
+        builder = astra_pyhmmer.plan7.Builder(alphabet, seed=7)
+        query = astra_pyhmmer.easel.TextSequence(
             name=b"cpu-model", sequence="ACDEFGHIKLMNPQRSTVWY" * 3
         ).digitize(alphabet)
         hmm, _, _ = builder.build(query, background)
-        targets = pyhmmer.easel.DigitalSequenceBlock(alphabet, [query])
+        targets = astra_pyhmmer.easel.DigitalSequenceBlock(alphabet, [query])
 
         original_import = builtins.__import__
 
@@ -1415,11 +1415,11 @@ class CPUPathTests(unittest.TestCase):
                 raise AssertionError("CPU path imported plan7_gpu")
             return original_import(name, *args, **kwargs)
 
-        with tempfile.TemporaryDirectory(prefix="astra-cpu-path-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-cpu-path-") as temporary:
             options = search_options(temporary, evalue="1.5")
             with (
                 mock.patch.object(
-                    search.pyhmmer, "hmmsearch", return_value=iter(())
+                    search.astra_pyhmmer, "hmmsearch", return_value=iter(())
                 ) as cpu_search,
                 mock.patch("builtins.__import__", side_effect=reject_plan7_gpu),
             ):
@@ -1466,7 +1466,7 @@ class BulkDispatchTests(unittest.TestCase):
             return iterator
 
         api.gpu_hmmsearch.side_effect = gpu_search
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-gc-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-gpu-gc-") as temporary:
             with (
                 mock.patch.dict(sys.modules, modules),
                 mock.patch.object(search, "GPU_CELL_CAP", 2),
@@ -1504,7 +1504,7 @@ class BulkDispatchTests(unittest.TestCase):
                 closed.append(True)
 
         api.gpu_hmmsearch.side_effect = lambda *_args, **_kwargs: results()
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-gc-error-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-gpu-gc-error-") as temporary:
             with (
                 mock.patch.dict(sys.modules, modules),
                 mock.patch.object(search.gc, "collect") as collect,
@@ -1547,7 +1547,7 @@ class BulkDispatchTests(unittest.TestCase):
         targets = [object(), object()]
         modules, api = synthetic_plan7_gpu()
         api.gpu_hmmsearch.side_effect = lambda *args, **kwargs: iter(())
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-dispatch-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-gpu-dispatch-") as temporary:
             with (
                 mock.patch.dict(sys.modules, modules),
                 mock.patch.object(search, "GPU_CELL_CAP", 5),
@@ -1587,7 +1587,7 @@ class BulkDispatchTests(unittest.TestCase):
         batch = object()
         modules, api = synthetic_plan7_gpu()
         api.gpu_hmmsearch.return_value = iter(())
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-postfilter-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-gpu-postfilter-") as temporary:
             with mock.patch.dict(sys.modules, modules):
                 search.hmmsearch(
                     {},
@@ -1658,14 +1658,14 @@ class GPUProfileOverlapTests(unittest.TestCase):
         }
         batch = Batch()
         pipeline_factory = mock.Mock(return_value=pipeline)
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-domain-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-gpu-domain-") as temporary:
             with (
                 mock.patch.dict(sys.modules, modules),
                 mock.patch.object(
                     search, "define_kwargs", return_value=pipeline_options
                 ),
                 mock.patch.object(
-                    pyhmmer.plan7, "Pipeline", pipeline_factory
+                    astra_pyhmmer.plan7, "Pipeline", pipeline_factory
                 ),
                 mock.patch.object(search, "process_hits_to_file"),
             ):
@@ -1737,12 +1737,12 @@ class GPUProfileOverlapTests(unittest.TestCase):
         api.gpu_hmmsearch.return_value = iter(("row",))
         pipeline = object()
         with tempfile.TemporaryDirectory(
-            prefix="astra-phase0-collector-"
+            prefix="aksha-phase0-collector-"
         ) as temporary:
             with (
                 mock.patch.dict(sys.modules, modules),
                 mock.patch.object(
-                    pyhmmer.plan7, "Pipeline", return_value=pipeline
+                    astra_pyhmmer.plan7, "Pipeline", return_value=pipeline
                 ),
                 mock.patch.object(search, "process_hits_to_file"),
             ):
@@ -1786,7 +1786,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
         )
         collector = api.TelemetryCollector()
         with tempfile.TemporaryDirectory(
-            prefix="astra-sparse-journal-v3-"
+            prefix="aksha-sparse-journal-v3-"
         ) as temporary:
             with (
                 mock.patch.dict(sys.modules, modules),
@@ -1839,7 +1839,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
         pools = object()
         disabled = search._disabled_gpu_request_tuning("not-evalue-only")
         with tempfile.TemporaryDirectory(
-            prefix="astra-pfam-continuation-policy-"
+            prefix="aksha-pfam-continuation-policy-"
         ) as temporary:
             with (
                 mock.patch.dict(os.environ, {}, clear=True),
@@ -1895,7 +1895,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
                 return object()
 
         with mock.patch.object(
-            pyhmmer.plan7,
+            astra_pyhmmer.plan7,
             "Pipeline",
             side_effect=AssertionError("domain pipeline constructed"),
         ):
@@ -1931,7 +1931,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
             "bias_filter": True,
         }
         with mock.patch.object(
-            pyhmmer.plan7, "Pipeline", return_value=pipeline
+            astra_pyhmmer.plan7, "Pipeline", return_value=pipeline
         ) as pipeline_factory:
             result = search._generate_gpu_profile_candidates(
                 Batch(), "selection", options, True, telemetry=True
@@ -1967,7 +1967,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
         }
         pipeline = object()
         with mock.patch.object(
-            pyhmmer.plan7, "Pipeline", return_value=pipeline
+            astra_pyhmmer.plan7, "Pipeline", return_value=pipeline
         ):
             result = search._generate_gpu_profile_candidates(
                 Batch(),
@@ -2261,7 +2261,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
             "F3": 0.00005,
             "bias_filter": False,
         }
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-overlap-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-gpu-overlap-") as temporary:
             with (
                 mock.patch.dict(os.environ, {}, clear=True),
                 mock.patch.dict(sys.modules, modules),
@@ -2291,7 +2291,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
         self.assertTrue(all(selection.closed for selection in selections))
         self.assertTrue(all(selection.close_count == 1 for selection in selections))
         self.assertTrue(all(
-            name.startswith("astra-gpu-generate")
+            name.startswith("aksha-gpu-generate")
             for name in selection_threads
         ))
         self.assertEqual(
@@ -2308,7 +2308,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
             [(0,), (2,), (1,), (3,)],
         )
         self.assertTrue(
-            all(name.startswith("astra-gpu-generate") for name in generation_threads)
+            all(name.startswith("aksha-gpu-generate") for name in generation_threads)
         )
         self.assertEqual(
             [call[0] for call in search_calls],
@@ -2360,7 +2360,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
         gc.collect()
         self.assertTrue(all(reference() is None for reference in candidate_refs))
         self.assertFalse(any(
-            thread.name.startswith("astra-gpu-generate")
+            thread.name.startswith("aksha-gpu-generate")
             for thread in threading.enumerate()
         ))
 
@@ -2564,7 +2564,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
                     reference() is None for reference in candidate_refs
                 ))
                 self.assertFalse(any(
-                    thread.name.startswith("astra-gpu-generate")
+                    thread.name.startswith("aksha-gpu-generate")
                     for thread in threading.enumerate()
                 ))
 
@@ -3402,7 +3402,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
             reference() is None for reference in candidate_refs
         ))
         self.assertFalse(any(
-            thread.name.startswith("astra-gpu-generate")
+            thread.name.startswith("aksha-gpu-generate")
             for thread in threading.enumerate()
         ))
 
@@ -3443,7 +3443,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
         )
         metrics = search.GPUOverlapMetrics()
         with tempfile.TemporaryDirectory(
-            prefix="astra-gpu-legacy-overlap-"
+            prefix="aksha-gpu-legacy-overlap-"
         ) as temporary:
             with (
                 mock.patch.dict(sys.modules, modules),
@@ -3476,7 +3476,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
             for name in selection_threads
         ))
         self.assertTrue(all(
-            name.startswith("astra-gpu-generate")
+            name.startswith("aksha-gpu-generate")
             for name in generation_threads
         ))
         snapshot = metrics.snapshot()
@@ -3505,7 +3505,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
 
         modules, _ = synthetic_plan7_gpu(True)
         with tempfile.TemporaryDirectory(
-            prefix="astra-gpu-legacy-selector-"
+            prefix="aksha-gpu-legacy-selector-"
         ) as temporary:
             root = Path(temporary)
             with (
@@ -3574,7 +3574,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
         modules, api = synthetic_plan7_gpu(True)
         api.gpu_hmmsearch.return_value = iter(("row",))
         metrics = search.GPUOverlapMetrics()
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-one-thread-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-gpu-one-thread-") as temporary:
             with (
                 mock.patch.dict(sys.modules, modules),
                 mock.patch.object(
@@ -3624,7 +3624,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
                 raise AssertionError("generation reached")
 
         with tempfile.TemporaryDirectory(
-            prefix="astra-gpu-selection-budget-"
+            prefix="aksha-gpu-selection-budget-"
         ) as temporary:
             with self.assertRaisesRegex(
                 search.GPUConfigurationError,
@@ -3672,7 +3672,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
 
         modules, api = synthetic_plan7_gpu(True)
         api.gpu_hmmsearch.side_effect = lambda *_args, **_kwargs: iter(("row-0",))
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-order-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-gpu-order-") as temporary:
             with (
                 mock.patch.dict(sys.modules, modules),
                 mock.patch.object(search, "GPU_CELL_CAP", 2),
@@ -3696,7 +3696,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
         self.assertEqual(emitted, ["row-0"])
         self.assertEqual(api.gpu_hmmsearch.call_count, 1)
         self.assertFalse(any(
-            thread.name.startswith("astra-gpu-generate")
+            thread.name.startswith("aksha-gpu-generate")
             for thread in threading.enumerate()
         ))
 
@@ -3742,7 +3742,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
             lambda _chunk, candidates, **_kwargs: iter((candidates.indices,))
         )
         with tempfile.TemporaryDirectory(
-            prefix="astra-gpu-generation-order-"
+            prefix="aksha-gpu-generation-order-"
         ) as temporary:
             with (
                 mock.patch.dict(sys.modules, modules),
@@ -3772,7 +3772,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
         )
         self.assertEqual(api.gpu_hmmsearch.call_count, 1)
         self.assertFalse(any(
-            thread.name.startswith("astra-gpu-generate")
+            thread.name.startswith("aksha-gpu-generate")
             for thread in threading.enumerate()
         ))
 
@@ -3823,7 +3823,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
             "bias_filter": False,
         }
         metrics = search.GPUOverlapMetrics()
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-serial-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-gpu-serial-") as temporary:
             with (
                 mock.patch.dict(sys.modules, modules),
                 mock.patch.object(search, "GPU_CELL_CAP", 4),
@@ -3923,7 +3923,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
 
         modules, api = synthetic_plan7_gpu(True)
         api.gpu_hmmsearch.side_effect = gpu_search
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-cleanup-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-gpu-cleanup-") as temporary:
             with (
                 mock.patch.dict(sys.modules, modules),
                 mock.patch.object(search, "GPU_CELL_CAP", 2),
@@ -3947,7 +3947,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
         self.assertTrue(all(selection.close_count == 1 for selection in selections))
         self.assertEqual(api.gpu_hmmsearch.call_count, 1)
         self.assertFalse(any(
-            thread.name.startswith("astra-gpu-generate")
+            thread.name.startswith("aksha-gpu-generate")
             for thread in threading.enumerate()
         ))
 
@@ -4007,7 +4007,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
         self_outer = self
         modules, api = synthetic_plan7_gpu(True)
         modules["plan7_gpu.astra_search"].hmmsearch = gpu_search
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-cancel-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-gpu-cancel-") as temporary:
             with (
                 mock.patch.dict(sys.modules, modules),
                 mock.patch.object(search, "GPU_CELL_CAP", 1),
@@ -4034,7 +4034,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
         self.assertEqual(len(candidate_refs), 3)
         self.assertTrue(all(reference() is None for reference in candidate_refs))
         self.assertFalse(any(
-            thread.name.startswith("astra-gpu-generate")
+            thread.name.startswith("aksha-gpu-generate")
             for thread in threading.enumerate()
         ))
 
@@ -4112,7 +4112,7 @@ class GPUProfileOverlapTests(unittest.TestCase):
         modules, _ = synthetic_plan7_gpu(True)
         modules["plan7_gpu.astra_search"].hmmsearch = gpu_search
         with tempfile.TemporaryDirectory(
-            prefix="astra-gpu-join-interrupt-"
+            prefix="aksha-gpu-join-interrupt-"
         ) as temporary:
             with (
                 mock.patch.dict(sys.modules, modules),
@@ -4330,7 +4330,7 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
             )
 
     def test_preflight_selects_live_seam_and_safely_falls_back_when_absent(self):
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-mode-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-gpu-mode-") as temporary:
             root = Path(temporary)
             db_dir = root / "GPUDB"
             db_dir.mkdir()
@@ -4403,7 +4403,7 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
                         api.ProfileSession.assert_not_called()
 
     def test_nonzero_cuda_device_retains_same_thread_forward_path(self):
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-device-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-gpu-device-") as temporary:
             root = Path(temporary)
             db_dir = root / "GPUDB"
             db_dir.mkdir()
@@ -4443,7 +4443,7 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
             api.ProfileSession.assert_not_called()
 
     def test_session_path_splits_build_and_selection_workers(self):
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-budget-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-gpu-budget-") as temporary:
             root = Path(temporary)
             db_dir = root / "GPUDB"
             db_dir.mkdir()
@@ -4489,7 +4489,7 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
 
     def test_large_opt_in_session_uses_chunk_local_pack_and_accounts_payload(self):
         with tempfile.TemporaryDirectory(
-            prefix="astra-gpu-chunk-local-pack-"
+            prefix="aksha-gpu-chunk-local-pack-"
         ) as temporary:
             root = Path(temporary)
             db_dir = root / "GPUDB"
@@ -4570,7 +4570,7 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
 
     def test_large_e_only_preflight_defers_every_profile_to_stream(self):
         with tempfile.TemporaryDirectory(
-            prefix="astra-gpu-pressed-stream-preflight-"
+            prefix="aksha-gpu-pressed-stream-preflight-"
         ) as temporary:
             root = Path(temporary)
             db_dir = root / "GPUDB"
@@ -4636,7 +4636,7 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
 
     def test_production_preflight_binds_forward_policy_only_for_one_database(self):
         with tempfile.TemporaryDirectory(
-            prefix="astra-gpu-production-preflight-"
+            prefix="aksha-gpu-production-preflight-"
         ) as temporary:
             root = Path(temporary)
             configuration = {"db_urls": []}
@@ -4720,7 +4720,7 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
 
     def test_pfam_preflight_binds_filter_continuation_and_forward_policy(self):
         with tempfile.TemporaryDirectory(
-            prefix="astra-gpu-pfam-production-preflight-"
+            prefix="aksha-gpu-pfam-production-preflight-"
         ) as temporary:
             root = Path(temporary)
             db_dir = root / "PFAM"
@@ -4776,7 +4776,7 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
             )
 
     def test_profile_cache_reuses_one_attested_session_across_preflights(self):
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-cache-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-gpu-cache-") as temporary:
             root = Path(temporary)
             db_dir = root / "GPUDB"
             db_dir.mkdir()
@@ -4899,7 +4899,7 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
             underlying.close.assert_called_once_with()
 
     def test_profile_cache_rejects_multi_database_preflight_before_batch(self):
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-cache-multi-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-gpu-cache-multi-") as temporary:
             root = Path(temporary)
             config = {"db_urls": []}
             mappings = {}
@@ -4944,7 +4944,7 @@ class GPUPostfilterSelectionTests(unittest.TestCase):
             cache.close()
 
     def test_later_session_failure_closes_prior_session_and_target_batch(self):
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-session-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-gpu-session-") as temporary:
             root = Path(temporary)
             config = {"db_urls": []}
             for name in ("GPU1", "GPU2"):
@@ -5009,7 +5009,7 @@ class InstalledGPUSelectionTests(unittest.TestCase):
                 combine_failure=combine_failure,
                 batch_close_failure=batch_close_failure,
             ), tempfile.TemporaryDirectory(
-                prefix="astra-cache-request-lifetime-"
+                prefix="aksha-cache-request-lifetime-"
             ) as temporary:
                 root = Path(temporary)
                 gpu_dir = root / "GPUDB"
@@ -5142,7 +5142,7 @@ class InstalledGPUSelectionTests(unittest.TestCase):
                     underlying.close.assert_called_once_with()
 
     def test_only_mapped_installed_databases_use_one_reused_gpu_batch(self):
-        with tempfile.TemporaryDirectory(prefix="astra-selection-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-selection-") as temporary:
             root = Path(temporary)
             cpu_dir = root / "CPUDB"
             gpu_one_dir = root / "GPU1"
@@ -5237,7 +5237,7 @@ class InstalledGPUSelectionTests(unittest.TestCase):
             api.filter_scores_seam_available.assert_called_once_with()
 
     def test_explicit_gpu_error_propagates_without_cpu_fallback_and_closes_batch(self):
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-error-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-gpu-error-") as temporary:
             root = Path(temporary)
             gpu_dir = root / "GPUDB"
             gpu_dir.mkdir()
@@ -5284,7 +5284,7 @@ class InstalledGPUSelectionTests(unittest.TestCase):
             fake_batch.close.assert_called_once_with()
 
     def test_presearch_failure_closes_popped_profile_session(self):
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-presearch-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-gpu-presearch-") as temporary:
             root = Path(temporary)
             gpu_dir = root / "GPUDB"
             gpu_dir.mkdir()
@@ -5338,7 +5338,7 @@ class InstalledGPUSelectionTests(unittest.TestCase):
         class Profile:
             pass
 
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-lifetime-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-gpu-lifetime-") as temporary:
             root = Path(temporary)
             config = {"db_urls": []}
             for name in ("GPU1", "GPU2"):
@@ -5398,7 +5398,7 @@ class InstalledGPUSelectionTests(unittest.TestCase):
             self.assertEqual(alive_at_search["GPU2"], (False, True))
 
     def test_second_profile_load_fails_before_first_search_or_publish(self):
-        with tempfile.TemporaryDirectory(prefix="astra-gpu-preload-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-gpu-preload-") as temporary:
             root = Path(temporary)
             config = {"db_urls": []}
             bases = {}
@@ -5465,7 +5465,7 @@ class InstalledGPUSelectionTests(unittest.TestCase):
             self.assertFalse(outdir.exists())
 
     def test_manifest_error_propagates_without_batch_creation_or_cpu_fallback(self):
-        with tempfile.TemporaryDirectory(prefix="astra-manifest-error-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-manifest-error-") as temporary:
             root = Path(temporary)
             gpu_dir = root / "GPUDB"
             gpu_dir.mkdir()
@@ -5527,11 +5527,11 @@ class GPUParityTests(unittest.TestCase):
         from plan7_gpu import load_pressed_profiles
         from plan7_gpu.pressed_manifest import create_pressed_manifest
 
-        cls.temporary = tempfile.TemporaryDirectory(prefix="astra-gpu-parity-")
+        cls.temporary = tempfile.TemporaryDirectory(prefix="aksha-gpu-parity-")
         root = Path(cls.temporary.name)
-        cls.alphabet = pyhmmer.easel.Alphabet.amino()
-        background = pyhmmer.plan7.Background(cls.alphabet)
-        builder = pyhmmer.plan7.Builder(cls.alphabet, seed=19)
+        cls.alphabet = astra_pyhmmer.easel.Alphabet.amino()
+        background = astra_pyhmmer.plan7.Background(cls.alphabet)
+        builder = astra_pyhmmer.plan7.Builder(cls.alphabet, seed=19)
         patterns = (
             "ACDEFGHIKLMNPQRSTVWY" * 4,
             "CDEFGHIKLMNPQRSTVWYA" * 4,
@@ -5541,7 +5541,7 @@ class GPUParityTests(unittest.TestCase):
         hmms = []
         targets = []
         for index, pattern in enumerate(patterns):
-            sequence = pyhmmer.easel.TextSequence(
+            sequence = astra_pyhmmer.easel.TextSequence(
                 name=f"target-{index}".encode(), sequence=pattern
             ).digitize(cls.alphabet)
             hmm, _, _ = builder.build(sequence, background)
@@ -5554,17 +5554,17 @@ class GPUParityTests(unittest.TestCase):
             hmms.append(hmm)
             targets.append(sequence)
         targets.append(
-            pyhmmer.easel.TextSequence(
+            astra_pyhmmer.easel.TextSequence(
                 name=b"decoy", sequence="YYYYVVVVAAAAGGGGSSSSTTTT" * 3
             ).digitize(cls.alphabet)
         )
-        cls.targets = pyhmmer.easel.DigitalSequenceBlock(cls.alphabet, targets)
+        cls.targets = astra_pyhmmer.easel.DigitalSequenceBlock(cls.alphabet, targets)
 
         cls.pressed_base = root / "mixed-cutoffs.hmm"
-        pyhmmer.hmmer.hmmpress(hmms, cls.pressed_base)
+        astra_pyhmmer.hmmer.hmmpress(hmms, cls.pressed_base)
         cls.manifest = root / "mixed-cutoffs.manifest.json"
         create_pressed_manifest(cls.pressed_base, cls.manifest)
-        with pyhmmer.plan7.HMMFile(cls.pressed_base) as hmm_file:
+        with astra_pyhmmer.plan7.HMMFile(cls.pressed_base) as hmm_file:
             cls.cpu_hmms = tuple(hmm_file)
         cls.gpu_pairs = load_pressed_profiles(cls.pressed_base, manifest=cls.manifest)
 
@@ -5770,7 +5770,7 @@ class GPUParityTests(unittest.TestCase):
         from plan7_gpu.pressed_manifest import create_pressed_manifest
 
         data = (
-            Path(pyhmmer.__file__).parent / "tests" / "data" / "hmms" / "txt"
+            Path(astra_pyhmmer.__file__).parent / "tests" / "data" / "hmms" / "txt"
         )
         names = ("RREFam.hmm", "LuxC.hmm", "Thioesterase.hmm")
         if not all((data / name).is_file() for name in names):
@@ -5780,35 +5780,35 @@ class GPUParityTests(unittest.TestCase):
         base = root / "domain-routes.hmm"
         hmms = []
         for name in names:
-            with pyhmmer.plan7.HMMFile(data / name) as hmm_file:
+            with astra_pyhmmer.plan7.HMMFile(data / name) as hmm_file:
                 hmms.append(hmm_file.read())
-        pyhmmer.hmmer.hmmpress(hmms, base)
+        astra_pyhmmer.hmmer.hmmpress(hmms, base)
         manifest = root / "domain-routes.manifest.json"
         create_pressed_manifest(base, manifest)
-        with pyhmmer.plan7.HMMFile(base) as hmm_file:
+        with astra_pyhmmer.plan7.HMMFile(base) as hmm_file:
             cpu_hmms = tuple(hmm_file)
         pairs = load_pressed_profiles(base, manifest=manifest)
 
         target_sequences = [
-            pyhmmer.easel.TextSequence(
+            astra_pyhmmer.easel.TextSequence(
                 name=b"mixed",
                 sequence="ACDEFGHIKLMNPQRSTVWY" * 5,
             ).digitize(self.alphabet),
-            pyhmmer.easel.TextSequence(
+            astra_pyhmmer.easel.TextSequence(
                 name=b"low-complexity", sequence="A" * 91
             ).digitize(self.alphabet),
-            pyhmmer.easel.TextSequence(
+            astra_pyhmmer.easel.TextSequence(
                 name=b"short", sequence="MTEYKLVVVGAGGVGKSALTIQLIQ"
             ).digitize(self.alphabet),
         ]
         target_sequences.extend(
-            pyhmmer.easel.TextSequence(
+            astra_pyhmmer.easel.TextSequence(
                 name=f"consensus-{index}".encode(),
                 sequence=hmm.consensus,
             ).digitize(self.alphabet)
             for index, hmm in enumerate(hmms)
         )
-        targets = pyhmmer.easel.DigitalSequenceBlock(
+        targets = astra_pyhmmer.easel.DigitalSequenceBlock(
             self.alphabet, target_sequences
         )
         options = {
@@ -6011,7 +6011,7 @@ class GPUParityTests(unittest.TestCase):
         from plan7_gpu.pressed_manifest import create_pressed_manifest
 
         data = (
-            Path(pyhmmer.__file__).parent / "tests" / "data" / "hmms" / "txt"
+            Path(astra_pyhmmer.__file__).parent / "tests" / "data" / "hmms" / "txt"
         )
         names = ("RREFam.hmm", "Thioesterase.hmm")
         if not all((data / name).is_file() for name in names):
@@ -6021,12 +6021,12 @@ class GPUParityTests(unittest.TestCase):
         base = root / "compact-threshold.hmm"
         hmms = []
         for name in names:
-            with pyhmmer.plan7.HMMFile(data / name) as hmm_file:
+            with astra_pyhmmer.plan7.HMMFile(data / name) as hmm_file:
                 hmms.append(hmm_file.read())
-        pyhmmer.hmmer.hmmpress(hmms, base)
+        astra_pyhmmer.hmmer.hmmpress(hmms, base)
         manifest = root / "compact-threshold.manifest.json"
         create_pressed_manifest(base, manifest)
-        with pyhmmer.plan7.HMMFile(base) as hmm_file:
+        with astra_pyhmmer.plan7.HMMFile(base) as hmm_file:
             pressed_hmms = tuple(hmm_file)
         pressed_pairs = load_pressed_profiles(base, manifest=manifest)
 
@@ -6034,15 +6034,15 @@ class GPUParityTests(unittest.TestCase):
         if isinstance(consensus, bytes):
             consensus = consensus.decode()
         consensus = consensus.replace("-", "")
-        target = pyhmmer.easel.TextSequence(
+        target = astra_pyhmmer.easel.TextSequence(
             name=b"two-domain-probe",
             sequence=consensus + "X" * 100 + consensus,
         ).digitize(self.alphabet)
-        targets = pyhmmer.easel.DigitalSequenceBlock(
+        targets = astra_pyhmmer.easel.DigitalSequenceBlock(
             self.alphabet, [target]
         )
         base_options = {"F1": 0.99, "F2": 1.0, "F3": 1.0}
-        baseline = pyhmmer.plan7.Pipeline(
+        baseline = astra_pyhmmer.plan7.Pipeline(
             self.alphabet, **base_options
         ).search_hmm(pressed_hmms[0], targets)
         self.assertEqual([hit.name for hit in baseline], ["two-domain-probe"])

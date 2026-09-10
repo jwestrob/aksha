@@ -1,0 +1,1288 @@
+diff --git a/include/libhmmer/p7_pipeline.pxd b/include/libhmmer/p7_pipeline.pxd
+index ef90e22..74a4b60 100644
+--- a/include/libhmmer/p7_pipeline.pxd
++++ b/include/libhmmer/p7_pipeline.pxd
+@@ -1 +1 @@
+-from libc.stdint cimport uint32_t, uint64_t, int64_t
++from libc.stdint cimport uint8_t, uint32_t, uint64_t, int64_t
+@@ -59,0 +60,38 @@ cdef extern from "hmmer.h" nogil:
++    cdef enum p7_pipeline_compact_domain_abi_e:
++        p7_COMPACT_DOMAIN_RECORD_VERSION = 1
++        p7_COMPACT_DOMAIN_RECORD_SIZE = 64
++        p7_COMPACT_TRACE_STEP_SIZE = 16
++        p7_COMPACT_NULL2_COUNT = 29
++        p7_COMPACT_DOMAIN_CPU_REQUIRED = 0
++        p7_COMPACT_DOMAIN_DEVICE_RESULT = 1
++        p7_COMPACT_FINAL_CALL_GUARD_VERSION = 1
++        p7_COMPACT_FINAL_CALL_FALLBACK = 28
++
++    ctypedef struct P7_PIPELINE_COMPACT_DOMAIN:
++        uint32_t row_index
++        uint32_t profile_index
++        uint32_t sequence_index
++        uint32_t envelope_begin
++        uint32_t envelope_end
++        uint32_t alignment_begin
++        uint32_t alignment_end
++        uint32_t model_begin
++        uint32_t model_end
++        float forward_score
++        float backward_score
++        float oa_score
++        float domain_correction
++        float score_consistency
++        uint8_t status
++        uint8_t action
++        uint8_t has_own_scales
++        uint8_t reserved
++        uint32_t reserved2
++
++    ctypedef struct P7_PIPELINE_COMPACT_TRACE_STEP:
++        uint32_t sequence_position
++        uint32_t model_position
++        float posterior
++        uint8_t state
++        uint8_t reserved[3]
++
+@@ -148,0 +187,2 @@ cdef extern from "hmmer.h" nogil:
++    uint64_t p7_pipeline_CompactTailFingerprintV2(const P7_PIPELINE *pli)
++    int p7_PipelineFromFilterForwardAndCompactDomainsV2(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *th, float usc, float filtersc, float vfsc, float fwdsc, uint64_t generation_tail_fingerprint, uint64_t final_target_count, uint32_t expected_row_index, uint32_t expected_profile_index, uint32_t expected_sequence_index, float nexpected, const P7_PIPELINE_COMPACT_DOMAIN *domains, uint64_t domain_count, const uint64_t *trace_offsets, uint64_t trace_offset_count, const P7_PIPELINE_COMPACT_TRACE_STEP *traces, uint64_t trace_count, const float *null2, uint64_t null2_count)
+diff --git a/vendor/hmmer/src/hmmer.h b/vendor/hmmer/src/hmmer.h
+index 6f658c4..5026e8e 100644
+--- a/vendor/hmmer/src/hmmer.h
++++ b/vendor/hmmer/src/hmmer.h
+@@ -1835,0 +1836,195 @@ typedef struct p7_pipeline_simple_region_s {
++/* Compact result of one externally rescored simple domain.  This layout is
++ * deliberately pointer-free and matches plan7_gpu's sealed CUDA journal.
++ * Coordinates are one-based and refer to the complete target sequence. */
++enum p7_pipeline_compact_domain_abi_e {
++  p7_COMPACT_DOMAIN_RECORD_VERSION = 1,
++  p7_COMPACT_DOMAIN_RECORD_SIZE    = 64,
++  p7_COMPACT_TRACE_STEP_SIZE       = 16,
++  p7_COMPACT_NULL2_COUNT           = p7_MAXCODE,
++  p7_COMPACT_DOMAIN_CPU_REQUIRED   = 0,
++  p7_COMPACT_DOMAIN_DEVICE_RESULT  = 1,
++  p7_COMPACT_FINAL_CALL_GUARD_VERSION = 1,
++  p7_COMPACT_FINAL_CALL_FALLBACK   = eslEINACCURATE
++};
++
++/* One accepted compact input may differ from the exact CPU input by this
++ * many nats. The final-call guard propagates this interval through the stock
++ * target/domain score formulas before allowing the compact tail to mutate
++ * pipeline state. This is twice the seam's largest 2e-3 consistency check
++ * and more than 8000x the observed CUDA/CPU score delta. */
++#define p7_COMPACT_FINAL_CALL_INPUT_EPSILON_NATS 0.004f
++#define p7_COMPACT_FINAL_CALL_ROUND_EPSILON_BITS 0.00001f
++
++/* The pressed optimized profile, pipeline background, bias-filter HMM, and
++ * digitized target may own distinct ESL_ALPHABET objects. Pointer identity is
++ * therefore not a compatibility test. Compact continuation instead requires
++ * four independently canonical standard-protein alphabets and compares every
++ * semantic field that can affect digitization, residue lookup, or display.
++ * Object pointers and structure padding are deliberately ignored. */
++static inline int
++p7_compact_AlphabetIsCanonicalAminoV2(const ESL_ALPHABET *abc)
++{
++  static const char symbols[] = "ACDEFGHIKLMNPQRSTVWY-BJZOUX*~";
++  ESL_DSQ expected_code;
++  int expected_degeneracy;
++  int c;
++  int x;
++  int y;
++
++  if (abc == NULL || abc->type != eslAMINO || abc->K != 20 || abc->Kp != 29 ||
++      abc->sym == NULL || abc->degen == NULL || abc->ndegen == NULL ||
++      abc->complement != NULL)
++    return FALSE;
++
++  for (x = 0; x <= abc->Kp; x++)
++    if (abc->sym[x] != symbols[x]) return FALSE;
++
++  for (c = 0; c < 128; c++)
++    {
++      expected_code = eslDSQ_ILLEGAL;
++      for (x = 0; x < abc->Kp; x++)
++        if (c == (unsigned char) symbols[x])
++          { expected_code = (ESL_DSQ) x; break; }
++      if (c >= 'a' && c <= 'z')
++        for (x = 0; x < abc->Kp; x++)
++          if (c - 'a' + 'A' == (unsigned char) symbols[x])
++            { expected_code = (ESL_DSQ) x; break; }
++      if (c == '.' || c == '_') expected_code = 20;
++      if (abc->inmap[c] != expected_code) return FALSE;
++    }
++
++  for (x = 0; x < abc->Kp; x++)
++    {
++      if (abc->degen[x] == NULL) return FALSE;
++      expected_degeneracy = 0;
++      for (y = 0; y < abc->K; y++)
++        {
++          int expected =
++              (x < 20 && x == y) ||
++              (x == 21 && (y == 2 || y == 11)) ||
++              (x == 22 && (y == 7 || y == 9)) ||
++              (x == 23 && (y == 3 || y == 13)) ||
++              (x == 24 && y == 8) ||
++              (x == 25 && y == 1) ||
++              (x == 26);
++          expected_degeneracy += expected;
++          if (abc->degen[x][y] != (char) expected) return FALSE;
++        }
++      if (abc->ndegen[x] != expected_degeneracy) return FALSE;
++    }
++  return TRUE;
++}
++
++static inline int
++p7_compact_AlphabetsAreEqualV2(const ESL_ALPHABET *left,
++                               const ESL_ALPHABET *right)
++{
++  int c;
++  int x;
++  int y;
++
++  if (left == NULL || right == NULL ||
++      left->type != eslAMINO || right->type != eslAMINO ||
++      left->K != 20 || right->K != 20 ||
++      left->Kp != 29 || right->Kp != 29 ||
++      left->type != right->type || left->K != right->K ||
++      left->Kp != right->Kp || left->sym == NULL || right->sym == NULL ||
++      left->degen == NULL || right->degen == NULL ||
++      left->ndegen == NULL || right->ndegen == NULL ||
++      ((left->complement == NULL) != (right->complement == NULL)))
++    return FALSE;
++  for (x = 0; x <= left->Kp; x++)
++    if (left->sym[x] != right->sym[x]) return FALSE;
++  for (c = 0; c < 128; c++)
++    if (left->inmap[c] != right->inmap[c]) return FALSE;
++  for (x = 0; x < left->Kp; x++)
++    {
++      if (left->degen[x] == NULL || right->degen[x] == NULL ||
++          left->ndegen[x] != right->ndegen[x])
++        return FALSE;
++      for (y = 0; y < left->K; y++)
++        if (left->degen[x][y] != right->degen[x][y]) return FALSE;
++      if (left->complement != NULL &&
++          left->complement[x] != right->complement[x])
++        return FALSE;
++    }
++  return TRUE;
++}
++
++static inline int
++p7_compact_AlphabetSetIsExactV2(const ESL_ALPHABET *profile,
++                                const ESL_ALPHABET *background,
++                                const ESL_ALPHABET *filter,
++                                const ESL_ALPHABET *sequence)
++{
++  return p7_compact_AlphabetIsCanonicalAminoV2(profile) &&
++         p7_compact_AlphabetIsCanonicalAminoV2(background) &&
++         p7_compact_AlphabetIsCanonicalAminoV2(filter) &&
++         p7_compact_AlphabetIsCanonicalAminoV2(sequence) &&
++         p7_compact_AlphabetsAreEqualV2(profile, background) &&
++         p7_compact_AlphabetsAreEqualV2(profile, filter) &&
++         p7_compact_AlphabetsAreEqualV2(profile, sequence);
++}
++
++typedef struct p7_pipeline_compact_domain_s {
++  uint32_t row_index;
++  uint32_t profile_index;
++  uint32_t sequence_index;
++  uint32_t envelope_begin;
++  uint32_t envelope_end;
++  uint32_t alignment_begin;
++  uint32_t alignment_end;
++  uint32_t model_begin;
++  uint32_t model_end;
++  float    forward_score;
++  float    backward_score;
++  float    oa_score;
++  float    domain_correction;
++  float    score_consistency;
++  uint8_t  status;
++  uint8_t  action;
++  uint8_t  has_own_scales;
++  uint8_t  reserved;
++  uint32_t reserved2;
++} P7_PIPELINE_COMPACT_DOMAIN;
++
++typedef struct p7_pipeline_compact_trace_step_s {
++  uint32_t sequence_position;
++  uint32_t model_position;
++  float    posterior;
++  uint8_t  state;
++  uint8_t  reserved[3];
++} P7_PIPELINE_COMPACT_TRACE_STEP;
++
++#if defined(__cplusplus)
++static_assert(sizeof(P7_PIPELINE_COMPACT_DOMAIN) == p7_COMPACT_DOMAIN_RECORD_SIZE,
++              "compact domain record ABI changed");
++static_assert(p7_COMPACT_NULL2_COUNT == 29, "compact null2 ABI changed");
++static_assert(sizeof(P7_PIPELINE_COMPACT_TRACE_STEP) == p7_COMPACT_TRACE_STEP_SIZE,
++              "compact trace step ABI changed");
++static_assert(offsetof(P7_PIPELINE_COMPACT_DOMAIN, envelope_begin) == 12 &&
++              offsetof(P7_PIPELINE_COMPACT_DOMAIN, forward_score) == 36 &&
++              offsetof(P7_PIPELINE_COMPACT_DOMAIN, status) == 56 &&
++              offsetof(P7_PIPELINE_COMPACT_DOMAIN, reserved2) == 60,
++              "compact domain field offsets changed");
++static_assert(offsetof(P7_PIPELINE_COMPACT_TRACE_STEP, sequence_position) == 0 &&
++              offsetof(P7_PIPELINE_COMPACT_TRACE_STEP, posterior) == 8 &&
++              offsetof(P7_PIPELINE_COMPACT_TRACE_STEP, state) == 12,
++              "compact trace field offsets changed");
++#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
++_Static_assert(sizeof(P7_PIPELINE_COMPACT_DOMAIN) == p7_COMPACT_DOMAIN_RECORD_SIZE,
++               "compact domain record ABI changed");
++_Static_assert(p7_COMPACT_NULL2_COUNT == 29, "compact null2 ABI changed");
++_Static_assert(sizeof(P7_PIPELINE_COMPACT_TRACE_STEP) == p7_COMPACT_TRACE_STEP_SIZE,
++               "compact trace step ABI changed");
++_Static_assert(offsetof(P7_PIPELINE_COMPACT_DOMAIN, envelope_begin) == 12 &&
++               offsetof(P7_PIPELINE_COMPACT_DOMAIN, forward_score) == 36 &&
++               offsetof(P7_PIPELINE_COMPACT_DOMAIN, status) == 56 &&
++               offsetof(P7_PIPELINE_COMPACT_DOMAIN, reserved2) == 60,
++               "compact domain field offsets changed");
++_Static_assert(offsetof(P7_PIPELINE_COMPACT_TRACE_STEP, sequence_position) == 0 &&
++               offsetof(P7_PIPELINE_COMPACT_TRACE_STEP, posterior) == 8 &&
++               offsetof(P7_PIPELINE_COMPACT_TRACE_STEP, state) == 12,
++               "compact trace field offsets changed");
++#endif
++
+@@ -1848,0 +2044,13 @@ extern int p7_PipelineFromFilterAndForwardSimpleRegions(P7_PIPELINE *pli, P7_OPR
++extern uint64_t p7_pipeline_CompactTailFingerprintV2(const P7_PIPELINE *pli);
++extern int p7_PipelineFromFilterForwardAndCompactDomainsV2(
++    P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg,
++    const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *th,
++    float usc, float filtersc, float vfsc, float fwdsc,
++    uint64_t generation_tail_fingerprint,
++    uint64_t final_target_count,
++    uint32_t expected_row_index, uint32_t expected_profile_index,
++    uint32_t expected_sequence_index, float nexpected,
++    const P7_PIPELINE_COMPACT_DOMAIN *domains, uint64_t domain_count,
++    const uint64_t *trace_offsets, uint64_t trace_offset_count,
++    const P7_PIPELINE_COMPACT_TRACE_STEP *traces, uint64_t trace_count,
++    const float *null2, uint64_t null2_count);
+@@ -1853,0 +2062,11 @@ extern int p7_domaindef_ByExternalSimpleRegions(const ESL_SQ *sq, const ESL_SQ *
++extern int p7_domaindef_ByExternalCompactDomainsV2(
++    const ESL_SQ *sq, const ESL_SQ *ntsq, const P7_OPROFILE *om,
++    const P7_PIPELINE *pli, const P7_BG *bg, P7_DOMAINDEF *ddef,
++    float nullsc, float fwdsc, float nexpected,
++    uint64_t final_target_count,
++    uint32_t expected_row_index, uint32_t expected_profile_index,
++    uint32_t expected_sequence_index,
++    const P7_PIPELINE_COMPACT_DOMAIN *domains, uint64_t domain_count,
++    const uint64_t *trace_offsets, uint64_t trace_offset_count,
++    const P7_PIPELINE_COMPACT_TRACE_STEP *traces, uint64_t trace_count,
++    const float *null2, uint64_t null2_count);
+diff --git a/vendor/hmmer/src/p7_domaindef.c b/vendor/hmmer/src/p7_domaindef.c
+index 264f205..757282c 100644
+--- a/vendor/hmmer/src/p7_domaindef.c
++++ b/vendor/hmmer/src/p7_domaindef.c
+@@ -36,0 +37 @@
++#include <limits.h>
+@@ -37,0 +39 @@
++#include <stdlib.h>
+@@ -40,0 +43 @@
++#include "esl_exponential.h"
+@@ -50,0 +54,11 @@ static int rescore_isolated_domain(P7_DOMAINDEF *ddef, P7_OPROFILE *om, const ES
++static int compact_trace_is_valid(const P7_OPROFILE *om,
++                                  const P7_PIPELINE_COMPACT_DOMAIN *domain,
++                                  const P7_PIPELINE_COMPACT_TRACE_STEP *steps,
++                                  uint64_t step_count);
++static int compact_null2_is_canonical(const float *null2);
++static int compact_final_calls_are_stable(
++    const P7_PIPELINE *pli, const P7_OPROFILE *om, const P7_BG *bg,
++    const ESL_SQ *sq, float nullsc, float fwdsc,
++    uint64_t final_target_count,
++    const P7_PIPELINE_COMPACT_DOMAIN *domains, uint64_t domain_count,
++    const float *null2);
+@@ -580,0 +595,720 @@ p7_domaindef_ByExternalSimpleRegions(const ESL_SQ *sq, const ESL_SQ *ntsq,
++/* Continue domain definition from externally rescored simple envelopes.
++ *
++ * The public pipeline entry point has already checked the filter scores and
++ * live pipeline generation.  This worker validates every compact result,
++ * null2 vector, and OA trace before it changes reusable HMMER state.  It then
++ * reconstructs only the ordinary P7_DOMAIN/P7_ALIDISPLAY representation; no
++ * Forward, Backward, decoding, null2, OA, or traceback DP is rerun here. */
++int
++p7_domaindef_ByExternalCompactDomainsV2(
++    const ESL_SQ *sq, const ESL_SQ *ntsq, const P7_OPROFILE *om,
++    const P7_PIPELINE *pli, const P7_BG *bg, P7_DOMAINDEF *ddef,
++    float nullsc, float fwdsc, float nexpected,
++    uint64_t final_target_count,
++    uint32_t expected_row_index, uint32_t expected_profile_index,
++    uint32_t expected_sequence_index,
++    const P7_PIPELINE_COMPACT_DOMAIN *domains, uint64_t domain_count,
++    const uint64_t *trace_offsets, uint64_t trace_offset_count,
++    const P7_PIPELINE_COMPACT_TRACE_STEP *traces, uint64_t trace_count,
++    const float *null2, uint64_t null2_count)
++{
++  P7_DOMAIN *staged_domains = NULL;
++  P7_TRACE  *trace          = NULL;
++  float     *staged_n2sc    = NULL;
++  uint64_t   trace_base;
++  uint64_t   d;
++  int        status = eslOK;
++  int        z;
++
++  if (sq == NULL || ntsq != NULL || om == NULL || pli == NULL || bg == NULL ||
++      ddef == NULL ||
++      sq->dsq == NULL || sq->name == NULL || sq->acc == NULL ||
++      sq->desc == NULL || sq->n <= 0 || sq->n > 100000 ||
++      om->abc == NULL || om->abc->sym == NULL || om->abc->type != eslAMINO ||
++      om->abc->Kp != p7_COMPACT_NULL2_COUNT || om->M <= 0 ||
++      om->L != sq->n || om->mode != p7_LOCAL || om->name == NULL ||
++      om->rf == NULL || om->mm == NULL || om->cs == NULL ||
++      om->consensus == NULL ||
++      bg->abc == NULL || bg->fhmm == NULL || bg->fhmm->abc == NULL ||
++      bg->fhmm->K != bg->abc->K ||
++      ! p7_compact_AlphabetSetIsExactV2(
++          om->abc, bg->abc,
++          bg->fhmm == NULL ? NULL : bg->fhmm->abc,
++          sq->abc) ||
++      ! isfinite(nexpected) || nexpected < 0.0f ||
++      nexpected > (float) sq->n || ! isfinite(nullsc) || ! isfinite(fwdsc) ||
++      final_target_count == 0)
++    return eslEINVAL;
++  if (ddef->mocc == NULL || ddef->btot == NULL || ddef->etot == NULL ||
++      ddef->n2sc == NULL || ddef->dcl == NULL || ddef->tr == NULL ||
++      ddef->gtr == NULL || ddef->sp == NULL || ddef->tr->N != 0 ||
++      ddef->gtr->N != 0 || ddef->Lalloc < 0 ||
++      ddef->nalloc <= 0 || ddef->ndom != 0 || ddef->nexpected != 0.0f ||
++      ddef->nregions != 0 ||
++      ddef->nclustered != 0 || ddef->noverlaps != 0 ||
++      ddef->nenvelopes != 0)
++    return eslEINVAL;
++  if (domain_count == 0 || domain_count > (uint64_t) sq->n ||
++      domains == NULL || trace_offsets == NULL || traces == NULL ||
++      null2 == NULL || domain_count == UINT64_MAX ||
++      trace_offset_count != domain_count + 1 ||
++      domain_count > UINT64_MAX / p7_COMPACT_NULL2_COUNT ||
++      null2_count != domain_count * p7_COMPACT_NULL2_COUNT)
++    return eslEINVAL;
++
++  trace_base = trace_offsets[0];
++  if (trace_base != 0 || trace_offsets[domain_count] != trace_count)
++    return eslEINVAL;
++
++  /* Validate the complete pointer-free payload first. */
++  for (d = 0; d < domain_count; d++)
++    {
++      const P7_PIPELINE_COMPACT_DOMAIN *dom = domains + d;
++      const float *domain_null2 = null2 + d * p7_COMPACT_NULL2_COUNT;
++      uint64_t begin = trace_offsets[d];
++      uint64_t end   = trace_offsets[d+1];
++      uint64_t max_steps;
++      float correction = 0.0f;
++      float consistency;
++      float reconstructed_oa = 0.0f;
++      int pos;
++      uint64_t step;
++
++      if (begin < trace_base || end < begin || end > trace_count)
++        return eslEINVAL;
++      if (dom->row_index != expected_row_index ||
++          dom->profile_index != expected_profile_index ||
++          dom->sequence_index != expected_sequence_index ||
++          dom->status != eslOK ||
++          dom->action != p7_COMPACT_DOMAIN_DEVICE_RESULT ||
++          dom->has_own_scales != FALSE || dom->reserved != 0 ||
++          dom->reserved2 != 0 ||
++          dom->envelope_begin == 0 ||
++          dom->envelope_begin > dom->envelope_end ||
++          dom->envelope_end > (uint32_t) sq->n ||
++          (d != 0 && dom->envelope_begin <= domains[d-1].envelope_end) ||
++          dom->alignment_begin < dom->envelope_begin ||
++          dom->alignment_begin > dom->alignment_end ||
++          dom->alignment_end > dom->envelope_end ||
++          dom->model_begin == 0 || dom->model_begin > dom->model_end ||
++          dom->model_end > (uint32_t) om->M ||
++          ! isfinite(dom->forward_score) ||
++          ! isfinite(dom->backward_score) ||
++          ! isfinite(dom->oa_score) || dom->oa_score < 0.0f ||
++          dom->oa_score > (float) (dom->envelope_end-dom->envelope_begin+1) + 0.01f ||
++          ! isfinite(dom->domain_correction) ||
++          ! isfinite(dom->score_consistency) ||
++          dom->score_consistency < 0.0f || dom->score_consistency > 0.002f)
++        return eslEINVAL;
++      max_steps = (uint64_t) (dom->envelope_end-dom->envelope_begin+1) +
++                  (uint64_t) om->M + 6;
++      if (end == begin || end-begin > max_steps || end-begin > INT_MAX)
++        return eslEINVAL;
++      consistency = fabsf(dom->forward_score - dom->backward_score);
++      if (! isfinite(consistency) || consistency > 0.002f ||
++          fabsf(consistency-dom->score_consistency) > 1.0e-6f)
++        return eslEINVAL;
++      if (! compact_null2_is_canonical(domain_null2)) return eslEINVAL;
++      for (pos = (int) dom->envelope_begin;
++           pos <= (int) dom->envelope_end; pos++)
++        {
++          int residue = sq->dsq[pos];
++          if (residue < 0 || residue >= p7_COMPACT_NULL2_COUNT)
++            return eslEINVAL;
++          correction += logf(domain_null2[residue]);
++        }
++      if (! isfinite(correction) ||
++          fabsf(correction-dom->domain_correction) > 0.002f)
++        return eslEINVAL;
++      if (! compact_trace_is_valid(om, dom, traces + begin, end - begin))
++        return eslEINVAL;
++      for (step = begin; step < end; step++)
++        if (traces[step].sequence_position != 0)
++          reconstructed_oa += traces[step].posterior;
++      if (! isfinite(reconstructed_oa) ||
++          fabsf(reconstructed_oa-dom->oa_score) > 0.002f)
++        return eslEINVAL;
++    }
++
++  if (! compact_final_calls_are_stable(
++          pli, om, bg, sq, nullsc, fwdsc, final_target_count,
++          domains, domain_count, null2))
++    return p7_COMPACT_FINAL_CALL_FALLBACK;
++
++  /* Stage all allocations and display construction away from live ddef. */
++  staged_domains = calloc((size_t) domain_count, sizeof(*staged_domains));
++  staged_n2sc = malloc(sizeof(*staged_n2sc) * ((size_t) sq->n + 1));
++  trace = p7_trace_CreateWithPP();
++  if (staged_domains == NULL || staged_n2sc == NULL || trace == NULL)
++    { status = eslEMEM; goto ERROR; }
++  esl_vec_FSet(staged_n2sc, sq->n+1, 0.0f);
++
++  for (d = 0; d < domain_count; d++)
++    {
++      const P7_PIPELINE_COMPACT_DOMAIN *src = domains + d;
++      const float *domain_null2 = null2 + d * p7_COMPACT_NULL2_COUNT;
++      uint64_t begin = trace_offsets[d];
++      uint64_t end   = trace_offsets[d+1];
++      float correction = 0.0f;
++      int pos;
++
++      for (z = 0; z < (int) (end-begin); z++)
++        {
++          const P7_PIPELINE_COMPACT_TRACE_STEP *step = traces + begin + z;
++          status = p7_trace_AppendWithPP(trace, step->state,
++                                         (int) step->model_position,
++                                         (int) step->sequence_position,
++                                         step->posterior);
++          if (status != eslOK) goto ERROR;
++        }
++      trace->M = om->M;
++      trace->L = sq->n;
++      status = p7_trace_Index(trace);
++      if (status != eslOK) goto ERROR;
++      if (trace->ndom != 1) { status = eslEINVAL; goto ERROR; }
++
++      staged_domains[d].ad = p7_alidisplay_Create(trace, 0, om, sq, NULL);
++      if (staged_domains[d].ad == NULL) { status = eslEMEM; goto ERROR; }
++      staged_domains[d].scores_per_pos = NULL;
++      staged_domains[d].ienv = src->envelope_begin;
++      staged_domains[d].jenv = src->envelope_end;
++      staged_domains[d].iali = staged_domains[d].ad->sqfrom;
++      staged_domains[d].jali = staged_domains[d].ad->sqto;
++      staged_domains[d].iorf = 0;
++      staged_domains[d].jorf = 0;
++      staged_domains[d].envsc = src->forward_score;
++      staged_domains[d].oasc = src->oa_score;
++      for (pos = (int) src->envelope_begin;
++           pos <= (int) src->envelope_end; pos++)
++        {
++          float value = logf(domain_null2[sq->dsq[pos]]);
++          staged_n2sc[pos] = value;
++          correction += value;
++        }
++      staged_domains[d].domcorrection = correction;
++      staged_domains[d].dombias = 0.0f;
++      staged_domains[d].bitscore = 0.0f;
++      staged_domains[d].lnP = 0.0;
++      staged_domains[d].is_reported = FALSE;
++      staged_domains[d].is_included = FALSE;
++      p7_trace_Reuse(trace);
++    }
++
++  /* All malformed-input exits are now behind us. */
++  status = p7_domaindef_GrowTo(ddef, sq->n);
++  if (status != eslOK) goto ERROR;
++  if ((uint64_t) ddef->nalloc < domain_count)
++    {
++      void *tmp = realloc(ddef->dcl, sizeof(*ddef->dcl) * (size_t) domain_count);
++      if (tmp == NULL) { status = eslEMEM; goto ERROR; }
++      ddef->dcl = tmp;
++      ddef->nalloc = (int) domain_count;
++    }
++  memcpy(ddef->n2sc, staged_n2sc, sizeof(*staged_n2sc) * ((size_t) sq->n + 1));
++  memcpy(ddef->dcl, staged_domains, sizeof(*staged_domains) * (size_t) domain_count);
++  ddef->L          = sq->n;
++  ddef->ndom       = (int) domain_count;
++  ddef->nexpected  = nexpected;
++  ddef->nregions   = (int) domain_count;
++  ddef->nclustered = 0;
++  ddef->noverlaps  = 0;
++  ddef->nenvelopes = (int) domain_count;
++
++  free(staged_domains);
++  free(staged_n2sc);
++  p7_trace_Destroy(trace);
++  return eslOK;
++
++ ERROR:
++  if (staged_domains != NULL)
++    for (d = 0; d < domain_count; d++)
++      p7_alidisplay_Destroy(staged_domains[d].ad);
++  free(staged_domains);
++  free(staged_n2sc);
++  p7_trace_Destroy(trace);
++  return status;
++}
++
++
++static int
++compact_score_call_is_stable(double score, double error, double threshold)
++{
++  double low;
++  double high;
++
++  if (! isfinite(score) || ! isfinite(error) || error < 0.0 ||
++      ! isfinite(threshold))
++    return FALSE;
++  low  = nextafter(score - error, -INFINITY);
++  high = nextafter(score + error,  INFINITY);
++  if (! isfinite(low) || ! isfinite(high)) return FALSE;
++  return (low >= threshold) == (high >= threshold);
++}
++
++
++static int
++compact_probability_bounds(double score, double error,
++                           const P7_OPROFILE *om,
++                           double *ret_low, double *ret_high)
++{
++  double score_low;
++  double score_high;
++  double low;
++  double high;
++  double ln_low;
++  double ln_high;
++
++  if (om == NULL || ret_low == NULL || ret_high == NULL ||
++      ! isfinite(score) || ! isfinite(error) || error < 0.0)
++    return FALSE;
++  score_low  = nextafter(score - error, -INFINITY);
++  score_high = nextafter(score + error,  INFINITY);
++  if (! isfinite(score_low) || ! isfinite(score_high)) return FALSE;
++  ln_low = esl_exp_logsurv(
++      score_high, om->evparam[p7_FTAU], om->evparam[p7_FLAMBDA]);
++  ln_high = esl_exp_logsurv(
++      score_low, om->evparam[p7_FTAU], om->evparam[p7_FLAMBDA]);
++  if (isnan(ln_low) || isnan(ln_high)) return FALSE;
++  low  = nextafter(exp(ln_low), 0.0);
++  high = nextafter(exp(ln_high), INFINITY);
++  if (! isfinite(low) || ! isfinite(high) || low < 0.0 ||
++      high < low)
++    return FALSE;
++  *ret_low  = low;
++  *ret_high = high;
++  return TRUE;
++}
++
++
++static int
++compact_fixed_e_call_is_stable(double score, double error,
++                               const P7_OPROFILE *om,
++                               double search_space, double threshold)
++{
++  double probability_low;
++  double probability_high;
++  double e_low;
++  double e_high;
++
++  if (! isfinite(search_space) || search_space < 0.0 ||
++      ! isfinite(threshold) || threshold < 0.0 ||
++      ! compact_probability_bounds(
++          score, error, om, &probability_low, &probability_high))
++    return FALSE;
++  e_low  = nextafter(probability_low  * search_space, 0.0);
++  e_high = nextafter(probability_high * search_space, INFINITY);
++  if (isnan(e_low) || isnan(e_high) || e_low < 0.0 || e_high < e_low)
++    return FALSE;
++  return (e_high <= threshold) == (e_low <= threshold);
++}
++
++
++/* With dynamic domZ, final domZ is an exactly representable integer in
++ * [1, final_target_count] whenever this target is reportable. Binary-search
++ * the first z where the actual stock double predicate fails at the high-P
++ * endpoint, then test the low-P endpoint at that same z. This deliberately
++ * avoids quotient arithmetic that can miss a boundary after rounded P*z. */
++static int
++compact_dynamic_e_call_is_stable(double score, double error,
++                                 const P7_OPROFILE *om,
++                                 uint64_t final_target_count,
++                                 double threshold)
++{
++  double probability_low;
++  double probability_high;
++  uint64_t low_z;
++  uint64_t high_z;
++
++  if (final_target_count == 0 || ! isfinite(threshold) || threshold < 0.0 ||
++      ! compact_probability_bounds(
++          score, error, om, &probability_low, &probability_high))
++    return FALSE;
++  if (probability_high * (double) final_target_count <= threshold)
++    return TRUE;
++
++  low_z = 1;
++  high_z = final_target_count;
++  while (low_z < high_z)
++    {
++      uint64_t middle = low_z + (high_z-low_z) / 2;
++      if (probability_high * (double) middle <= threshold)
++        low_z = middle + 1;
++      else
++        high_z = middle;
++    }
++  return ! (probability_low * (double) low_z <= threshold);
++}
++
++
++static int
++compact_target_call_is_stable(const P7_PIPELINE *pli,
++                              const P7_OPROFILE *om,
++                              double score, double error,
++                              int by_e, double e_threshold,
++                              double score_threshold, double search_space)
++{
++  if (pli == NULL) return FALSE;
++  if (by_e)
++    return compact_fixed_e_call_is_stable(
++        score, error, om, search_space, e_threshold);
++  return compact_score_call_is_stable(score, error, score_threshold);
++}
++
++
++static int
++compact_domain_call_is_stable(const P7_PIPELINE *pli,
++                              const P7_OPROFILE *om,
++                              double score, double error,
++                              int by_e, double e_threshold,
++                              double score_threshold,
++                              uint64_t final_target_count)
++{
++  if (pli == NULL) return FALSE;
++  if (! by_e)
++    return compact_score_call_is_stable(score, error, score_threshold);
++  if (pli->domZ_setby == p7_ZSETBY_NTARGETS)
++    return compact_dynamic_e_call_is_stable(
++        score, error, om, final_target_count, e_threshold);
++  return compact_fixed_e_call_is_stable(
++      score, error, om, pli->domZ, e_threshold);
++}
++
++
++/* Reconstruct the exact score expressions used by pipeline_post_domains(),
++ * then propagate the accepted compact-input error interval through every
++ * branch and every report/include predicate. FALSE is a conservative
++ * whole-row fallback, never a classification decision. */
++static int
++compact_final_calls_are_stable(
++    const P7_PIPELINE *pli, const P7_OPROFILE *om, const P7_BG *bg,
++    const ESL_SQ *sq, float nullsc, float fwdsc,
++    uint64_t final_target_count,
++    const P7_PIPELINE_COMPACT_DOMAIN *domains, uint64_t domain_count,
++    const float *null2)
++{
++  const float input_error = p7_COMPACT_FINAL_CALL_INPUT_EPSILON_NATS;
++  const float round_error = p7_COMPACT_FINAL_CALL_ROUND_EPSILON_BITS;
++  float sequence_correction = 0.0f;
++  float sequence_compensation = 0.0f;
++  float reconstruction_correction = 0.0f;
++  float reconstruction_nats = 0.0f;
++  float full_score;
++  double full_error;
++  float reconstruction_score;
++  double reconstruction_error;
++  float target_score;
++  double target_error;
++  float bias;
++  double final_z;
++  uint64_t selected_count = 0;
++  uint64_t d;
++  int selected_length = 0;
++  int sequence_position = 0;
++
++  if (pli == NULL || om == NULL || bg == NULL || sq == NULL ||
++      domains == NULL || null2 == NULL || domain_count == 0 ||
++      final_target_count == 0 || ! isfinite(nullsc) || ! isfinite(fwdsc))
++    return FALSE;
++  final_z = (pli->Z_setby == p7_ZSETBY_NTARGETS)
++      ? (double) final_target_count : pli->Z;
++  if (! isfinite(final_z) || final_z < 0.0) return FALSE;
++
++  for (d = 0; d < domain_count; d++)
++    {
++      const P7_PIPELINE_COMPACT_DOMAIN *domain = domains + d;
++      const float *domain_null2 = null2 + d * p7_COMPACT_NULL2_COUNT;
++      float correction = 0.0f;
++      float branch_value;
++      double branch_error;
++      float domain_bias;
++      float domain_score;
++      double domain_error;
++      int length = (int) (domain->envelope_end-domain->envelope_begin+1);
++      int pos;
++
++      /* Match esl_vec_FSum(staged_n2sc, L+1) exactly: its Kahan loop
++       * visits position 0 and every zero-filled gap in sequence order. */
++      while (sequence_position < (int) domain->envelope_begin)
++        {
++          float y = 0.0f - sequence_compensation;
++          float t = sequence_correction + y;
++          sequence_compensation = (t-sequence_correction)-y;
++          sequence_correction = t;
++          sequence_position++;
++        }
++      for (pos = (int) domain->envelope_begin;
++           pos <= (int) domain->envelope_end; pos++)
++        {
++          float value = logf(domain_null2[sq->dsq[pos]]);
++          float y;
++          float t;
++
++          correction += value;
++          y = value - sequence_compensation;
++          t = sequence_correction + y;
++          sequence_compensation = (t-sequence_correction)-y;
++          sequence_correction = t;
++          sequence_position++;
++        }
++      if (! isfinite(correction)) return FALSE;
++      if (! isfinite(sequence_correction) ||
++          ! isfinite(sequence_compensation))
++        return FALSE;
++
++      branch_value = domain->forward_score -
++          (pli->do_null2 ? correction : 0.0f);
++      branch_error = (double) input_error *
++          (pli->do_null2 ? 2.0 : 1.0);
++      if (! isfinite(branch_value) ||
++          fabs((double) branch_value) <= branch_error)
++        return FALSE;
++      if (branch_value > 0.0f)
++        {
++          reconstruction_nats += domain->forward_score;
++          reconstruction_correction += correction;
++          selected_length += length;
++          selected_count++;
++          if (! isfinite(reconstruction_nats) ||
++              ! isfinite(reconstruction_correction))
++            return FALSE;
++        }
++
++      domain_bias = pli->do_null2
++          ? p7_FLogsum(0.0, log(bg->omega) + correction) : 0.0f;
++      domain_score = domain->forward_score +
++          (sq->n-length) * log((float) sq->n / (float) (sq->n+3));
++      domain_score = (domain_score - (nullsc + domain_bias)) /
++          eslCONST_LOG2;
++      domain_error = (
++          (double) input_error +
++          (pli->do_null2 ? (double) input_error : 0.0)) /
++          eslCONST_LOG2 + (double) round_error;
++      if (! isfinite(domain_score) || ! isfinite(domain_error) ||
++          ! compact_domain_call_is_stable(
++              pli, om, domain_score, domain_error,
++              pli->dom_by_E, pli->domE, pli->domT,
++              final_target_count) ||
++          ! compact_domain_call_is_stable(
++              pli, om, domain_score, domain_error,
++              pli->incdom_by_E, pli->incdomE, pli->incdomT,
++              final_target_count))
++        return FALSE;
++    }
++
++  while (sequence_position <= sq->n)
++    {
++      float y = 0.0f - sequence_compensation;
++      float t = sequence_correction + y;
++      sequence_compensation = (t-sequence_correction)-y;
++      sequence_correction = t;
++      sequence_position++;
++    }
++  if (! isfinite(sequence_correction) ||
++      ! isfinite(sequence_compensation))
++    return FALSE;
++
++  bias = pli->do_null2
++      ? p7_FLogsum(0.0, log(bg->omega) + sequence_correction) : 0.0f;
++  full_score = (fwdsc - (nullsc + bias)) / eslCONST_LOG2;
++  full_error = (
++      (double) input_error +
++      (pli->do_null2
++          ? (double) domain_count * (double) input_error : 0.0)) /
++      eslCONST_LOG2 + (double) round_error;
++
++  reconstruction_nats += (sq->n-selected_length) *
++      log((float) sq->n / (float) (sq->n+3));
++  bias = pli->do_null2
++      ? p7_FLogsum(
++          0.0, log(bg->omega) + reconstruction_correction) : 0.0f;
++  reconstruction_score = (reconstruction_nats - (nullsc + bias)) /
++      eslCONST_LOG2;
++  reconstruction_error = (
++      (double) selected_count * (double) input_error *
++      (pli->do_null2 ? 2.0 : 1.0)) /
++      eslCONST_LOG2 + (double) round_error;
++  if (! isfinite(full_score) || ! isfinite(full_error) ||
++      ! isfinite(reconstruction_score) ||
++      ! isfinite(reconstruction_error))
++    return FALSE;
++
++  target_score = full_score;
++  target_error = full_error;
++  if (selected_length > 0)
++    {
++      if (fabs((double) reconstruction_score-(double) full_score) <=
++          reconstruction_error+full_error)
++        return FALSE;
++      if (reconstruction_score > full_score)
++        {
++          target_score = reconstruction_score;
++          target_error = reconstruction_error;
++        }
++    }
++
++  /* The first check protects pipeline_post_domains()' lower-bound insertion
++   * gate. The remaining checks protect final p7_tophits_Threshold() calls. */
++  if (! compact_target_call_is_stable(
++          pli, om, target_score, target_error,
++          pli->by_E, pli->E, pli->T, pli->Z) ||
++      ! compact_target_call_is_stable(
++          pli, om, target_score, target_error,
++          pli->by_E, pli->E, pli->T, final_z) ||
++      ! compact_target_call_is_stable(
++          pli, om, target_score, target_error,
++          pli->inc_by_E, pli->incE, pli->incT, final_z))
++    return FALSE;
++  return TRUE;
++}
++
++
++static int
++compact_null2_is_canonical(const float *null2)
++{
++  float any = 0.0f;
++  float expected;
++  int x;
++
++  for (x = 0; x < p7_COMPACT_NULL2_COUNT; x++)
++    if (! isfinite(null2[x]) || null2[x] <= 0.0f) return FALSE;
++  if (null2[20] != 1.0f || null2[27] != 1.0f || null2[28] != 1.0f)
++    return FALSE;
++  expected = (null2[11] + null2[2]) * 0.5f;
++  if (fabsf(null2[21]-expected) > 1.0e-6f) return FALSE;
++  expected = (null2[7] + null2[9]) * 0.5f;
++  if (fabsf(null2[22]-expected) > 1.0e-6f) return FALSE;
++  expected = (null2[13] + null2[3]) * 0.5f;
++  if (fabsf(null2[23]-expected) > 1.0e-6f) return FALSE;
++  if (fabsf(null2[24]-null2[8]) > 1.0e-6f ||
++      fabsf(null2[25]-null2[1]) > 1.0e-6f)
++    return FALSE;
++  for (x = 0; x < 20; x++) any += null2[x];
++  expected = any / 20.0f;
++  return fabsf(null2[26]-expected) <= 1.0e-6f;
++}
++
++
++static int
++compact_trace_is_valid(const P7_OPROFILE *om,
++                       const P7_PIPELINE_COMPACT_DOMAIN *domain,
++                       const P7_PIPELINE_COMPACT_TRACE_STEP *steps,
++                       uint64_t step_count)
++{
++  uint32_t expected_i = domain->envelope_begin;
++  uint32_t current_k  = 0;
++  uint32_t first_i    = 0;
++  uint32_t last_i     = 0;
++  uint32_t first_k    = 0;
++  uint32_t last_k     = 0;
++  int n_b = 0;
++  int n_e = 0;
++  int n_m = 0;
++  uint64_t z;
++
++  if (steps == NULL || step_count < 7 ||
++      steps[0].state != p7T_S || steps[step_count-1].state != p7T_T)
++    return FALSE;
++
++  for (z = 0; z < step_count; z++)
++    {
++      const P7_PIPELINE_COMPACT_TRACE_STEP *step = steps + z;
++      int previous = (z == 0 ? p7T_BOGUS : steps[z-1].state);
++      int emits = FALSE;
++
++      if (step->reserved[0] != 0 || step->reserved[1] != 0 ||
++          step->reserved[2] != 0 || ! isfinite(step->posterior))
++        return FALSE;
++      switch (step->state)
++        {
++        case p7T_S:
++          if (z != 0 || step->sequence_position != 0 ||
++              step->model_position != 0 || step->posterior != 0.0f)
++            return FALSE;
++          break;
++        case p7T_N:
++          if (step->model_position != 0) return FALSE;
++          if (previous == p7T_S)
++            {
++              if (step->sequence_position != 0 || step->posterior != 0.0f)
++                return FALSE;
++            }
++          else if (previous == p7T_N) emits = TRUE;
++          else return FALSE;
++          break;
++        case p7T_B:
++          if (previous != p7T_N || ++n_b != 1 ||
++              step->sequence_position != 0 || step->model_position != 0 ||
++              step->posterior != 0.0f)
++            return FALSE;
++          break;
++        case p7T_M:
++          if (previous == p7T_B)
++            current_k = step->model_position;
++          else if (previous == p7T_M || previous == p7T_D || previous == p7T_I)
++            current_k++;
++          else return FALSE;
++          if (current_k == 0 || current_k > (uint32_t) om->M ||
++              step->model_position != current_k)
++            return FALSE;
++          emits = TRUE;
++          if (n_m++ == 0)
++            { first_i = expected_i; first_k = current_k; }
++          last_i = expected_i;
++          last_k = current_k;
++          break;
++        case p7T_D:
++          if (previous != p7T_M && previous != p7T_D) return FALSE;
++          current_k++;
++          if (current_k == 0 || current_k > (uint32_t) om->M ||
++              step->model_position != current_k ||
++              step->sequence_position != 0 || step->posterior != 0.0f)
++            return FALSE;
++          break;
++        case p7T_I:
++          if ((previous != p7T_M && previous != p7T_I) || current_k == 0 ||
++              step->model_position != current_k)
++            return FALSE;
++          emits = TRUE;
++          break;
++        case p7T_E:
++          if ((previous != p7T_M && previous != p7T_D) || ++n_e != 1 ||
++              step->sequence_position != 0 || step->model_position != 0 ||
++              step->posterior != 0.0f)
++            return FALSE;
++          break;
++        case p7T_C:
++          if (step->model_position != 0) return FALSE;
++          if (previous == p7T_E)
++            {
++              if (step->sequence_position != 0 || step->posterior != 0.0f)
++                return FALSE;
++            }
++          else if (previous == p7T_C) emits = TRUE;
++          else return FALSE;
++          break;
++        case p7T_T:
++          if (z != step_count-1 || previous != p7T_C ||
++              step->sequence_position != 0 || step->model_position != 0 ||
++              step->posterior != 0.0f)
++            return FALSE;
++          break;
++        default:
++          return FALSE;
++        }
++      if (emits)
++        {
++          if (expected_i > domain->envelope_end ||
++              step->sequence_position != expected_i ||
++              step->posterior < 0.0f || step->posterior > 1.0001f)
++            return FALSE;
++          expected_i++;
++        }
++    }
++  return n_b == 1 && n_e == 1 && n_m > 0 &&
++         expected_i == domain->envelope_end + 1 &&
++         first_i == domain->alignment_begin &&
++         last_i == domain->alignment_end &&
++         first_k == domain->model_begin && last_k == domain->model_end;
++}
++
++
+diff --git a/vendor/hmmer/src/p7_pipeline.c b/vendor/hmmer/src/p7_pipeline.c
+index 52b3497..12b38eb 100644
+--- a/vendor/hmmer/src/p7_pipeline.c
++++ b/vendor/hmmer/src/p7_pipeline.c
+@@ -718,0 +719,5 @@ static int
++pipeline_compact_tail_options_are_valid(const P7_PIPELINE *pli);
++static int
++pipeline_compact_model_cutoffs_are_exact(const P7_PIPELINE *pli,
++                                         const P7_OPROFILE *om);
++static int
+@@ -973,0 +979,254 @@ p7_PipelineFromFilterAndForwardSimpleRegions(
++/* Canonical generation marker for every pipeline option that can affect the
++ * filter replay, domain/hit construction, sorting key, or report/include tail.
++ * Dynamic Z/domZ values are intentionally omitted while HMMER owns them via
++ * p7_ZSETBY_NTARGETS; p7_pli_NewSeq() changes Z for every target. */
++uint64_t
++p7_pipeline_CompactTailFingerprintV2(const P7_PIPELINE *pli)
++{
++  union { double value; uint64_t bits; } d;
++  union { float value; uint32_t bits; } f;
++  uint64_t hash = UINT64_C(1469598103934665603);
++  uint64_t value;
++  int byte;
++
++#define HASH_U64(v) do {                                                       \
++    value = (uint64_t) (v);                                                    \
++    for (byte = 0; byte < 8; byte++) {                                         \
++      hash ^= value & UINT64_C(0xff);                                          \
++      hash *= UINT64_C(1099511628211);                                         \
++      value >>= 8;                                                             \
++    }                                                                          \
++  } while (0)
++#define HASH_I32(v) HASH_U64((uint32_t) (v))
++#define HASH_DOUBLE(v) do { d.value = (v); HASH_U64(d.bits); } while (0)
++#define HASH_FLOAT(v)  do { f.value = (v); HASH_U64(f.bits); } while (0)
++
++  if (pli == NULL || pli->ddef == NULL) return 0;
++  HASH_U64(UINT64_C(0x5044435441494c31)); /* "PDCTAIL1" */
++  HASH_U64(p7_COMPACT_FINAL_CALL_GUARD_VERSION);
++  HASH_FLOAT(p7_COMPACT_FINAL_CALL_INPUT_EPSILON_NATS);
++  HASH_FLOAT(p7_COMPACT_FINAL_CALL_ROUND_EPSILON_BITS);
++  HASH_DOUBLE(pli->F1);       HASH_DOUBLE(pli->F2);
++  HASH_DOUBLE(pli->F3);       HASH_DOUBLE(pli->E);
++  HASH_DOUBLE(pli->domE);     HASH_DOUBLE(pli->incE);
++  HASH_DOUBLE(pli->incdomE);
++  if (pli->use_bit_cutoffs == FALSE)
++    {
++      HASH_DOUBLE(pli->T);       HASH_DOUBLE(pli->domT);
++      HASH_DOUBLE(pli->incT);    HASH_DOUBLE(pli->incdomT);
++    }
++  else HASH_U64(UINT64_C(0x4355544f46465331)); /* "CUTOFFS1" */
++  if (pli->Z_setby != p7_ZSETBY_NTARGETS) HASH_DOUBLE(pli->Z);
++  else HASH_U64(UINT64_C(0x44594e414d49435a));
++  if (pli->domZ_setby != p7_ZSETBY_NTARGETS) HASH_DOUBLE(pli->domZ);
++  else HASH_U64(UINT64_C(0x44594e444f4d5a31));
++  HASH_FLOAT(pli->ddef->rt1); HASH_FLOAT(pli->ddef->rt2);
++  HASH_FLOAT(pli->ddef->rt3);
++  HASH_I32(pli->ddef->nsamples);
++  HASH_FLOAT(pli->ddef->min_overlap);
++  HASH_I32(pli->ddef->of_smaller);
++  HASH_I32(pli->ddef->max_diagdiff);
++  HASH_FLOAT(pli->ddef->min_posterior);
++  HASH_FLOAT(pli->ddef->min_endpointp);
++  HASH_I32(pli->ddef->do_reseeding);
++  HASH_I32(pli->do_reseeding); HASH_I32(pli->do_max);
++  HASH_I32(pli->B1); HASH_I32(pli->B2); HASH_I32(pli->B3);
++  HASH_I32(pli->do_biasfilter); HASH_I32(pli->do_null2);
++  HASH_I32(pli->do_alignment_score_calc);
++  HASH_I32(pli->by_E);       HASH_I32(pli->dom_by_E);
++  HASH_I32(pli->inc_by_E);   HASH_I32(pli->incdom_by_E);
++  HASH_I32(pli->use_bit_cutoffs);
++  HASH_I32(pli->Z_setby);    HASH_I32(pli->domZ_setby);
++  HASH_I32(pli->mode);       HASH_I32(pli->long_targets);
++  HASH_I32(pli->show_accessions); HASH_I32(pli->show_alignments);
++
++#undef HASH_FLOAT
++#undef HASH_DOUBLE
++#undef HASH_I32
++#undef HASH_U64
++  return hash;
++}
++
++
++/* Continue one guarded F3 survivor from a sealed set of already-rescored
++ * simple domains.  The compact worker constructs ordinary HMMER domain and
++ * alignment-display objects; the unchanged shared tail owns all hit scoring,
++ * TopHits insertion, and reporting/inclusion behavior. */
++int
++p7_PipelineFromFilterForwardAndCompactDomainsV2(
++    P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg,
++    const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *hitlist,
++    float usc, float filtersc, float vfsc, float fwdsc,
++    uint64_t generation_tail_fingerprint,
++    uint64_t final_target_count,
++    uint32_t expected_row_index, uint32_t expected_profile_index,
++    uint32_t expected_sequence_index, float nexpected,
++    const P7_PIPELINE_COMPACT_DOMAIN *domains, uint64_t domain_count,
++    const uint64_t *trace_offsets, uint64_t trace_offset_count,
++    const P7_PIPELINE_COMPACT_TRACE_STEP *traces, uint64_t trace_count,
++    const float *null2, uint64_t null2_count)
++{
++  float nullsc;
++  float seq_score;
++  double P;
++  int status;
++
++  /* Pipeline/generation/filter validation is read-only.  The domain worker
++   * likewise validates its entire payload and stages all displays before it
++   * mutates reusable domaindef state. */
++  if (pli == NULL || om == NULL || bg == NULL || sq == NULL || hitlist == NULL)
++    return eslEINVAL;
++  if (pli->mode != p7_SEARCH_SEQS || pli->long_targets || ntsq != NULL ||
++      pli->oxf == NULL || pli->oxb == NULL || pli->fwd == NULL ||
++      pli->bck == NULL || pli->ddef == NULL)
++    return eslEINVAL;
++  if (sq->n == 0 || sq->n > 100000 ||
++      ! pipeline_profile_configuration_is_exact(om, sq->n) ||
++      ! pipeline_background_configuration_is_exact(bg, sq->n) ||
++      ! p7_compact_AlphabetSetIsExactV2(
++          om->abc, bg->abc,
++          bg->fhmm == NULL ? NULL : bg->fhmm->abc,
++          sq->abc))
++    return eslEINVAL;
++  if (! pipeline_float_environment_is_exact() ||
++      ! pipeline_compact_tail_options_are_valid(pli) ||
++      ! pipeline_compact_model_cutoffs_are_exact(pli, om) ||
++      generation_tail_fingerprint == 0 ||
++      generation_tail_fingerprint != p7_pipeline_CompactTailFingerprintV2(pli))
++    return eslEINVAL;
++  if (! isfinite(om->evparam[p7_MMU]) ||
++      ! isfinite(om->evparam[p7_MLAMBDA]) || om->evparam[p7_MLAMBDA] <= 0.0f ||
++      ! isfinite(om->evparam[p7_VMU]) ||
++      ! isfinite(om->evparam[p7_VLAMBDA]) || om->evparam[p7_VLAMBDA] <= 0.0f ||
++      ! isfinite(om->evparam[p7_FTAU]) ||
++      ! isfinite(om->evparam[p7_FLAMBDA]) || om->evparam[p7_FLAMBDA] <= 0.0f ||
++      ! isfinite(bg->omega) || bg->omega <= 0.0f || bg->omega >= 1.0f ||
++      ! isfinite(usc) || ! isfinite(fwdsc) ||
++      final_target_count == 0 ||
++      final_target_count > UINT64_C(9007199254740992) ||
++      (pli->Z_setby == p7_ZSETBY_NTARGETS &&
++       (pli->Z < 1.0 || pli->Z > (double) final_target_count ||
++        floor(pli->Z) != pli->Z)) ||
++      ! isfinite(nexpected) || nexpected < 0.0f || nexpected > (float) sq->n ||
++      (pli->do_biasfilter && ! isfinite(filtersc)))
++    return eslEINVAL;
++
++  status = p7_bg_NullOne(bg, sq->dsq, sq->n, &nullsc);
++  if (status != eslOK) return status;
++  seq_score = (usc-nullsc) / eslCONST_LOG2;
++  P = esl_gumbel_surv(seq_score, om->evparam[p7_MMU], om->evparam[p7_MLAMBDA]);
++  if (P > pli->F1) return eslEINVAL;
++  if (pli->do_biasfilter)
++    {
++      seq_score = (usc-filtersc) / eslCONST_LOG2;
++      P = esl_gumbel_surv(seq_score, om->evparam[p7_MMU], om->evparam[p7_MLAMBDA]);
++      if (P > pli->F1) return eslEINVAL;
++    }
++  else filtersc = nullsc;
++  if (P > pli->F2)
++    {
++      if (isnan(vfsc) || (isinf(vfsc) && vfsc < 0.0f)) return eslEINVAL;
++      seq_score = (vfsc-filtersc) / eslCONST_LOG2;
++      P = esl_gumbel_surv(seq_score, om->evparam[p7_VMU], om->evparam[p7_VLAMBDA]);
++      if (P > pli->F2) return eslEINVAL;
++    }
++  seq_score = (fwdsc-filtersc) / eslCONST_LOG2;
++  P = esl_exp_surv(seq_score, om->evparam[p7_FTAU], om->evparam[p7_FLAMBDA]);
++  if (P > pli->F3) return eslEINVAL;
++
++  status = p7_domaindef_ByExternalCompactDomainsV2(
++      sq, ntsq, om, pli, bg, pli->ddef, nullsc, fwdsc, nexpected,
++      final_target_count,
++      expected_row_index, expected_profile_index, expected_sequence_index,
++      domains, domain_count, trace_offsets, trace_offset_count,
++      traces, trace_count, null2, null2_count);
++  if (status != eslOK) return status;
++
++  pli->n_past_msv++;
++  pli->n_past_bias++;
++  pli->n_past_vit++;
++  pli->n_past_fwd++;
++  return pipeline_post_domains(pli, om, bg, sq, hitlist, nullsc, fwdsc);
++}
++
++
++static int
++pipeline_compact_tail_options_are_valid(const P7_PIPELINE *pli)
++{
++  if (pli == NULL || pli->ddef == NULL ||
++      ! isfinite(pli->F1) || pli->F1 < 0.0 || pli->F1 > 1.0 ||
++      ! isfinite(pli->F2) || pli->F2 < 0.0 || pli->F2 > 1.0 ||
++      ! isfinite(pli->F3) || pli->F3 < 0.0 || pli->F3 > 1.0 ||
++      ! isfinite(pli->E) || pli->E < 0.0 ||
++      ! isfinite(pli->domE) || pli->domE < 0.0 ||
++      ! isfinite(pli->incE) || pli->incE < 0.0 ||
++      ! isfinite(pli->incdomE) || pli->incdomE < 0.0 ||
++      ! isfinite(pli->T) || ! isfinite(pli->domT) ||
++      ! isfinite(pli->incT) || ! isfinite(pli->incdomT) ||
++      ! isfinite(pli->Z) || pli->Z < 0.0 ||
++      ! isfinite(pli->domZ) || pli->domZ < 0.0 ||
++      ! isfinite(pli->ddef->rt1) || pli->ddef->rt1 < 0.0f || pli->ddef->rt1 > 1.0f ||
++      ! isfinite(pli->ddef->rt2) || pli->ddef->rt2 < 0.0f || pli->ddef->rt2 > 1.0f ||
++      ! isfinite(pli->ddef->rt3) || pli->ddef->rt3 < 0.0f || pli->ddef->rt3 > 1.0f ||
++      pli->ddef->nsamples <= 0 ||
++      ! isfinite(pli->ddef->min_overlap) || pli->ddef->min_overlap < 0.0f ||
++      pli->ddef->min_overlap > 1.0f || pli->ddef->max_diagdiff < 0 ||
++      ! isfinite(pli->ddef->min_posterior) || pli->ddef->min_posterior < 0.0f ||
++      pli->ddef->min_posterior > 1.0f ||
++      ! isfinite(pli->ddef->min_endpointp) || pli->ddef->min_endpointp < 0.0f ||
++      pli->ddef->min_endpointp > 1.0f)
++    return FALSE;
++  if ((pli->do_biasfilter != FALSE && pli->do_biasfilter != TRUE) ||
++      (pli->do_null2 != FALSE && pli->do_null2 != TRUE) ||
++      (pli->do_reseeding != FALSE && pli->do_reseeding != TRUE) ||
++      (pli->do_max != FALSE && pli->do_max != TRUE) ||
++      (pli->do_alignment_score_calc != FALSE && pli->do_alignment_score_calc != TRUE) ||
++      (pli->by_E != FALSE && pli->by_E != TRUE) ||
++      (pli->dom_by_E != FALSE && pli->dom_by_E != TRUE) ||
++      (pli->inc_by_E != FALSE && pli->inc_by_E != TRUE) ||
++      (pli->incdom_by_E != FALSE && pli->incdom_by_E != TRUE) ||
++      (pli->ddef->of_smaller != FALSE && pli->ddef->of_smaller != TRUE) ||
++      (pli->ddef->do_reseeding != FALSE && pli->ddef->do_reseeding != TRUE) ||
++      (pli->show_accessions != FALSE && pli->show_accessions != TRUE) ||
++      (pli->show_alignments != FALSE && pli->show_alignments != TRUE) ||
++      (pli->use_bit_cutoffs != FALSE && pli->use_bit_cutoffs != p7H_GA &&
++       pli->use_bit_cutoffs != p7H_TC && pli->use_bit_cutoffs != p7H_NC) ||
++      pli->Z_setby < p7_ZSETBY_NTARGETS || pli->Z_setby > p7_ZSETBY_FILEINFO ||
++      pli->domZ_setby < p7_ZSETBY_NTARGETS || pli->domZ_setby > p7_ZSETBY_FILEINFO)
++    return FALSE;
++  return TRUE;
++}
++
++
++/* Model cutoffs are loaded by p7_pli_NewModel(). They are derived from the
++ * profile identity rather than user-owned generation options, so the option
++ * fingerprint uses a marker and this check independently attests the live
++ * threshold values. */
++static int
++pipeline_compact_model_cutoffs_are_exact(const P7_PIPELINE *pli,
++                                         const P7_OPROFILE *om)
++{
++  int target_cutoff;
++  int domain_cutoff;
++
++  if (pli == NULL || om == NULL) return FALSE;
++  if (pli->use_bit_cutoffs == FALSE) return TRUE;
++  if      (pli->use_bit_cutoffs == p7H_GA)
++    { target_cutoff = p7_GA1; domain_cutoff = p7_GA2; }
++  else if (pli->use_bit_cutoffs == p7H_TC)
++    { target_cutoff = p7_TC1; domain_cutoff = p7_TC2; }
++  else if (pli->use_bit_cutoffs == p7H_NC)
++    { target_cutoff = p7_NC1; domain_cutoff = p7_NC2; }
++  else return FALSE;
++
++  if (! isfinite(om->cutoff[target_cutoff]) ||
++      ! isfinite(om->cutoff[domain_cutoff]) ||
++      om->cutoff[target_cutoff] == p7_CUTOFF_UNSET ||
++      om->cutoff[domain_cutoff] == p7_CUTOFF_UNSET)
++    return FALSE;
++  return pli->T       == (double) om->cutoff[target_cutoff] &&
++         pli->incT    == (double) om->cutoff[target_cutoff] &&
++         pli->domT    == (double) om->cutoff[domain_cutoff] &&
++         pli->incdomT == (double) om->cutoff[domain_cutoff];
++}
++
+@@ -1014 +1273,3 @@ pipeline_background_configuration_is_exact(const P7_BG *bg, int L)
+-  if (bg == NULL || bg->fhmm == NULL || bg->fhmm->t == NULL ||
++  if (bg == NULL || bg->abc == NULL || bg->fhmm == NULL ||
++      bg->fhmm->abc == NULL || bg->fhmm->K != bg->abc->K ||
++      bg->fhmm->t == NULL ||

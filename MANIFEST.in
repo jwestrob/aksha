@@ -1,0 +1,5 @@
+recursive-include native *.py *.pyx *.pxd *.h *.hpp *.cc *.cpp *.cu *.patch *.md
+recursive-include release *.py *.json *.md *.txt *.in
+recursive-include tests *.py
+include RELEASE.md initialize_usage_guide.md
+global-exclude __pycache__ *.py[cod] *.so *.o *.a

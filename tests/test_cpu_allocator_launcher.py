@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from astra import _launcher as launcher
+from aksha import _launcher as launcher
 
 
 class AllocatorLauncherTests(unittest.TestCase):
@@ -161,7 +161,7 @@ class AllocatorLauncherTests(unittest.TestCase):
             launcher._REEXEC_SENTINEL_ENV: "1",
         }
         with (
-            mock.patch.object(sys, "argv", ["/opt/astra", *arguments]),
+            mock.patch.object(sys, "argv", ["/opt/aksha", *arguments]),
             mock.patch.object(sys, "executable", "/opt/python"),
             mock.patch.dict(os.environ, source, clear=True),
             mock.patch.object(
@@ -176,14 +176,14 @@ class AllocatorLauncherTests(unittest.TestCase):
                 launcher.main()
         execute.assert_called_once_with(
             "/opt/python",
-            ["/opt/python", "-m", "astra.main", *arguments],
+            ["/opt/python", "-m", "aksha.main", *arguments],
             expected_environment,
         )
         dispatch.assert_not_called()
 
     def test_main_bypass_preserves_direct_dispatch(self):
         with (
-            mock.patch.object(sys, "argv", ["astra", "search", "--threads", "1"]),
+            mock.patch.object(sys, "argv", ["aksha", "search", "--threads", "1"]),
             mock.patch.object(launcher, "_dispatch", return_value=object()) as dispatch,
             mock.patch.object(launcher.os, "execvpe") as execute,
         ):
@@ -195,10 +195,10 @@ class AllocatorLauncherTests(unittest.TestCase):
     def test_launcher_import_does_not_import_pyhmmer_or_runtime_cli(self):
         root = Path(__file__).resolve().parents[1]
         code = (
-            "import astra._launcher, sys; "
-            "assert 'pyhmmer' not in sys.modules; "
-            "assert 'astra.search' not in sys.modules; "
-            "assert 'astra.main' not in sys.modules"
+            "import aksha._launcher, sys; "
+            "assert 'astra_pyhmmer' not in sys.modules; "
+            "assert 'aksha.search' not in sys.modules; "
+            "assert 'aksha.main' not in sys.modules"
         )
         environment = os.environ.copy()
         environment["PYTHONPATH"] = os.fspath(root)
@@ -216,7 +216,7 @@ class AllocatorLauncherTests(unittest.TestCase):
     def test_reexec_sets_arena_environment_before_pyhmmer_import(self):
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory(
-            prefix="astra-allocator-launcher-"
+            prefix="aksha-allocator-launcher-"
         ) as temporary:
             temporary_path = Path(temporary)
             probe = temporary_path / "startup.tsv"
@@ -226,14 +226,14 @@ class AllocatorLauncherTests(unittest.TestCase):
                 "    stream.write('\\t'.join((\n"
                 "        os.environ.get('MALLOC_ARENA_MAX', '-'),\n"
                 "        os.environ.get('_ASTRA_CPU_ALLOCATOR_REEXEC', '-'),\n"
-                "        str(int('pyhmmer' in sys.modules)),\n"
+                "        str(int('astra_pyhmmer' in sys.modules)),\n"
                 "    )) + '\\n')\n",
                 encoding="ascii",
             )
             code = (
                 "import sys; "
-                "sys.argv = ['astra', 'search', '--threads', '64', '--help']; "
-                "from astra._launcher import main; main()"
+                "sys.argv = ['aksha', 'search', '--threads', '64', '--help']; "
+                "from aksha._launcher import main; main()"
             )
             environment = os.environ.copy()
             for name in (
@@ -265,7 +265,7 @@ class AllocatorLauncherTests(unittest.TestCase):
     def test_console_entry_points_to_lightweight_launcher(self):
         pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
         self.assertIn(
-            'astra = "astra._launcher:main"',
+            'aksha = "aksha._launcher:main"',
             pyproject.read_text(encoding="utf-8"),
         )
 

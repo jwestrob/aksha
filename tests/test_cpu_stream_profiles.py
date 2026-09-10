@@ -4,9 +4,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import pyhmmer
+import astra_pyhmmer
 
-from astra import search
+from aksha import search
 
 
 def _options(outdir):
@@ -30,16 +30,16 @@ def _options(outdir):
 
 class PressedHMMStreamTests(unittest.TestCase):
     def test_streamed_chunks_preserve_profile_and_output_order(self):
-        with tempfile.TemporaryDirectory(prefix="astra-cpu-stream-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="aksha-cpu-stream-") as tmp:
             root = Path(tmp)
-            alphabet = pyhmmer.easel.Alphabet.amino()
-            background = pyhmmer.plan7.Background(alphabet)
-            builder = pyhmmer.plan7.Builder(alphabet, seed=31)
+            alphabet = astra_pyhmmer.easel.Alphabet.amino()
+            background = astra_pyhmmer.plan7.Background(alphabet)
+            builder = astra_pyhmmer.plan7.Builder(alphabet, seed=31)
             hmms = []
             targets = []
             for index in range(5):
                 pattern = "ACDEFGHIKLMNPQRSTVWY"[index:] + "ACDEFGHIKLMNPQRSTVWY"[:index]
-                sequence = pyhmmer.easel.TextSequence(
+                sequence = astra_pyhmmer.easel.TextSequence(
                     name=f"target-{index}".encode(), sequence=pattern * 4
                 ).digitize(alphabet)
                 hmm, _, _ = builder.build(sequence, background)
@@ -49,7 +49,7 @@ class PressedHMMStreamTests(unittest.TestCase):
                 targets.append(sequence)
 
             pressed = root / "profiles"
-            pyhmmer.hmmer.hmmpress(hmms, pressed)
+            astra_pyhmmer.hmmer.hmmpress(hmms, pressed)
             stream = search._PressedHMMStream(pressed)
             self.assertTrue(stream.all_have_cutoff("gathering"))
             chunks = list(stream.chunks(2))
@@ -59,10 +59,10 @@ class PressedHMMStreamTests(unittest.TestCase):
                 [hmm.name for hmm in hmms],
             )
 
-            target_block = pyhmmer.easel.DigitalSequenceBlock(alphabet, targets)
+            target_block = astra_pyhmmer.easel.DigitalSequenceBlock(alphabet, targets)
             eager_dir = root / "eager"
             stream_dir = root / "stream"
-            with pyhmmer.plan7.HMMFile(pressed) as hmm_file:
+            with astra_pyhmmer.plan7.HMMFile(pressed) as hmm_file:
                 eager_hmms = tuple(hmm_file)
             with mock.patch.object(search, "HMM_CHUNK_SIZE", 2):
                 search.hmmsearch(
@@ -82,7 +82,7 @@ class PressedHMMStreamTests(unittest.TestCase):
             # back before executing any profiles so ordering stays exact.
             hmms[-1].cutoffs.gathering = None
             mixed_pressed = root / "mixed-profiles"
-            pyhmmer.hmmer.hmmpress(hmms, mixed_pressed)
+            astra_pyhmmer.hmmer.hmmpress(hmms, mixed_pressed)
             mixed_stream = search._PressedHMMStream(mixed_pressed)
             self.assertFalse(mixed_stream.all_have_cutoff("gathering"))
             with (
@@ -96,7 +96,7 @@ class PressedHMMStreamTests(unittest.TestCase):
             self.assertEqual(decision.reason, "mixed-gathering-availability")
             mixed_eager_dir = root / "mixed-eager"
             mixed_stream_dir = root / "mixed-stream"
-            with pyhmmer.plan7.HMMFile(mixed_pressed) as hmm_file:
+            with astra_pyhmmer.plan7.HMMFile(mixed_pressed) as hmm_file:
                 mixed_eager_hmms = tuple(hmm_file)
             with mock.patch.object(search, "HMM_CHUNK_SIZE", 2):
                 search.hmmsearch(
@@ -133,14 +133,14 @@ class PressedHMMStreamTests(unittest.TestCase):
                 search._stream_pressed_cpu_enabled()
 
     def test_automatic_selection_is_large_installed_fixed_cpu_only(self):
-        with tempfile.TemporaryDirectory(prefix="astra-cpu-select-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="aksha-cpu-select-") as tmp:
             root = Path(tmp)
-            alphabet = pyhmmer.easel.Alphabet.amino()
-            background = pyhmmer.plan7.Background(alphabet)
-            builder = pyhmmer.plan7.Builder(alphabet, seed=37)
+            alphabet = astra_pyhmmer.easel.Alphabet.amino()
+            background = astra_pyhmmer.plan7.Background(alphabet)
+            builder = astra_pyhmmer.plan7.Builder(alphabet, seed=37)
             hmms = []
             for index in range(3):
-                sequence = pyhmmer.easel.TextSequence(
+                sequence = astra_pyhmmer.easel.TextSequence(
                     name=f"target-{index}".encode(),
                     sequence="ACDEFGHIKLMNPQRSTVWY" * 2,
                 ).digitize(alphabet)
@@ -149,7 +149,7 @@ class PressedHMMStreamTests(unittest.TestCase):
                 hmm.cutoffs.gathering = (0.0, 0.0)
                 hmms.append(hmm)
             pressed = root / "profiles"
-            pyhmmer.hmmer.hmmpress(hmms, pressed)
+            astra_pyhmmer.hmmer.hmmpress(hmms, pressed)
             options = _options(root / "output")
 
             for value in (None, "auto", "1"):

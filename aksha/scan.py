@@ -6,11 +6,11 @@ import sys
 import time
 import shutil
 
-import pyhmmer
+import astra_pyhmmer
 from tqdm import tqdm
 
-from astra import initialize
-from astra.search import (
+from aksha import initialize
+from aksha.search import (
     extract_sequences,
     has_thresholds,
     parse_hmms,
@@ -82,13 +82,13 @@ def hmmscan(all_sequences, hmms, threads, options, outdir, db_name=None):
 
         if hmms_with_thresh:
             print(f"  Thresholded pass ({len(hmms_with_thresh)} HMMs, bit_cutoffs={bit_cutoff})...")
-            for hits in pyhmmer.hmmscan(all_sequences, hmms_with_thresh,
+            for hits in astra_pyhmmer.hmmscan(all_sequences, hmms_with_thresh,
                                          cpus=threads, bit_cutoffs=bit_cutoff):
                 process_scan_hits(hits, fh)
 
         if hmms_without_thresh:
             print(f"  Unthresholded pass ({len(hmms_without_thresh)} HMMs)...")
-            for hits in pyhmmer.hmmscan(all_sequences, hmms_without_thresh,
+            for hits in astra_pyhmmer.hmmscan(all_sequences, hmms_without_thresh,
                                          cpus=threads, **hmmscan_kwargs):
                 process_scan_hits(hits, fh)
 

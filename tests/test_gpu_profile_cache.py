@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from astra.gpu_profile_cache import (
+from aksha.gpu_profile_cache import (
     GPUProfileCacheBusyError,
     GPUProfileSessionCache,
     PROFILE_SEMANTICS,
@@ -13,7 +13,7 @@ from astra.gpu_profile_cache import (
 
 
 RUNTIME = Plan7RuntimeIdentity(
-    pyhmmer_version="test-pyhmmer",
+    pyhmmer_version="test-astra_pyhmmer",
     pyhmmer_private_abi_sha256="1" * 64,
     adapter_sha256="2" * 64,
     native_extension_sha256="3" * 64,
@@ -90,7 +90,7 @@ class CacheFixture:
 
 class GPUProfileSessionCacheTests(CacheFixture, unittest.TestCase):
     def test_warm_acquire_reuses_pairs_and_session_until_owner_close(self):
-        with tempfile.TemporaryDirectory(prefix="astra-profile-cache-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-profile-cache-") as temporary:
             base = Path(temporary) / "PFAM"
             cache, _, pairs, sessions, validator, loader, factory = (
                 self.make_cache(base)
@@ -142,7 +142,7 @@ class GPUProfileSessionCacheTests(CacheFixture, unittest.TestCase):
         )
         for label, state_change, option_change in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory(
-                prefix="astra-profile-cache-key-"
+                prefix="aksha-profile-cache-key-"
             ) as temporary:
                 base = Path(temporary) / "PFAM"
                 cache, state, _, sessions, _, loader, _ = self.make_cache(base)
@@ -166,7 +166,7 @@ class GPUProfileSessionCacheTests(CacheFixture, unittest.TestCase):
 
     def test_invalidation_severs_old_entry_before_loading_replacement(self):
         with tempfile.TemporaryDirectory(
-            prefix="astra-profile-cache-replace-"
+            prefix="aksha-profile-cache-replace-"
         ) as temporary:
             base = Path(temporary) / "PFAM"
             cache, state, _, sessions, _, loader, _ = self.make_cache(base)
@@ -199,7 +199,7 @@ class GPUProfileSessionCacheTests(CacheFixture, unittest.TestCase):
             cache.close()
 
     def test_active_lease_excludes_overlap_and_owner_close_is_deferred(self):
-        with tempfile.TemporaryDirectory(prefix="astra-profile-cache-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-profile-cache-") as temporary:
             base = Path(temporary) / "PFAM"
             cache, _, _, sessions, validator, _, _ = self.make_cache(base)
             lease = cache.acquire(
@@ -234,7 +234,7 @@ class GPUProfileSessionCacheTests(CacheFixture, unittest.TestCase):
                 )
 
     def test_reservation_excludes_work_before_lease_and_can_be_cancelled(self):
-        with tempfile.TemporaryDirectory(prefix="astra-profile-cache-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-profile-cache-") as temporary:
             base = Path(temporary) / "PFAM"
             cache, _, _, _, validator, _, _ = self.make_cache(base)
             reservation = cache.reserve()
@@ -262,7 +262,7 @@ class GPUProfileSessionCacheTests(CacheFixture, unittest.TestCase):
             cache.close()
 
     def test_reservation_is_consumed_only_after_successful_acquire(self):
-        with tempfile.TemporaryDirectory(prefix="astra-profile-cache-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-profile-cache-") as temporary:
             base = Path(temporary) / "PFAM"
             cache, _, _, _, _, loader, _ = self.make_cache(base)
             reservation = cache.reserve()
@@ -293,7 +293,7 @@ class GPUProfileSessionCacheTests(CacheFixture, unittest.TestCase):
             cache.close()
 
     def test_cache_close_cancels_an_unconsumed_reservation(self):
-        with tempfile.TemporaryDirectory(prefix="astra-profile-cache-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-profile-cache-") as temporary:
             base = Path(temporary) / "PFAM"
             cache, *_ = self.make_cache(base)
             reservation = cache.reserve()
@@ -303,7 +303,7 @@ class GPUProfileSessionCacheTests(CacheFixture, unittest.TestCase):
             reservation.close()
 
     def test_released_lease_cannot_access_reused_session(self):
-        with tempfile.TemporaryDirectory(prefix="astra-profile-cache-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-profile-cache-") as temporary:
             base = Path(temporary) / "PFAM"
             cache, *_ = self.make_cache(base)
             lease = cache.acquire(
@@ -323,7 +323,7 @@ class GPUProfileSessionCacheTests(CacheFixture, unittest.TestCase):
             cache.close()
 
     def test_externally_closed_idle_session_is_rebuilt(self):
-        with tempfile.TemporaryDirectory(prefix="astra-profile-cache-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-profile-cache-") as temporary:
             base = Path(temporary) / "PFAM"
             cache, _, _, sessions, _, loader, _ = self.make_cache(base)
             first = cache.acquire(
@@ -347,7 +347,7 @@ class GPUProfileSessionCacheTests(CacheFixture, unittest.TestCase):
             cache.close()
 
     def test_new_session_contract_failure_closes_it_and_caches_nothing(self):
-        with tempfile.TemporaryDirectory(prefix="astra-profile-cache-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-profile-cache-") as temporary:
             base = Path(temporary) / "PFAM"
             validation = SimpleNamespace(
                 canonical_base=base.resolve(),
@@ -374,7 +374,7 @@ class GPUProfileSessionCacheTests(CacheFixture, unittest.TestCase):
             cache.close()
 
     def test_rejects_invalid_inputs_before_loading(self):
-        with tempfile.TemporaryDirectory(prefix="astra-profile-cache-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="aksha-profile-cache-") as temporary:
             base = Path(temporary) / "PFAM"
             cache, _, _, _, validator, loader, factory = self.make_cache(base)
             for options, exception in (
