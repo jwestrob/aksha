@@ -288,6 +288,19 @@
             "version": null,
             "source_url": "",
             "installed_date": ""
+        },
+        {
+            "name": "CCTyper",
+            "url": "https://raw.githubusercontent.com/Russel88/CRISPRCasTyper/v1.9.0/cctyper/data/",
+            "installed": false,
+            "installation_dir": "",
+            "molecule_type": "protein",
+            "domain": false,
+            "citation": "Russel J, Pinilla-Redondo R, Mayo-Mu\u00f1oz D, Shah SA, S\u00f8rensen SJ. CRISPRCasTyper: Automated Identification, Annotation, and Classification of CRISPR-Cas Loci. The CRISPR Journal 3(6):462-469 (2020). doi:10.1089/crispr.2020.0059 (MIT license)",
+            "notes": "704 Cas profiles from CRISPRCasTyper v1.9.0, with its subtype scoring table, per-effector cutoffs, interference/adaptation gene sets and repeat-subtype XGBoost model, for CRISPR-Cas subtyping (e.g. Sharur's cas-type caller).",
+            "version": null,
+            "source_url": "",
+            "installed_date": ""
         }
     ]
 }

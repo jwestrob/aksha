@@ -652,6 +652,64 @@ def fetch_kofam_markers(kos, target_folder, db_path, rp16):
     return version
 
 
+CCTYPER_RELEASE = 'v1.9.0'
+CCTYPER_DATA_URL = f'https://raw.githubusercontent.com/Russel88/CRISPRCasTyper/{CCTYPER_RELEASE}/cctyper/data/'
+# The scoring tables and repeat model travel with the profiles: a Cas typer
+# needs them to turn profile hits into subtypes.
+CCTYPER_TABLES = ('CasScoring.csv', 'cutoffs.tab', 'interference.json', 'adaptation.json',
+                  'type_dict.tab', 'xgb_repeats.json')
+
+
+def install_CCTyper():
+    """Install CRISPRCasTyper's Cas profiles with its typing tables.
+
+    The 704 profiles ship zstd-compressed; their model names are the keys of
+    ``CasScoring.csv``, so they are installed as one decompressed file rather
+    than from the per-file ``Profiles.tar.gz`` (whose model names differ).
+    """
+    try:
+        import zstandard
+    except ImportError:
+        sys.exit("CCTyper needs the 'zstandard' package: pip install zstandard")
+
+    db_name = 'CCTyper'
+    parsed_json = load_config()
+    db_path = os.path.expandvars(os.path.expanduser(parsed_json['db_path']))
+
+    for db in parsed_json['db_urls']:
+        if db['name'] == db_name and db['installed'] and db['installation_dir']:
+            print(f"Database {db_name} already installed.")
+            return
+
+    target_folder = os.path.join(db_path, db_name)
+    os.makedirs(target_folder, exist_ok=True)
+    print(f"Downloading {db_name} {CCTYPER_RELEASE} to {target_folder}...")
+
+    for name in ('cctyper_profiles.hmm.zst',) + CCTYPER_TABLES:
+        with TqdmUpTo(unit='B', unit_scale=True, miniters=1, desc=name) as t:
+            urllib.request.urlretrieve(CCTYPER_DATA_URL + name, os.path.join(target_folder, name),
+                                       reporthook=t.update_to)
+
+    packed = os.path.join(target_folder, 'cctyper_profiles.hmm.zst')
+    with open(packed, 'rb') as src, open(os.path.join(target_folder, 'cctyper_profiles.hmm'), 'wb') as dst:
+        zstandard.ZstdDecompressor().copy_stream(src, dst)
+    os.remove(packed)
+
+    for db in parsed_json['db_urls']:
+        if db['name'] == db_name:
+            db['installed'] = True
+            db['installation_dir'] = target_folder
+            record_version(db, CCTYPER_DATA_URL, version=CCTYPER_RELEASE)
+            break
+
+    with open(os.path.join(astra_config_dir(), 'hmm_databases.json'), 'w') as f:
+        json.dump(parsed_json, f, indent=4)
+
+    print(f"{db_name} successfully downloaded.")
+    print(f"\nPressing {db_name} database for fast loading...")
+    press_hmm_database(target_folder, db_name=db_name)
+
+
 def install_databases(db_name, parsed_json=None, db_path=None):
     # Are you trying to install KOFAM? Let's have separate logic for that.
     if db_name == 'KOFAM':
@@ -664,6 +722,10 @@ def install_databases(db_name, parsed_json=None, db_path=None):
     # RP16 is assembled from KOFAM + PFAM rather than downloaded as a unit
     if db_name == 'RP16':
         return install_RP16()
+
+    # CCTyper ships zstd-compressed profiles alongside its typing tables
+    if db_name == 'CCTyper':
+        return install_CCTyper()
 
     # Did you call this as a function from an external script?
     # Want to model that function call as 'initialize.install_databases(db_name)'
