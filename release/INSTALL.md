@@ -1,6 +1,6 @@
 # Installing Aksha
 
-PyPI publication is pending. After upload, on Linux x86-64/CPython 3.12:
+On Linux x86-64/CPython 3.12:
 
 ```bash
 python -m pip install aksha
@@ -9,8 +9,8 @@ python -m pip install 'aksha[gpu]'
 aksha --help
 ```
 
-Before upload add `--find-links /path/to/release-bundle`. App version 0.2.0
-pins runtime/CUDA 0.1.0. Pip selects the components automatically; ordinary
+Before upload add `--find-links /path/to/release-bundle`. App version 0.2.2
+pins runtime/CUDA 0.1.1. Pip selects the components automatically; ordinary
 dependencies are downloaded separately. This is not a complete offline wheelhouse.
 
 CPU requires SSE4.1; AVX-512 is optional. Native wheels have manylinux2014 /

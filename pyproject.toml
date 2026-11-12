@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aksha"
-version = "0.2.0"
+version = "0.2.2"
 description = "Scalable HMM-based sequence search and retrieval"
 readme = "readme.md"
 license = "MIT"
@@ -20,7 +20,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 dependencies = [
-    "aksha-runtime==0.1.0",
+    "aksha-runtime==0.1.1",
     "pandas>=2.0.0",
     "tqdm>=4.65.0",
     "requests>=2.28.0",
@@ -29,7 +29,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gpu = ["aksha-cuda12==0.1.0"]
+gpu = ["aksha-cuda12==0.1.1"]
 
 [project.urls]
 Repository = "https://github.com/jwestrob/aksha"

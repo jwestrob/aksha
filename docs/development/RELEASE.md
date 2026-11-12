@@ -13,9 +13,9 @@ Legacy `ASTRA_*` knobs and native-library names remain unchanged.
 
 | Distribution | Contents |
 | --- | --- |
-| `aksha==0.2.0` | Python application and `aksha` command |
-| `aksha-runtime==0.1.0` | Private PyHMMER/HMMER/Easel and CPU continuation |
-| `aksha-cuda12==0.1.0` | Optional CUDA extension |
+| `aksha==0.2.2` | Python application and `aksha` command |
+| `aksha-runtime==0.1.1` | Private PyHMMER/HMMER/Easel and CPU continuation |
+| `aksha-cuda12==0.1.1` | Optional CUDA extension |
 
 Plain `aksha` selects two wheels; `aksha[gpu]` selects three. The root
 pyproject and released metadata both pin the same internal dependencies.
@@ -30,14 +30,13 @@ fresh installation and small exact-output check accompany the rename. Full
 benchmarking and ARM are separate work. Publication is performed by the user;
 no recipe reads credentials or uploads artifacts.
 
-The 2026-09-10 renamed-wheel install check completed as Slurm1194528: CPU and
+The 2026-09-10 renamed-wheel install check completed as a Slurm job: CPU and
 GPU-extra installation/import/ABI/CLI checks passed in a fresh environment,
 and the one tiny real-fixture output matched exactly. The 13 launcher tests
 also passed in that environment. All three wheels and the sdist passed Twine
 checks; standalone sdist preparation reproduced all 655 pinned numerical
 source files without a second checkout or native compilation.
-The stable handoff remains
-`/groups/banfield/projects/environmental/sr/srvp2020/Jacob/hmmer_gpu/build/pip-release-candidate-v4/release-bundle`.
+The stable handoff remains the maintainer's `release-bundle` directory.
 Its manifest records `READY_FOR_USER_UPLOAD`, meaning local wheel readiness,
 not publication on PyPI. See [publication instructions](../../release/PUBLISH.md)
 for the user's commands. The original v4
