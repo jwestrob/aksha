@@ -215,6 +215,24 @@ def press_hmm_database(db_dir, db_name=None):
     return pressed_base
 
 
+def require_hmm_download(path, url):
+    """Stop with a clear message when a download is neither an archive nor HMM text.
+
+    A database URL that moved often answers with an HTML page; installing that
+    would leave an empty database marked as installed.
+    """
+    with open(path, 'rb') as f:
+        head = f.read(512)
+    if head.startswith((b'\x1f\x8b', b'BZh')) or b'HMMER' in head[:16] or tarfile.is_tarfile(path):
+        return
+    os.remove(path)
+    folder = os.path.dirname(path)
+    if not os.listdir(folder):
+        os.rmdir(folder)
+    sys.exit(f"{url} did not return an HMM file or archive (got {head[:40]!r}); "
+             "the database URL may have moved. Nothing was installed.")
+
+
 def remote_version(url):
     """Release identifier for a download: the source file's Last-Modified date.
 
@@ -334,9 +352,9 @@ def install_KOFAM():
             db['installed'] = True
             db["installation_dir"] = target_folder  # Add installation directory
             record_version(db, url)
-            # Write changes to the JSON file 
-            json_path = os.path.join(db_path, 'hmm_databases.json')  # Use db_path here
-            print(json_path)
+            # Record the install in the registry Aksha reads (the config directory),
+            # which differs from db_path when the databases live elsewhere.
+            json_path = os.path.join(astra_config_dir(), 'hmm_databases.json')
             with open(json_path, 'w') as f:
                 json.dump(parsed_json, f, indent=4)
             print(f"{db_name} successfully downloaded and extracted.")
@@ -359,33 +377,27 @@ def install_KOFAM():
             shutil.copyfileobj(f_in, f_out)
 
     print("Adding kofam bitscore thresholds to HMM files...")
-    #Now parse ko_list as a pandas DF
-    ko_list = pd.read_csv(os.path.join(db_path, 'ko_list'), sep='\t')
-
-    # Not all models actually have thresholds; insist that they do
-    # All this extraneous code is for the purposes of avoiding a pandas warning. Don't judge me
-    # Create a mask for rows where the threshold is not '-'
-    mask = ko_list['threshold'] != '-'
-
-    # Use the mask to filter rows and convert the 'threshold' column to float
-    ko_list.loc[mask, 'threshold'] = ko_list.loc[mask, 'threshold'].astype(float)
-
-
-    
     kofam_dir = os.path.join(db_path, 'KOFAM')
-    #Iterate only on rows of ko_list as all other HMMs will lack thresholds
-    for index, row in ko_list.iterrows():
-        threshold = row.threshold
-        knum = row.knum
-        #Get path to HMM file
-        hmm_file = os.path.join(kofam_dir,'{}.hmm'.format(knum))
-        #Add the threshold and overwrite the file!!
-        add_threshold(hmm_file, threshold)
+    for knum, threshold in ko_thresholds(os.path.join(db_path, 'ko_list')):
+        # Add the threshold and overwrite the file
+        add_threshold(os.path.join(kofam_dir, '{}.hmm'.format(knum)), threshold)
 
     # Press the database for fast loading at search time
     print("\nPressing KOFAM database for fast loading...")
     press_hmm_database(kofam_dir, db_name='KOFAM')
     return
+
+def ko_thresholds(ko_list_path):
+    """(KO, score threshold) pairs from KOfam's ``ko_list``; KOs listed with '-' are left out.
+
+    ``pd.to_numeric`` reads the column whatever dtype pandas gives it (object in
+    pandas 2, str in pandas 3), so no float is written into a string column.
+    """
+    ko_list = pd.read_csv(ko_list_path, sep='\t', usecols=['knum', 'threshold'])
+    thresholds = pd.to_numeric(ko_list['threshold'], errors='coerce')
+    keep = thresholds.notna()
+    return list(zip(ko_list.loc[keep, 'knum'].astype(str), thresholds[keep].astype(float)))
+
 
 def add_threshold(hmm_file_path, threshold):
     # Some thresholds in ko_list are specified for HMMs not provided by the package...
@@ -819,6 +831,7 @@ def install_databases(db_name, parsed_json=None, db_path=None):
                 # Download the file with progress bar
                 with TqdmUpTo(unit='B', unit_scale=True, miniters=1, desc=file_name) as t:  
                     urllib.request.urlretrieve(url, download_path, reporthook=t.update_to)
+                require_hmm_download(download_path, url)
                 
                 # Extract the file if it's a tar archive
                 if tarfile.is_tarfile(download_path):
@@ -846,7 +859,7 @@ def install_databases(db_name, parsed_json=None, db_path=None):
                 # Check for other file types and add .hmm extension if necessary
                 elif not file_name.endswith(('.hmm', '.HMM')):
                     if db_name == 'dbCAN':
-                        #dbCAN provides a single file called 'dbCAN-fam-HMMs.txt.v11'
+                        # dbCAN provides a single HMM text file (dbCAN-HMMdb-V14.txt)
                         new_file_name = file_name + '.hmm'
                         os.rename(download_path, os.path.join(target_folder, new_file_name))
                     else:

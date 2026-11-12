@@ -90,7 +90,7 @@
         },
         {
             "name": "dbCAN",
-            "url": "https://bcb.unl.edu/dbCAN2/download/Databases/dbCAN-old@UGA/dbCAN-fam-HMMs.txt.v11",
+            "url": "https://pro.unl.edu/dbCAN2/download/Databases/V14/dbCAN-HMMdb-V14.txt",
             "installed": false,
             "installation_dir": "",
             "molecule_type": "protein",
