@@ -84,6 +84,27 @@ def initialize_config():
 
     return hmm_databases
 
+def record_install(db_name, parsed_json):
+    """Write one database's entry into the registry on disk, keeping every other entry as stored.
+
+    ``aksha initialize --hmms A,B`` installs in turn, and an installer's own copy of
+    the registry predates the installs before it; rewriting the whole copy would
+    drop their records.
+    """
+    json_path = os.path.join(astra_config_dir(), 'hmm_databases.json')
+    entry = next(db for db in parsed_json['db_urls'] if db['name'] == db_name)
+    with open(json_path) as f:
+        stored = json.load(f)
+    for index, db in enumerate(stored['db_urls']):
+        if db['name'] == db_name:
+            stored['db_urls'][index] = entry
+            break
+    else:
+        stored['db_urls'].append(entry)
+    with open(json_path, 'w') as f:
+        json.dump(stored, f, indent=4)
+
+
 def load_config():
     config_dir = astra_config_dir()
     default_db_json_path = os.path.join(config_dir, 'hmm_databases.json')
@@ -316,24 +337,25 @@ def install_KOFAM():
             target_folder = os.path.expanduser(os.path.join(db_path, db_name))
             
             os.makedirs(target_folder, exist_ok=True)
-            
-            print(f"Downloading {db_name} to {target_folder}...")
-            
-            # Download the database
             url = db['url']
 
             file_name = url.split('/')[-1]
             download_path = os.path.join(target_folder, file_name)
-            
-            if not os.path.exists(download_path):
-                # Download the file with progress bar
+            extracted = any(name.endswith('.hmm') for name in os.listdir(target_folder))
+
+            if extracted and not os.path.exists(download_path):
+                # An earlier install extracted the profiles and stopped later (for
+                # example at the threshold step); resume from them.
+                print(f"KOFAM profiles already extracted in {target_folder}; resuming without downloading.")
+            elif not os.path.exists(download_path):
+                print(f"Downloading {db_name} to {target_folder}...")
                 with TqdmUpTo(unit='B', unit_scale=True, miniters=1, desc=file_name) as t:  
                     urllib.request.urlretrieve(url, download_path, reporthook=t.update_to)
             else:
                 print("KOFAM profiles already detected in download directory. Decompressing...")
                 
             # Extract the file if it's a tar archive
-            if tarfile.is_tarfile(download_path):
+            if os.path.exists(download_path) and tarfile.is_tarfile(download_path):
                 print(f"Extracting {file_name}...")
                 with tarfile.open(download_path, 'r') as tar_ref:
                     tar_ref.extractall(target_folder)
@@ -354,9 +376,7 @@ def install_KOFAM():
             record_version(db, url)
             # Record the install in the registry Aksha reads (the config directory),
             # which differs from db_path when the databases live elsewhere.
-            json_path = os.path.join(astra_config_dir(), 'hmm_databases.json')
-            with open(json_path, 'w') as f:
-                json.dump(parsed_json, f, indent=4)
+            record_install(db_name, parsed_json)
             print(f"{db_name} successfully downloaded and extracted.")
 
     ####
@@ -500,11 +520,7 @@ def install_HydDB():
             record_version(db, base_url)
             break
 
-    # Write updated config
-    config_dir = astra_config_dir()
-    json_path = os.path.join(config_dir, 'hmm_databases.json')
-    with open(json_path, 'w') as f:
-        json.dump(parsed_json, f, indent=4)
+    record_install(db_name, parsed_json)
 
     print(f"{db_name} successfully downloaded and thresholds applied.")
 
@@ -609,9 +625,7 @@ def install_RP16():
                            source_url=db['url'], version=source_version)
             break
 
-    config_dir = astra_config_dir()
-    with open(os.path.join(config_dir, 'hmm_databases.json'), 'w') as f:
-        json.dump(parsed_json, f, indent=4)
+    record_install(db_name, parsed_json)
 
     print(f"{db_name}: {len(expected)} marker profiles installed to {target_folder} "
           f"(KOfam {source_version or 'version unknown'})")
@@ -714,8 +728,7 @@ def install_CCTyper():
             record_version(db, CCTYPER_DATA_URL, version=CCTYPER_RELEASE)
             break
 
-    with open(os.path.join(astra_config_dir(), 'hmm_databases.json'), 'w') as f:
-        json.dump(parsed_json, f, indent=4)
+    record_install(db_name, parsed_json)
 
     print(f"{db_name} successfully downloaded.")
     print(f"\nPressing {db_name} database for fast loading...")
@@ -880,11 +893,7 @@ def install_databases(db_name, parsed_json=None, db_path=None):
 
 
     if update_required:
-        # Update the JSON file in the config directory
-        config_dir = astra_config_dir()
-        json_path = os.path.join(config_dir, 'hmm_databases.json')
-        with open(json_path, 'w') as f:
-            json.dump(parsed_json, f, indent=4)
+        record_install(db_name, parsed_json)
 
 
 

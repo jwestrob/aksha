@@ -53,34 +53,78 @@ def _fake_kofam_downloads(profile_names, ko_rows):
         elif url.endswith("ko_list.gz"):
             with gzip.open(filename, "wt") as handle:
                 handle.write(_ko_list_text(ko_rows))
+        elif url.endswith("dbCAN-HMMdb-V14.txt"):
+            with open(filename, "w") as handle:
+                handle.write("HMMER3/b [3.0 | March 2010]\nNAME  example\n//\n")
         else:
             raise AssertionError(f"unexpected download {url}")
         return filename, None
     return urlretrieve
 
 
-def test_kofam_install_is_recorded_in_the_registry_aksha_reads(tmp_path, monkeypatch):
+def _entry(name, url):
+    return {"name": name, "url": url, "installed": False, "installation_dir": "", "version": None,
+            "source_url": "", "installed_date": ""}
+
+
+def _installer_sandbox(tmp_path, monkeypatch, downloads):
+    """Config and database directories under tmp_path, fake downloads, no pressing; returns them."""
     config_dir, db_path = tmp_path / "config", tmp_path / "databases"
     config_dir.mkdir()
-    kofam = {"name": "KOFAM", "url": "https://example.invalid/kofam/profiles.tar.gz", "installed": False,
-             "installation_dir": "", "version": None, "source_url": "", "installed_date": ""}
-    (config_dir / "hmm_databases.json").write_text(json.dumps({"db_path": str(db_path), "db_urls": [kofam]}))
-
+    registry = {"db_path": str(db_path), "db_urls": [
+        _entry("KOFAM", "https://example.invalid/kofam/profiles.tar.gz"),
+        _entry("dbCAN", "https://example.invalid/dbCAN-HMMdb-V14.txt")]}
+    (config_dir / "hmm_databases.json").write_text(json.dumps(registry))
     monkeypatch.setattr(ini, "astra_config_dir", lambda: str(config_dir))
-    monkeypatch.setattr(ini.urllib.request, "urlretrieve",
-                        _fake_kofam_downloads(["K00001.hmm", "K00002.hmm"], [("K00001", "50.5"), ("K00002", "-")]))
+    monkeypatch.setattr(ini.urllib.request, "urlretrieve", downloads)
     monkeypatch.setattr(ini, "record_version", lambda db, url, version=None: db.update(version="test"))
     monkeypatch.setattr(ini, "press_hmm_database", lambda *args, **kwargs: None)
     thresholds = []
     monkeypatch.setattr(ini, "add_threshold", lambda path, threshold: thresholds.append((path, threshold)))
+    return config_dir, db_path, thresholds
+
+
+def _installed(config_dir):
+    registry = json.loads((config_dir / "hmm_databases.json").read_text())
+    return {db["name"]: db["installation_dir"] for db in registry["db_urls"] if db["installed"]}
+
+
+def test_kofam_install_is_recorded_in_the_registry_aksha_reads(tmp_path, monkeypatch):
+    config_dir, db_path, thresholds = _installer_sandbox(
+        tmp_path, monkeypatch,
+        _fake_kofam_downloads(["K00001.hmm", "K00002.hmm"], [("K00001", "50.5"), ("K00002", "-")]))
 
     ini.install_KOFAM()
 
-    registry = json.loads((config_dir / "hmm_databases.json").read_text())
-    entry = next(db for db in registry["db_urls"] if db["name"] == "KOFAM")
-    assert entry["installed"] is True
-    assert entry["installation_dir"] == str(db_path / "KOFAM")
+    assert _installed(config_dir) == {"KOFAM": str(db_path / "KOFAM")}
     assert not (db_path / "hmm_databases.json").exists()
+    assert thresholds == [(str(db_path / "KOFAM" / "K00001.hmm"), 50.5)]
+
+
+def test_installs_in_one_command_keep_each_others_records(tmp_path, monkeypatch):
+    # `aksha initialize --hmms KOFAM,dbCAN`: main() holds the registry from before KOFAM's install.
+    config_dir, db_path, _ = _installer_sandbox(
+        tmp_path, monkeypatch, _fake_kofam_downloads(["K00001.hmm"], [("K00001", "50.5")]))
+    held = ini.initialize_config()
+    ini.install_databases("KOFAM", held, str(db_path))
+    ini.install_databases("dbCAN", held, str(db_path))
+    assert _installed(config_dir) == {"KOFAM": str(db_path / "KOFAM"), "dbCAN": str(db_path / "dbCAN")}
+
+
+def test_kofam_install_resumes_from_extracted_profiles_without_downloading(tmp_path, monkeypatch):
+    fake = _fake_kofam_downloads([], [("K00001", "50.5")])
+
+    def no_profile_download(url, filename, reporthook=None):
+        assert not url.endswith("profiles.tar.gz"), "profiles were downloaded again"
+        return fake(url, filename, reporthook)
+
+    config_dir, db_path, thresholds = _installer_sandbox(tmp_path, monkeypatch, no_profile_download)
+    (db_path / "KOFAM").mkdir(parents=True)
+    (db_path / "KOFAM" / "K00001.hmm").write_text("HMMER3/f placeholder\n//\n")
+
+    ini.install_KOFAM()
+
+    assert _installed(config_dir) == {"KOFAM": str(db_path / "KOFAM")}
     assert thresholds == [(str(db_path / "KOFAM" / "K00001.hmm"), 50.5)]
 
 
