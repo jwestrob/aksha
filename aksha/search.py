@@ -4479,6 +4479,26 @@ def parse_protein_input(prot_in, threads):
     
     return protein_dict
 
+def warn_legacy_kofam_cutoffs(db_entry, options):
+    """Warn when a bit-cutoff search uses a KOfam-derived database stamped before score_type support.
+
+    Such a database holds each ko_list threshold as both its sequence and its
+    domain cutoff, so a full-score KO also requires a domain to reach the
+    threshold; the registry's 'cutoff_encoding' tells the two encodings apart.
+    """
+    if db_entry is None or db_entry.get('name') not in initialize.KOFAM_CUTOFF_DATABASES:
+        return
+    if not any(options.get(flag) for flag in ('cut_ga', 'cut_tc', 'cut_nc', 'cascade')):
+        return
+    if db_entry.get('cutoff_encoding') == initialize.KOFAM_CUTOFF_ENCODING:
+        return
+    name = db_entry['name']
+    message = (f"{name} carries the earlier KOfam cutoff encoding, which applies each ko_list "
+               "threshold to both the full-sequence and the domain score whatever its score_type. "
+               f"Run `aksha initialize --restamp --hmms {name}` to re-stamp it from its ko_list.")
+    print(f"WARNING: {message}")
+    logging.warning(message)
+
 def define_kwargs(options):
     kwargs = {}
     
@@ -4837,6 +4857,10 @@ def main(args, *, gpu_profile_session_cache=None):
         logging.info(f"MacSyFinder-compatible output enabled → {macsyfinder_dir}/")
 
     try:
+        if rp16_mode:
+            rp16_entry = next((db for db in initialize.load_config()['db_urls']
+                               if db['name'] == 'RP16'), None)
+            warn_legacy_kofam_cutoffs(rp16_entry, hmmsearch_options)
         if hmm_in is not None:
             print("Searching with user-provided HMM(s)...")
             logging.info("Searching with user-provided HMM(s)...")
@@ -4870,6 +4894,7 @@ def main(args, *, gpu_profile_session_cache=None):
             for hmm_db in installed_hmm_names:
                 installed_hmm_in = next((item for item in parsed_json['db_urls'] if item["name"] == hmm_db), None)
                 if installed_hmm_in is not None:
+                    warn_legacy_kofam_cutoffs(installed_hmm_in, hmmsearch_options)
                     installation_dir = installed_hmm_in['installation_dir']
                     manifest_path = gpu_manifests.get(hmm_db)
                     if manifest_path is None:

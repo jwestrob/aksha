@@ -1,5 +1,6 @@
 """KOfam cutoffs follow ko_list's score_type: stamping, pressing, search semantics and re-stamping."""
 
+import argparse
 import functools
 import json
 import math
@@ -187,7 +188,7 @@ def test_domain_type_is_decided_by_the_best_domain_score_alone(tmp_path):
     assert _rows(tmp_path, (full + 1.0, threshold), "gated-on-full") == []
 
 
-# --- RP16 install ---------------------------------------------------------------------------------
+# --- Re-stamping an installed database -------------------------------------------------------------
 
 def _sandbox(tmp_path, monkeypatch, entries):
     config_dir, db_path = tmp_path / "config", tmp_path / "databases"
@@ -202,6 +203,68 @@ def _sandbox(tmp_path, monkeypatch, entries):
 def _registry_entry(config_dir, name):
     registry = json.loads((config_dir / "hmm_databases.json").read_text())
     return next(db for db in registry["db_urls"] if db["name"] == name)
+
+
+def _legacy_kofam(tmp_path, monkeypatch):
+    """An installed KOFAM stamped the earlier way (threshold in both slots) and pressed."""
+    db_path = tmp_path / "databases"
+    entry = {"name": "KOFAM", "url": "", "installed": True, "installation_dir": str(db_path / "KOFAM"),
+             "molecule_type": "protein", "version": "test"}
+    config_dir, db_path = _sandbox(tmp_path, monkeypatch, [entry])
+    kofam = db_path / "KOFAM"
+    kofam.mkdir()
+    _ko_list(db_path / "ko_list", [("K90001", "30.00", "full"), ("K90002", "40.00", "domain"),
+                                   ("K90003", "-", "-"), ("K90004", "0", "full")])
+    _write(_model("K90001", 1), kofam / "K90001.hmm", cutoffs=(30.0, 30.0))
+    _write(_model("K90002", 2), kofam / "K90002.hmm", cutoffs=(40.0, 40.0))
+    _write(_model("K90003", 3), kofam / "K90003.hmm")
+    _write(_model("K90004", 4), kofam / "K90004.hmm")
+    ini.press_hmm_database(str(kofam), db_name="KOFAM")
+    return config_dir, kofam
+
+
+def test_restamp_rewrites_legacy_cutoffs_and_presses_again(tmp_path, monkeypatch):
+    config_dir, kofam = _legacy_kofam(tmp_path, monkeypatch)
+    assert "cutoff_encoding" not in _registry_entry(config_dir, "KOFAM")
+
+    ini.restamp_kofam_database("KOFAM", ini.load_config())
+
+    assert _read(kofam / "K90001.hmm").cutoffs.gathering == pytest.approx((30.0, P))
+    assert _read(kofam / "K90002.hmm").cutoffs.trusted == pytest.approx((P, 40.0))
+    assert _read(kofam / "K90003.hmm").cutoffs.gathering is None  # no threshold in ko_list
+    assert _read(kofam / "K90004.hmm").cutoffs.gathering is None  # zero threshold
+    with astra_pyhmmer.plan7.HMMFile(str(kofam / "KOFAM")) as handle:
+        pressed = {hmm.name.decode() if isinstance(hmm.name, bytes) else hmm.name: hmm.cutoffs.noise
+                   for hmm in handle}
+    assert pressed["K90001"] == pytest.approx((30.0, P))
+    assert pressed["K90002"] == pytest.approx((P, 40.0))
+    assert _registry_entry(config_dir, "KOFAM")["cutoff_encoding"] == ini.KOFAM_CUTOFF_ENCODING
+
+    pressed_mtime = (kofam / "KOFAM.h3m").stat().st_mtime_ns
+    ini.restamp_kofam_database("KOFAM", ini.load_config())  # already current: nothing rewritten
+    assert (kofam / "KOFAM.h3m").stat().st_mtime_ns == pressed_mtime
+
+
+def test_restamp_without_a_local_ko_list_changes_nothing(tmp_path, monkeypatch, capsys):
+    config_dir, kofam = _legacy_kofam(tmp_path, monkeypatch)
+    (tmp_path / "databases" / "ko_list").unlink()
+    ini.restamp_kofam_database("KOFAM", ini.load_config())
+    assert "No ko_list" in capsys.readouterr().out
+    assert _read(kofam / "K90001.hmm").cutoffs.gathering == pytest.approx((30.0, 30.0))
+    assert "cutoff_encoding" not in _registry_entry(config_dir, "KOFAM")
+
+    ini.restamp_kofam_database("PFAM", ini.load_config())
+    assert "--restamp applies to KOFAM and RP16" in capsys.readouterr().out
+
+
+def test_initialize_restamp_flag_restamps_each_named_database(monkeypatch):
+    called = []
+    monkeypatch.setattr(ini, "initialize_config", lambda: {"db_path": "/unused", "db_urls": []})
+    monkeypatch.setattr(ini, "restamp_kofam_database", lambda name, parsed: called.append(name))
+    args = argparse.Namespace(hmms="KOFAM,RP16", restamp=True, press=False, force=False,
+                              show_available=False, show_installed=False)
+    ini.main(args)
+    assert called == ["KOFAM", "RP16"]
 
 
 def test_rp16_install_stamps_markers_by_score_type_from_a_legacy_kofam(tmp_path, monkeypatch):
@@ -224,3 +287,19 @@ def test_rp16_install_stamps_markers_by_score_type_from_a_legacy_kofam(tmp_path,
         stamped = _read(db_path / "RP16" / rp16.profile_filename(ko)).cutoffs.gathering
         assert stamped == pytest.approx(ini.kofam_cutoffs(35.0, types[ko]))
     assert _registry_entry(config_dir, "RP16")["cutoff_encoding"] == ini.KOFAM_CUTOFF_ENCODING
+
+
+# --- Search-time warning ------------------------------------------------------------------------
+
+def test_search_warns_only_for_bit_cutoff_searches_of_legacy_kofam_databases(capsys):
+    cut = {"cut_ga": True}
+    search.warn_legacy_kofam_cutoffs({"name": "KOFAM"}, cut)
+    assert "aksha initialize --restamp --hmms KOFAM" in capsys.readouterr().out
+    search.warn_legacy_kofam_cutoffs({"name": "RP16"}, {"cascade": True})
+    assert "--restamp --hmms RP16" in capsys.readouterr().out
+
+    search.warn_legacy_kofam_cutoffs({"name": "KOFAM", "cutoff_encoding": ini.KOFAM_CUTOFF_ENCODING}, cut)
+    search.warn_legacy_kofam_cutoffs({"name": "KOFAM"}, {"cut_ga": False, "evalue": "1e-5"})
+    search.warn_legacy_kofam_cutoffs({"name": "PFAM"}, cut)
+    search.warn_legacy_kofam_cutoffs(None, cut)
+    assert capsys.readouterr().out == ""

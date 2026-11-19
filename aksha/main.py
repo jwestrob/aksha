@@ -28,6 +28,7 @@ def main():
     parser_initialize.add_argument('--hmms', nargs='?', const='all', default=None, help='Install specified HMM databases. Use comma-separated values for multiple databases.')
     parser_initialize.add_argument('--press', action='store_true', default=False, help='Press installed databases for fast loading. Optionally specify --hmms to press only specific databases.')
     parser_initialize.add_argument('--force', action='store_true', default=False, help='Reinstall the databases named by --hmms even if they are already installed, replacing them with the current upstream release.')
+    parser_initialize.add_argument('--restamp', action='store_true', default=False, help='Rewrite the cutoffs of the installed KOFAM and/or RP16 named by --hmms from the local ko_list, applying each threshold to the score its score_type names, and press them again. Downloads nothing.')
 
 
     ##########

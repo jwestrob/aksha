@@ -517,6 +517,53 @@ def record_cutoff_encoding(db_name, parsed_json):
     record_install(db_name, parsed_json)
 
 
+def restamp_kofam_database(db_name, parsed_json):
+    """Rewrite an installed KOFAM or RP16's cutoffs from the local ko_list and press it again.
+
+    Nothing is downloaded: the source is the ko_list the KOFAM installer left in
+    db_path (or beside the database).  The registry records the new encoding once
+    the profiles and the pressed database carry it.
+    """
+    if db_name not in KOFAM_CUTOFF_DATABASES:
+        print(f"{db_name} has no ko_list cutoffs; --restamp applies to "
+              f"{' and '.join(KOFAM_CUTOFF_DATABASES)}.")
+        return
+    entry = next((db for db in parsed_json['db_urls'] if db['name'] == db_name), None)
+    if entry is None or not entry.get('installed') or not entry.get('installation_dir'):
+        print(f"{db_name} is not installed; nothing to re-stamp.")
+        return
+
+    db_dir = os.path.expandvars(os.path.expanduser(entry['installation_dir'])).rstrip('/')
+    db_path = os.path.expandvars(os.path.expanduser(parsed_json['db_path']))
+    candidates = [os.path.join(db_path, 'ko_list'), os.path.join(os.path.dirname(db_dir), 'ko_list')]
+    ko_list_path = next((path for path in candidates if os.path.exists(path)), None)
+    if ko_list_path is None:
+        print(f"No ko_list at {' or '.join(candidates)}; {db_name} was left unchanged.")
+        return
+
+    if db_name == 'RP16':
+        from aksha import rp16
+
+        def profile_path(knum):
+            if knum not in rp16.RP16_MARKERS:
+                return None
+            return os.path.join(db_dir, rp16.profile_filename(knum))
+    else:
+        def profile_path(knum):
+            return os.path.join(db_dir, f'{knum}.hmm')
+
+    print(f"Re-stamping {db_name} cutoffs in {db_dir} from {ko_list_path}...")
+    changed = stamp_kofam_cutoffs(profile_path, ko_list_path)
+    print(f"  {changed} profiles rewritten.")
+    if changed:
+        repress_hmm_database(db_dir, db_name)
+        print(f"  {db_name} was pressed again; regenerate any GPU manifest made for it.")
+    else:
+        press_hmm_database(db_dir, db_name=db_name)
+    record_cutoff_encoding(db_name, parsed_json)
+    print(f"{db_name} now applies each ko_list threshold to the score its score_type names.")
+
+
 def add_hyddb_thresholds(hmm_file_path, ga_threshold, nc_threshold):
     """
     Add GA (gathering) and NC (noise) thresholds to all HMMs in a file.
@@ -1030,6 +1077,12 @@ def main(args):
         hmms = hmms.split(',')
     else:
         hmms = [hmms]
+
+    # Re-stamp KOfam cutoffs from the local ko_list if the flag is set
+    if getattr(args, 'restamp', False):
+        for db_name in hmms:
+            restamp_kofam_database(db_name, parsed_json)
+        return
 
     # Press existing databases if the flag is set
     if getattr(args, 'press', False):
