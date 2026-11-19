@@ -16,8 +16,11 @@ KO_LIST_HEADER = ("knum\tthreshold\tscore_type\tprofile_type\tF-measure\tnseq\tn
 
 
 def _ko_list_text(rows):
+    """ko_list text from (knum, threshold) or (knum, threshold, score_type) rows; score_type defaults to full."""
+    rows = [row if len(row) == 3 else (*row, "full") for row in rows]
     return KO_LIST_HEADER + "".join(
-        f"{knum}\t{threshold}\tfull\tall\t0.5\t10\t10\t100\t100\t1.0\t0.5\tdescription\n" for knum, threshold in rows)
+        f"{knum}\t{threshold}\t{score_type}\tall\t0.5\t10\t10\t100\t100\t1.0\t0.5\tdescription\n"
+        for knum, threshold, score_type in rows)
 
 
 def _string_inference(enabled):
@@ -34,11 +37,12 @@ def _string_inference(enabled):
 @pytest.mark.parametrize("infer_string", [False, True])
 def test_ko_thresholds_are_floats_and_skip_dashes(tmp_path, infer_string):
     path = tmp_path / "ko_list"
-    path.write_text(_ko_list_text([("K00001", "123.45"), ("K00002", "-"), ("K00003", "0")]))
+    path.write_text(_ko_list_text([("K00001", "123.45"), ("K00002", "-", "-"), ("K00003", "0"),
+                                   ("K00004", "67.87", "domain")]))
     with _string_inference(infer_string):
-        pairs = ini.ko_thresholds(str(path))
-    assert pairs == [("K00001", 123.45), ("K00003", 0.0)]
-    assert all(isinstance(threshold, float) for _, threshold in pairs)
+        triples = ini.ko_thresholds(str(path))
+    assert triples == [("K00001", 123.45, "full"), ("K00003", 0.0, "full"), ("K00004", 67.87, "domain")]
+    assert all(isinstance(threshold, float) for _, threshold, _ in triples)
 
 
 def _fake_kofam_downloads(profile_names, ko_rows):
@@ -80,7 +84,12 @@ def _installer_sandbox(tmp_path, monkeypatch, downloads):
     monkeypatch.setattr(ini, "record_version", lambda db, url, version=None: db.update(version="test"))
     monkeypatch.setattr(ini, "press_hmm_database", lambda *args, **kwargs: None)
     thresholds = []
-    monkeypatch.setattr(ini, "add_threshold", lambda path, threshold: thresholds.append((path, threshold)))
+
+    def add_threshold(path, threshold, score_type):
+        thresholds.append((path, threshold, score_type))
+        return True
+
+    monkeypatch.setattr(ini, "add_threshold", add_threshold)
     return config_dir, db_path, thresholds
 
 
@@ -98,7 +107,10 @@ def test_kofam_install_is_recorded_in_the_registry_aksha_reads(tmp_path, monkeyp
 
     assert _installed(config_dir) == {"KOFAM": str(db_path / "KOFAM")}
     assert not (db_path / "hmm_databases.json").exists()
-    assert thresholds == [(str(db_path / "KOFAM" / "K00001.hmm"), 50.5)]
+    assert thresholds == [(str(db_path / "KOFAM" / "K00001.hmm"), 50.5, "full")]
+    registry = json.loads((config_dir / "hmm_databases.json").read_text())
+    kofam = next(db for db in registry["db_urls"] if db["name"] == "KOFAM")
+    assert kofam["cutoff_encoding"] == ini.KOFAM_CUTOFF_ENCODING
 
 
 def test_installs_in_one_command_keep_each_others_records(tmp_path, monkeypatch):
@@ -125,7 +137,7 @@ def test_kofam_install_resumes_from_extracted_profiles_without_downloading(tmp_p
     ini.install_KOFAM()
 
     assert _installed(config_dir) == {"KOFAM": str(db_path / "KOFAM")}
-    assert thresholds == [(str(db_path / "KOFAM" / "K00001.hmm"), 50.5)]
+    assert thresholds == [(str(db_path / "KOFAM" / "K00001.hmm"), 50.5, "full")]
 
 
 def _catalog():
