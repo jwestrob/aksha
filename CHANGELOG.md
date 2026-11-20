@@ -14,6 +14,9 @@
   a KOFAM or RP16 install lacks it.
 - RP16 markers are stamped from `ko_list` at install, including those copied from a
   local KOFAM.
+- `aksha search --cpu-parallel {auto,queries,targets}` chooses how CPU searches spread
+  work over threads (`targets` shares each HMM across workers); `auto` keeps the
+  runtime's default. Results are identical across strategies. GPU searches reject it.
 
 ## 0.2.2 (2026-11-12)
 

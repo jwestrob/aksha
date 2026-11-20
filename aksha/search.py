@@ -3785,7 +3785,7 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                         flush=True,
                     )
                     hit_iterator = astra_pyhmmer.hmmsearch(
-                        hmm_chunk, all_sequences, cpus=threads, **kwargs
+                        hmm_chunk, all_sequences, cpus=threads, **cpu_parallel_options(options), **kwargs
                     )
                     hits = None
                     try:
@@ -3995,7 +3995,7 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                           f"({len(hmm_chunk)} HMMs)...", end="", flush=True)
                     if gpu_sequence_batch is None:
                         hit_iterator = astra_pyhmmer.hmmsearch(
-                            hmm_chunk, all_sequences, cpus=threads, **kwargs
+                            hmm_chunk, all_sequences, cpus=threads, **cpu_parallel_options(options), **kwargs
                         )
                         rendered_rows_type = None
                     else:
@@ -4063,7 +4063,7 @@ def hmmsearch(protein_dict, hmms, threads, options, db_name=None,
                     for chunk_start in range(0, len(hmm_group), HMM_CHUNK_SIZE):
                         hmm_chunk = hmm_group[chunk_start:chunk_start + HMM_CHUNK_SIZE]
                         for hits in astra_pyhmmer.hmmsearch(hmm_chunk, sequences,
-                                                      cpus=threads, **kwargs):
+                                                      cpus=threads, **cpu_parallel_options(options), **kwargs):
                             process_hits_to_file(hits, fh)
                             write_macsyfinder_hit(hits, macsyfinder_dir, hmm_name_to_filename)
             gc.collect()
@@ -4499,6 +4499,13 @@ def warn_legacy_kofam_cutoffs(db_entry, options):
     print(f"WARNING: {message}")
     logging.warning(message)
 
+def cpu_parallel_options(options):
+    """Select CPU scheduling without modifying statistical thresholds."""
+    strategy = options.get('cpu_parallel', 'auto')
+    if strategy not in ('auto', 'queries', 'targets'):
+        raise ValueError(f"Invalid CPU parallel strategy: {strategy!r}")
+    return {} if strategy == 'auto' else {'parallel': strategy}
+
 def define_kwargs(options):
     kwargs = {}
     
@@ -4683,6 +4690,8 @@ def main(args, *, gpu_profile_session_cache=None):
     gpu_manifests = parse_gpu_manifest_mappings(
         getattr(args, 'gpu_manifest', ())
     )
+    if gpu_manifests and getattr(args, 'cpu_parallel', 'auto') != 'auto':
+        raise ValueError('--cpu-parallel cannot be combined with --gpu-manifest')
     gpu_parsed_json = None
     gpu_installed_hmm_names = None
     log_file_path = os.path.join(outdir, 'astra_search_log.txt')
@@ -4739,6 +4748,7 @@ def main(args, *, gpu_profile_session_cache=None):
         )
 
     hmmsearch_options = {
+        "cpu_parallel": getattr(args, "cpu_parallel", "auto"),
         "cascade": args.cascade,
         "cut_ga": args.cut_ga,
         "cut_nc": args.cut_nc,

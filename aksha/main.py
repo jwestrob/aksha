@@ -79,6 +79,7 @@ def main():
     parser_search.add_argument('--meta', action='store_true',default=False, help='Indicates input files are metagenomes; changes behavior to compensate for large input file size. See docs for details')
     parser_search.add_argument('--individual_results', action='store_true', default=False, help='Indicates a large number of input files; dont store everything in memory and write results per input file, then concatenate')
     parser_search.add_argument("--write_seqs", action="store_true", default=False, help="Obtain sequences for each HMM and write them to a folder within 'outdir'. Default: False")
+    parser_search.add_argument('--cpu-parallel', choices=('auto', 'queries', 'targets'), default='auto', help='CPU search scheduling: auto preserves runtime defaults; targets shares each HMM across workers. Not supported with GPU searches.')
     parser_search.add_argument('--threads', type=int, help="Number of threads to use for HMMsearch. Default behavior: Choose appropriate number of threads based on psutil.cpu_count and number of query sequences", default=1)
     parser_search.add_argument('--write_macsyfinder', action='store_true', default=False,
         help="Write per-HMM hmmsearch-format output files for MacSyFinder --previous-run compatibility. "
