@@ -236,6 +236,15 @@ def press_hmm_database(db_dir, db_name=None):
     return pressed_base
 
 
+def repress_hmm_database(db_dir, db_name):
+    """Press *db_dir* again after its profiles changed, replacing the pressed files."""
+    pressed_base = os.path.join(db_dir, db_name)
+    for ext in ('h3m', 'h3i', 'h3f', 'h3p'):
+        if os.path.exists(f"{pressed_base}.{ext}"):
+            os.remove(f"{pressed_base}.{ext}")
+    return press_hmm_database(db_dir, db_name=db_name)
+
+
 def require_hmm_download(path, url):
     """Stop with a clear message when a download is neither an archive nor HMM text.
 
@@ -398,47 +407,163 @@ def install_KOFAM():
 
     print("Adding kofam bitscore thresholds to HMM files...")
     kofam_dir = os.path.join(db_path, 'KOFAM')
-    for knum, threshold in ko_thresholds(os.path.join(db_path, 'ko_list')):
-        # Add the threshold and overwrite the file
-        add_threshold(os.path.join(kofam_dir, '{}.hmm'.format(knum)), threshold)
+    changed = stamp_kofam_cutoffs(lambda knum: os.path.join(kofam_dir, f'{knum}.hmm'),
+                                  os.path.join(db_path, 'ko_list'))
 
-    # Press the database for fast loading at search time
+    # Press the database for fast loading at search time; a rerun that changed
+    # the cutoffs replaces the pressed copy so both carry the same values.
     print("\nPressing KOFAM database for fast loading...")
-    press_hmm_database(kofam_dir, db_name='KOFAM')
+    if changed:
+        repress_hmm_database(kofam_dir, 'KOFAM')
+    else:
+        press_hmm_database(kofam_dir, db_name='KOFAM')
+    record_cutoff_encoding(db_name, parsed_json)
     return
 
+
+# KOfam's ko_list gives each KO one score threshold and names the HMMER score it
+# applies to: the full-sequence score ('full') or the best single-domain score
+# ('domain').  HMMER's bit cutoffs are a (sequence, domain) pair, so the threshold
+# goes into the slot score_type names and the other slot gets PERMISSIVE_CUTOFF,
+# which every score passes.  A search with --cut_ga/--cut_tc/--cut_nc then keeps a
+# sequence exactly when KofamScan would assign the KO.
+#
+# PERMISSIVE_CUTOFF is finite and differs from HMMER's unset marker (-99999): an
+# optimized profile whose cutoff equals that marker counts as having none, and the
+# GPU runtime's GA pruning accepts only finite cutoffs.  It sits far below every
+# attainable score (domain scores reach about -700 bits in long, poorly matching
+# envelopes) and is exact in single precision, as HMMER stores cutoffs.
+PERMISSIVE_CUTOFF = -1000000.0
+
+# Registry value of 'cutoff_encoding' for a KOfam-derived database stamped as above.
+# Databases stamped by earlier versions carry no 'cutoff_encoding': they hold the
+# threshold in both slots, which also requires every reported domain to reach it.
+KOFAM_CUTOFF_ENCODING = 'score_type'
+
+# Installed databases whose cutoffs come from ko_list.
+KOFAM_CUTOFF_DATABASES = ('KOFAM', 'RP16')
+
+
 def ko_thresholds(ko_list_path):
-    """(KO, score threshold) pairs from KOfam's ``ko_list``; KOs listed with '-' are left out.
+    """(KO, score threshold, score_type) triples from KOfam's ``ko_list``; KOs listed with '-' are left out.
 
     ``pd.to_numeric`` reads the column whatever dtype pandas gives it (object in
     pandas 2, str in pandas 3), so no float is written into a string column.
     """
-    ko_list = pd.read_csv(ko_list_path, sep='\t', usecols=['knum', 'threshold'])
+    ko_list = pd.read_csv(ko_list_path, sep='\t', usecols=['knum', 'threshold', 'score_type'])
     thresholds = pd.to_numeric(ko_list['threshold'], errors='coerce')
     keep = thresholds.notna()
-    return list(zip(ko_list.loc[keep, 'knum'].astype(str), thresholds[keep].astype(float)))
+    return list(zip(ko_list.loc[keep, 'knum'].astype(str), thresholds[keep].astype(float),
+                    ko_list.loc[keep, 'score_type'].astype(str)))
 
 
-def add_threshold(hmm_file_path, threshold):
-    # Some thresholds in ko_list are specified for HMMs not provided by the package...
+def kofam_cutoffs(threshold, score_type):
+    """(sequence, domain) bit cutoffs that apply a ko_list threshold to the score its score_type names."""
+    threshold = float(threshold)
+    if score_type == 'full':
+        return threshold, PERMISSIVE_CUTOFF
+    if score_type == 'domain':
+        return PERMISSIVE_CUTOFF, threshold
+    raise ValueError(f"unknown ko_list score_type {score_type!r} (expected 'full' or 'domain')")
 
+
+def add_threshold(hmm_file_path, threshold, score_type):
+    """Write a ko_list threshold into a KOfam profile as its GA, TC and NC cutoffs.
+
+    Returns True when the file was rewritten.  A profile that is missing (ko_list
+    names KOs the profile set does not ship), a zero threshold, or cutoffs that
+    already match leave the file as it is.
+    """
     if not os.path.exists(hmm_file_path) or threshold == 0.0 or threshold == '-':
-        # '-' values shouldn't still exist in this set, but if the threshold is 0
-        # or the HMM is specified in KO_list but not provided in the HMM set,
-        # let's just ignore it and not add bad thresholds
-        return
+        return False
 
+    cutoffs = kofam_cutoffs(threshold, score_type)
     with astra_pyhmmer.plan7.HMMFile(hmm_file_path) as hmm_file:
         hmm = hmm_file.read()
 
-    hmm.cutoffs.gathering = threshold, threshold
-    hmm.cutoffs.trusted = threshold, threshold
-    hmm.cutoffs.noise = threshold, threshold
+    current = (hmm.cutoffs.gathering, hmm.cutoffs.trusted, hmm.cutoffs.noise)
+    if all(pair is not None and all(abs(a - b) < 0.005 for a, b in zip(pair, cutoffs))
+           for pair in current):
+        return False
 
-    with open(hmm_file_path, "wb") as dst:
+    hmm.cutoffs.gathering = cutoffs
+    hmm.cutoffs.trusted = cutoffs
+    hmm.cutoffs.noise = cutoffs
+
+    # Write beside the profile and rename, so an interrupted run never leaves a
+    # truncated profile.
+    with open(hmm_file_path + '.tmp', "wb") as dst:
         hmm.write(dst)
+    os.replace(hmm_file_path + '.tmp', hmm_file_path)
+    return True
 
-    return
+
+def stamp_kofam_cutoffs(profile_path, ko_list_path):
+    """Write every ko_list threshold into its KOfam profile; returns how many profiles changed.
+
+    *profile_path* maps a KO to its profile file (or None for KOs the database
+    does not hold).  KOs without a threshold keep whatever their profile carries.
+    """
+    changed = 0
+    for knum, threshold, score_type in tqdm(ko_thresholds(ko_list_path), desc="  Stamping cutoffs"):
+        path = profile_path(knum)
+        if path is not None and add_threshold(path, threshold, score_type):
+            changed += 1
+    return changed
+
+
+def record_cutoff_encoding(db_name, parsed_json):
+    """Mark a KOfam-derived database in the registry as stamped with score_type-aware cutoffs."""
+    entry = next(db for db in parsed_json['db_urls'] if db['name'] == db_name)
+    entry['cutoff_encoding'] = KOFAM_CUTOFF_ENCODING
+    record_install(db_name, parsed_json)
+
+
+def restamp_kofam_database(db_name, parsed_json):
+    """Rewrite an installed KOFAM or RP16's cutoffs from the local ko_list and press it again.
+
+    Nothing is downloaded: the source is the ko_list the KOFAM installer left in
+    db_path (or beside the database).  The registry records the new encoding once
+    the profiles and the pressed database carry it.
+    """
+    if db_name not in KOFAM_CUTOFF_DATABASES:
+        print(f"{db_name} has no ko_list cutoffs; --restamp applies to "
+              f"{' and '.join(KOFAM_CUTOFF_DATABASES)}.")
+        return
+    entry = next((db for db in parsed_json['db_urls'] if db['name'] == db_name), None)
+    if entry is None or not entry.get('installed') or not entry.get('installation_dir'):
+        print(f"{db_name} is not installed; nothing to re-stamp.")
+        return
+
+    db_dir = os.path.expandvars(os.path.expanduser(entry['installation_dir'])).rstrip('/')
+    db_path = os.path.expandvars(os.path.expanduser(parsed_json['db_path']))
+    candidates = [os.path.join(db_path, 'ko_list'), os.path.join(os.path.dirname(db_dir), 'ko_list')]
+    ko_list_path = next((path for path in candidates if os.path.exists(path)), None)
+    if ko_list_path is None:
+        print(f"No ko_list at {' or '.join(candidates)}; {db_name} was left unchanged.")
+        return
+
+    if db_name == 'RP16':
+        from aksha import rp16
+
+        def profile_path(knum):
+            if knum not in rp16.RP16_MARKERS:
+                return None
+            return os.path.join(db_dir, rp16.profile_filename(knum))
+    else:
+        def profile_path(knum):
+            return os.path.join(db_dir, f'{knum}.hmm')
+
+    print(f"Re-stamping {db_name} cutoffs in {db_dir} from {ko_list_path}...")
+    changed = stamp_kofam_cutoffs(profile_path, ko_list_path)
+    print(f"  {changed} profiles rewritten.")
+    if changed:
+        repress_hmm_database(db_dir, db_name)
+        print(f"  {db_name} was pressed again; regenerate any GPU manifest made for it.")
+    else:
+        press_hmm_database(db_dir, db_name=db_name)
+    record_cutoff_encoding(db_name, parsed_json)
+    print(f"{db_name} now applies each ko_list threshold to the score its score_type names.")
 
 
 def add_hyddb_thresholds(hmm_file_path, ga_threshold, nc_threshold):
@@ -529,11 +654,10 @@ def install_HydDB():
     press_hmm_database(target_folder, db_name=db_name)
 
 
-def fetch_ko_thresholds(db_path, kos):
-    """Bitscore thresholds for a set of KOs, from KOfam's ``ko_list``.
+def local_ko_list(db_path):
+    """Path to KOfam's ``ko_list`` in ``db_path``, downloading it only if absent.
 
-    Downloads ``ko_list`` if it isn't already sitting in ``db_path`` (KOFAM's
-    installer leaves it there).  KOs whose threshold is '-' are omitted.
+    KOFAM's installer leaves ``ko_list`` there.
     """
     ko_list_path = os.path.join(db_path, 'ko_list')
 
@@ -546,9 +670,7 @@ def fetch_ko_thresholds(db_path, kos):
         with gzip.open(gz_path, 'rb') as f_in, open(ko_list_path, 'wb') as f_out:
             shutil.copyfileobj(f_in, f_out)
 
-    ko_list = pd.read_csv(ko_list_path, sep='\t')
-    wanted = ko_list[ko_list['knum'].isin(kos) & (ko_list['threshold'] != '-')]
-    return {row['knum']: float(row['threshold']) for _, row in wanted.iterrows()}
+    return ko_list_path
 
 
 def install_RP16():
@@ -557,9 +679,9 @@ def install_RP16():
     All 16 markers are KOfam KOs, so rather than vendoring profiles into the
     package they are lifted out of the KOFAM database Aksha already knows how
     to install.  If KOFAM isn't installed, the profiles are pulled from
-    upstream instead; KOfam ships thresholds in ``ko_list`` rather than in the
-    profiles themselves, so those get their cutoffs injected here (an
-    installed KOFAM has already had this done to it).
+    upstream instead.  KOfam ships thresholds in ``ko_list`` rather than in the
+    profiles themselves, so every marker gets its cutoffs stamped here from
+    ``ko_list``, whichever encoding a local KOFAM was installed with.
 
     RP16 inherits its version from whichever KOFAM release it was built from,
     which is recorded in the config alongside the profiles.
@@ -617,10 +739,18 @@ def install_RP16():
         # recorded, but the profiles themselves carry their build date.
         source_version = hmm_build_date(os.path.join(target_folder, sorted(expected)[0]))
 
+    def marker_path(knum):
+        if knum not in rp16.RP16_MARKERS:
+            return None
+        return os.path.join(target_folder, rp16.profile_filename(knum))
+
+    stamp_kofam_cutoffs(marker_path, local_ko_list(db_path))
+
     for index, db in enumerate(parsed_json['db_urls']):
         if db['name'] == db_name:
             parsed_json['db_urls'][index]['installed'] = True
             parsed_json['db_urls'][index]['installation_dir'] = target_folder
+            parsed_json['db_urls'][index]['cutoff_encoding'] = KOFAM_CUTOFF_ENCODING
             record_version(parsed_json['db_urls'][index],
                            source_url=db['url'], version=source_version)
             break
@@ -635,7 +765,7 @@ def install_RP16():
 
 
 def fetch_kofam_markers(kos, target_folder, db_path, rp16):
-    """Pull specific KOfam profiles from upstream and inject their thresholds.
+    """Pull specific KOfam profiles from upstream (install_RP16 stamps their cutoffs).
 
     KOfam publishes no per-profile download, so this streams the release
     tarball and keeps only the members we asked for.  Returns the KOfam
@@ -668,12 +798,6 @@ def fetch_kofam_markers(kos, target_folder, db_path, rp16):
             found[ko] = dest
             if len(found) == len(wanted):
                 break
-
-    # Upstream profiles carry no cutoffs; KOfam keeps them in ko_list.
-    thresholds = fetch_ko_thresholds(db_path, list(found))
-    for ko, dest in found.items():
-        if ko in thresholds:
-            add_threshold(dest, thresholds[ko])
 
     return version
 
@@ -955,6 +1079,12 @@ def main(args):
         hmms = hmms.split(',')
     else:
         hmms = [hmms]
+
+    # Re-stamp KOfam cutoffs from the local ko_list if the flag is set
+    if getattr(args, 'restamp', False):
+        for db_name in hmms:
+            restamp_kofam_database(db_name, parsed_json)
+        return
 
     # Press existing databases if the flag is set
     if getattr(args, 'press', False):

@@ -65,6 +65,33 @@ aksha search --installed_hmms PFAM --prot_in proteins.faa --cut_ga --outdir resu
 Choose thresholds appropriate to the database. `--cut_ga` requires profiles
 with gathering cutoffs; it is not a universal option for arbitrary HMMs.
 
+### KOfam thresholds
+
+KOfam publishes one score threshold per KO in `ko_list`, together with the
+score it applies to (`score_type`): the full-sequence score (`full`) or the
+best single-domain score (`domain`). Installing KOFAM or RP16 writes each
+threshold into its profile's GA, TC and NC lines as a (sequence, domain) pair:
+`full` KOs carry `threshold -1000000.00`, `domain` KOs carry `-1000000.00 threshold`.
+A `--cut_ga`, `--cut_tc` or `--cut_nc` search therefore assigns a KO exactly
+when KofamScan's rule does. A sequence that passes a `full` threshold reports
+all of its domains, including ones below the threshold, so take the full-sequence
+`bitscore` column when ranking hits per sequence and KO. KOs listed in
+`ko_list` without a threshold carry no cutoffs: `--cut_ga` alone reports their
+hits by Aksha's default E-value thresholds, and `--cascade` searches them at an
+E-value of 1e-15.
+
+Databases installed by Aksha 0.2.2 or earlier hold the threshold in both
+slots, which also requires a domain to reach it; a search warns about them.
+Re-stamp such a database from its local `ko_list` (no download) and press it
+again with:
+
+```bash
+aksha initialize --restamp --hmms KOFAM,RP16
+```
+
+The registry then records `"cutoff_encoding": "score_type"` for each database.
+Regenerate any GPU manifest for a re-stamped database: its pressed files change.
+
 ## Pressing and replacing an installation
 
 Installers normally press downloaded HMMs automatically. To request pressing

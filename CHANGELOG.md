@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.3 (2026-11-20)
+
+Application-only release; it uses the published `aksha-runtime==0.1.1` and
+`aksha-cuda12==0.1.1` wheels unchanged.
+
+- KOfam cutoffs follow `ko_list`'s `score_type`. A `full` KO's threshold is the
+  sequence cutoff and a `domain` KO's threshold the domain cutoff; the other slot is
+  -1,000,000 bits. `--cut_ga`/`--cut_tc`/`--cut_nc` searches of KOFAM and RP16 now assign
+  KOs by KofamScan's rule; earlier installs also required a domain to reach a
+  full-score threshold, which dropped hits just above it. A passing full-score hit
+  now lists all of its domains.
+- `aksha initialize --restamp --hmms KOFAM,RP16` re-stamps installed databases from
+  the local `ko_list` and presses them again, without downloading. The registry
+  records `"cutoff_encoding": "score_type"`, and a search with bit cutoffs warns when
+  a KOFAM or RP16 install lacks it.
+- RP16 markers are stamped from `ko_list` at install, including those copied from a
+  local KOFAM.
+- `aksha search --cpu-parallel {auto,queries,targets}` chooses how CPU searches spread
+  work over threads (`targets` shares each HMM across workers); `auto` keeps the
+  runtime's default. Results are identical across strategies. GPU searches reject it.
+- `aksha --version` prints the installed version.
+
 ## 0.2.2 (2026-11-12)
 
 Application-only release; it uses the published `aksha-runtime==0.1.1` and

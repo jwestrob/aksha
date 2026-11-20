@@ -1,6 +1,13 @@
 import argparse
 from aksha import search, initialize, nucsearch, phmmer, jackhmmer, scan
 
+def _installed_version():
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        return version("aksha")
+    except PackageNotFoundError:
+        return "unknown"
+
 class CustomHelpFormatter(argparse.HelpFormatter):
     def _format_action(self, action):
         parts = super()._format_action(action)
@@ -10,6 +17,7 @@ class CustomHelpFormatter(argparse.HelpFormatter):
 
 def main():
     parser = argparse.ArgumentParser(description='Aksha: A scalable tool for various sequence searching tasks.', formatter_class=CustomHelpFormatter)
+    parser.add_argument('--version', action='version', version=f"aksha {_installed_version()}")
     subparsers = parser.add_subparsers(dest='command', help='\nAvailable subroutines:')
 
 
@@ -28,6 +36,7 @@ def main():
     parser_initialize.add_argument('--hmms', nargs='?', const='all', default=None, help='Install specified HMM databases. Use comma-separated values for multiple databases.')
     parser_initialize.add_argument('--press', action='store_true', default=False, help='Press installed databases for fast loading. Optionally specify --hmms to press only specific databases.')
     parser_initialize.add_argument('--force', action='store_true', default=False, help='Reinstall the databases named by --hmms even if they are already installed, replacing them with the current upstream release.')
+    parser_initialize.add_argument('--restamp', action='store_true', default=False, help='Rewrite the cutoffs of the installed KOFAM and/or RP16 named by --hmms from the local ko_list, applying each threshold to the score its score_type names, and press them again. Downloads nothing.')
 
 
     ##########
@@ -78,6 +87,7 @@ def main():
     parser_search.add_argument('--meta', action='store_true',default=False, help='Indicates input files are metagenomes; changes behavior to compensate for large input file size. See docs for details')
     parser_search.add_argument('--individual_results', action='store_true', default=False, help='Indicates a large number of input files; dont store everything in memory and write results per input file, then concatenate')
     parser_search.add_argument("--write_seqs", action="store_true", default=False, help="Obtain sequences for each HMM and write them to a folder within 'outdir'. Default: False")
+    parser_search.add_argument('--cpu-parallel', choices=('auto', 'queries', 'targets'), default='auto', help='CPU search scheduling: auto preserves runtime defaults; targets shares each HMM across workers. Not supported with GPU searches.')
     parser_search.add_argument('--threads', type=int, help="Number of threads to use for HMMsearch. Default behavior: Choose appropriate number of threads based on psutil.cpu_count and number of query sequences", default=1)
     parser_search.add_argument('--write_macsyfinder', action='store_true', default=False,
         help="Write per-HMM hmmsearch-format output files for MacSyFinder --previous-run compatibility. "

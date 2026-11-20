@@ -41,7 +41,7 @@ def smoke(bundle, baseline, output):
     pip = [python, "-m", "pip"]
     install = pip + ["install", "--no-index", "--only-binary=:all:", "--find-links", bundle,
                      "--find-links", baseline / "qualification-wheelhouse"]
-    run("install-cpu", install + ["--report", output / "pip-cpu.json", "aksha==0.2.2"])
+    run("install-cpu", install + ["--report", output / "pip-cpu.json", "aksha==0.2.3"])
     run("pip-check-cpu", pip + ["check"])
     run("imports", [python, "-I", "-c", r'''
 import importlib.metadata as md, importlib.util, json, pathlib, sys
@@ -57,7 +57,7 @@ assert _pipeline._ASTRA_TSV_RENDERER_ABI == 2
 assert _pipeline.PYHMMER_PRIVATE_ABI_SHA256 == _abi.pyhmmer_abi_fingerprint()
 for module in (aksha, astra_pyhmmer, _pipeline):
     assert pathlib.Path(module.__file__).is_relative_to(sys.prefix)
-assert md.version("aksha") == "0.2.2"
+assert md.version("aksha") == "0.2.3"
 assert md.version("aksha-runtime") == "0.1.1"
 print(json.dumps({"private_abi": _pipeline.PYHMMER_PRIVATE_ABI_SHA256,
     "fixture_dir": str(pathlib.Path(astra_pyhmmer.__file__).parent / "tests/data"),
@@ -90,7 +90,7 @@ print(json.dumps({"private_abi": _pipeline.PYHMMER_PRIVATE_ABI_SHA256,
         requests[name] = {"command": list(map(str, command)), "output": record(result),
                           "wall_seconds": float(seconds), "peak_rss_kib": int(rss)}
     assert requests["reference"]["output"]["sha256"] == requests["candidate"]["output"]["sha256"]
-    run("install-gpu", install + ["--report", output / "pip-gpu.json", "aksha[gpu]==0.2.2"])
+    run("install-gpu", install + ["--report", output / "pip-gpu.json", "aksha[gpu]==0.2.3"])
     run("pip-check-gpu", pip + ["check"])
     run("gpu-extra", [python, "-I", "-c", "import importlib.metadata as m, importlib.util as u; assert m.version('aksha-cuda12') == '0.1.1'; assert u.find_spec('plan7_gpu._native') is not None; print('PASS_EXTRA_INSTALL')"])
     run("freeze", pip + ["freeze"])
