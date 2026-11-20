@@ -1,6 +1,13 @@
 import argparse
 from aksha import search, initialize, nucsearch, phmmer, jackhmmer, scan
 
+def _installed_version():
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        return version("aksha")
+    except PackageNotFoundError:
+        return "unknown"
+
 class CustomHelpFormatter(argparse.HelpFormatter):
     def _format_action(self, action):
         parts = super()._format_action(action)
@@ -10,6 +17,7 @@ class CustomHelpFormatter(argparse.HelpFormatter):
 
 def main():
     parser = argparse.ArgumentParser(description='Aksha: A scalable tool for various sequence searching tasks.', formatter_class=CustomHelpFormatter)
+    parser.add_argument('--version', action='version', version=f"aksha {_installed_version()}")
     subparsers = parser.add_subparsers(dest='command', help='\nAvailable subroutines:')
 
 

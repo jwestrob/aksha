@@ -13,7 +13,7 @@ Legacy `ASTRA_*` knobs and native-library names remain unchanged.
 
 | Distribution | Contents |
 | --- | --- |
-| `aksha==0.2.2` | Python application and `aksha` command |
+| `aksha==0.2.3` | Python application and `aksha` command |
 | `aksha-runtime==0.1.1` | Private PyHMMER/HMMER/Easel and CPU continuation |
 | `aksha-cuda12==0.1.1` | Optional CUDA extension |
 

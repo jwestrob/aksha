@@ -9,7 +9,7 @@ python -m pip install 'aksha[gpu]'
 aksha --help
 ```
 
-Before upload add `--find-links /path/to/release-bundle`. App version 0.2.2
+Before upload add `--find-links /path/to/release-bundle`. App version 0.2.3
 pins runtime/CUDA 0.1.1. Pip selects the components automatically; ordinary
 dependencies are downloaded separately. This is not a complete offline wheelhouse.
 

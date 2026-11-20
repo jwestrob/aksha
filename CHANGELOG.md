@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.2.3 (2026-11-20)
+
+Application-only release; it uses the published `aksha-runtime==0.1.1` and
+`aksha-cuda12==0.1.1` wheels unchanged.
 
 - KOfam cutoffs follow `ko_list`'s `score_type`. A `full` KO's threshold is the
   sequence cutoff and a `domain` KO's threshold the domain cutoff; the other slot is
@@ -17,6 +20,7 @@
 - `aksha search --cpu-parallel {auto,queries,targets}` chooses how CPU searches spread
   work over threads (`targets` shares each HMM across workers); `auto` keeps the
   runtime's default. Results are identical across strategies. GPU searches reject it.
+- `aksha --version` prints the installed version.
 
 ## 0.2.2 (2026-11-12)
 

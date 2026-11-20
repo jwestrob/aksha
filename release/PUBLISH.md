@@ -1,6 +1,6 @@
 # User-operated publication
 
-## Application-only release (0.2.2)
+## Application-only release (0.2.3)
 
 `aksha-runtime==0.1.1` and `aksha-cuda12==0.1.1` are already on PyPI and stay unchanged.
 From a clean checkout of the release commit:
@@ -8,8 +8,8 @@ From a clean checkout of the release commit:
 ```bash
 python -m pip install build twine
 python -m build --outdir dist
-twine check dist/aksha-0.2.2-py3-none-any.whl dist/aksha-0.2.2.tar.gz
-twine upload dist/aksha-0.2.2-py3-none-any.whl dist/aksha-0.2.2.tar.gz
+twine check dist/aksha-0.2.3-py3-none-any.whl dist/aksha-0.2.3.tar.gz
+twine upload dist/aksha-0.2.3-py3-none-any.whl dist/aksha-0.2.3.tar.gz
 ```
 
 ## Native bundle release
