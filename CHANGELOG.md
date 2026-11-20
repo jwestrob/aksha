@@ -4,7 +4,7 @@
 
 - KOfam cutoffs follow `ko_list`'s `score_type`. A `full` KO's threshold is the
   sequence cutoff and a `domain` KO's threshold the domain cutoff; the other slot is
-  -1000 bits. `--cut_ga`/`--cut_tc`/`--cut_nc` searches of KOFAM and RP16 now assign
+  -1,000,000 bits. `--cut_ga`/`--cut_tc`/`--cut_nc` searches of KOFAM and RP16 now assign
   KOs by KofamScan's rule; earlier installs also required a domain to reach a
   full-score threshold, which dropped hits just above it. A passing full-score hit
   now lists all of its domains.

@@ -430,8 +430,10 @@ def install_KOFAM():
 #
 # PERMISSIVE_CUTOFF is finite and differs from HMMER's unset marker (-99999): an
 # optimized profile whose cutoff equals that marker counts as having none, and the
-# GPU runtime's GA pruning accepts only finite cutoffs.
-PERMISSIVE_CUTOFF = -1000.0
+# GPU runtime's GA pruning accepts only finite cutoffs.  It sits far below every
+# attainable score (domain scores reach about -700 bits in long, poorly matching
+# envelopes) and is exact in single precision, as HMMER stores cutoffs.
+PERMISSIVE_CUTOFF = -1000000.0
 
 # Registry value of 'cutoff_encoding' for a KOfam-derived database stamped as above.
 # Databases stamped by earlier versions carry no 'cutoff_encoding': they hold the

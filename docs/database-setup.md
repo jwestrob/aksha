@@ -71,7 +71,7 @@ KOfam publishes one score threshold per KO in `ko_list`, together with the
 score it applies to (`score_type`): the full-sequence score (`full`) or the
 best single-domain score (`domain`). Installing KOFAM or RP16 writes each
 threshold into its profile's GA, TC and NC lines as a (sequence, domain) pair:
-`full` KOs carry `threshold -1000.00`, `domain` KOs carry `-1000.00 threshold`.
+`full` KOs carry `threshold -1000000.00`, `domain` KOs carry `-1000000.00 threshold`.
 A `--cut_ga`, `--cut_tc` or `--cut_nc` search therefore assigns a KO exactly
 when KofamScan's rule does. A sequence that passes a `full` threshold reports
 all of its domains, including ones below the threshold, so take the full-sequence

@@ -1,10 +1,12 @@
 """KOfam cutoffs follow ko_list's score_type: stamping, pressing, search semantics and re-stamping."""
 
 import argparse
+import array
 import functools
 import json
 import math
 import random
+import struct
 
 import astra_pyhmmer
 import pytest
@@ -67,7 +69,7 @@ def _targets():
 def _scores():
     """(full-sequence score, best domain score) of the target, searched without thresholds."""
     hits = next(iter(astra_pyhmmer.hmmer.hmmsearch(
-        [_model("K90001")], _targets(), cpus=1, T=-1000.0, domT=-1000.0, incT=-1000.0, incdomT=-1000.0)))
+        [_model("K90001")], _targets(), cpus=1, T=P, domT=P, incT=P, incdomT=P)))
     hit = hits[0]
     return hit.score, hit.best_domain.score
 
@@ -104,7 +106,35 @@ def test_permissive_cutoff_is_finite_and_distinct_from_hmmers_unset_marker():
     hmm = _model("K90001")
     del hmm.cutoffs.gathering
     unset = hmm.cutoffs.as_vector()[0]
-    assert math.isfinite(P) and P != unset and P < -100
+    assert math.isfinite(P) and P != unset and P < -1000
+    assert struct.unpack("f", struct.pack("f", P))[0] == P  # HMMER stores cutoffs as float32
+
+
+def test_permissive_cutoff_round_trips_through_the_profile_text(tmp_path):
+    hmm = _model("K90001")
+    hmm.cutoffs.gathering = ini.kofam_cutoffs(159.07, "full")
+    hmm.cutoffs.trusted = ini.kofam_cutoffs(93.93, "domain")
+    path = _write(hmm, tmp_path / "K90001.hmm")
+    lines = {line.split()[0]: line.split()[1:] for line in path.read_text().splitlines()
+             if line.startswith(("GA ", "TC "))}
+    assert lines == {"GA": ["159.07", "-1000000.00"], "TC": ["-1000000.00", "93.93"]}
+    back = _read(path).cutoffs
+    assert back.gathering == pytest.approx((159.07, P)) and back.trusted == pytest.approx((P, 93.93))
+
+
+def test_gpu_profile_loader_keeps_the_permissive_cutoff_finite(tmp_path):
+    adapter = pytest.importorskip("plan7_gpu.adapter", exc_type=ImportError)
+    full = _model("K90001")
+    full.cutoffs.gathering = ini.kofam_cutoffs(159.07, "full")
+    domain = _model("K90002", seed=12)
+    domain.cutoffs.gathering = ini.kofam_cutoffs(93.93, "domain")
+    pressed = tmp_path / "pressed"
+    astra_pyhmmer.hmmer.hmmpress([full, domain], str(pressed))
+    pairs = list(adapter.load_pressed_profiles(str(pressed)))
+    assert [pair.cutoffs.gathering for pair in pairs] == [pytest.approx((159.07, P)), pytest.approx((P, 93.93))]
+    # GA pruning packs the sequence cutoffs into array('f') and requires each to be finite.
+    packed = array.array("f", [pair.cutoffs.gathering[0] for pair in pairs])
+    assert all(math.isfinite(value) for value in packed) and packed[1] == P
 
 
 # --- Stamping ----------------------------------------------------------------------------------
