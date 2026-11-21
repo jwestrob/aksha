@@ -351,6 +351,66 @@ cdef extern from "bias_cuda.h" nogil:
     )
     int plan7_bias_environment_attested(char *reason, size_t reason_size)
 
+    cdef enum plan7_bias_environment_code:
+        PLAN7_BIAS_ENV_ATTESTED_BUILTIN
+        PLAN7_BIAS_ENV_ATTESTED_SELF
+        PLAN7_BIAS_ENV_UNSUPPORTED_PLATFORM
+        PLAN7_BIAS_ENV_FLOAT_ENVIRONMENT
+        PLAN7_BIAS_ENV_CUDA_DEVICE
+        PLAN7_BIAS_ENV_HOST_FEATURES
+        PLAN7_BIAS_ENV_LIBM_UNAVAILABLE
+        PLAN7_BIAS_ENV_NOT_ATTESTED
+
+    enum:
+        PLAN7_BIAS_ATTESTATION_ALGORITHM_VERSION
+        PLAN7_BIAS_ATTESTATION_INPUT_COUNT
+
+    ctypedef struct plan7_bias_self_attestation:
+        int32_t algorithm_version
+        int32_t cuda_target
+        int32_t host_threads
+        int32_t attested
+        uint64_t inputs_checked
+        uint64_t float_mismatches
+        uint64_t double_mismatches
+        uint32_t maximum_float_ulp
+        uint32_t first_float_mismatch_input
+        uint32_t first_float_mismatch_host
+        uint32_t first_float_mismatch_device
+        uint64_t maximum_double_ulp
+        uint32_t first_double_mismatch_input
+        double seconds
+        uint8_t libm_build_id[20]
+        plan7_bias_host_identity host
+        plan7_bias_cuda_identity cuda
+
+    int plan7_bias_classify_environment(char *reason, size_t reason_size)
+    int plan7_bias_self_attest(
+        int host_threads,
+        plan7_bias_self_attestation *report,
+        char *reason,
+        size_t reason_size,
+    )
+    int plan7_bias_register_attestation(
+        const uint8_t *build_id,
+        size_t build_id_size,
+        const plan7_bias_host_identity *host,
+        int cuda_target,
+        int algorithm_version,
+        uint64_t inputs_checked,
+        uint64_t float_mismatches,
+        char *reason,
+        size_t reason_size,
+    )
+    void plan7_bias_clear_attestation()
+    int plan7_bias_cuda_device_count(int *count, char *reason, size_t reason_size)
+    int plan7_bias_cuda_identity_for_device(
+        int device_ordinal,
+        plan7_bias_cuda_identity *identity,
+        char *reason,
+        size_t reason_size,
+    )
+
 
 cdef extern from "ssv_cuda.h" nogil:
     cdef enum plan7_ssv_status:
@@ -3956,6 +4016,205 @@ def bias_environment_provenance():
             "attested_for_target": bool(libm_attested),
         },
     }
+
+
+BIAS_ATTESTATION_ALGORITHM = (
+    "plan7-gpu-bias-log-exhaustive-v%d"
+    % PLAN7_BIAS_ATTESTATION_ALGORITHM_VERSION
+)
+BIAS_ATTESTATION_INPUT_COUNT = PLAN7_BIAS_ATTESTATION_INPUT_COUNT
+
+_BIAS_ENVIRONMENT_NAMES = {
+    PLAN7_BIAS_ENV_ATTESTED_BUILTIN: "attested-builtin",
+    PLAN7_BIAS_ENV_ATTESTED_SELF: "attested-self",
+    PLAN7_BIAS_ENV_UNSUPPORTED_PLATFORM: "unsupported-platform",
+    PLAN7_BIAS_ENV_FLOAT_ENVIRONMENT: "float-environment",
+    PLAN7_BIAS_ENV_CUDA_DEVICE: "cuda-device",
+    PLAN7_BIAS_ENV_HOST_FEATURES: "host-features",
+    PLAN7_BIAS_ENV_LIBM_UNAVAILABLE: "libm-unavailable",
+    PLAN7_BIAS_ENV_NOT_ATTESTED: "not-attested",
+}
+
+
+cdef object _bias_target_name(int target):
+    return {
+        PLAN7_BIAS_CUDA_SM75_RTX2080_TI: "sm75_rtx2080ti",
+        PLAN7_BIAS_CUDA_SM90_H200: "sm90_h200",
+    }.get(target, "unattested")
+
+
+def bias_environment_status():
+    """Classify the live bias-math environment without launching a kernel.
+
+    ``self_attestation_applicable`` is true only when the device, CPU features
+    and floating-point environment are admitted and the sole missing piece is
+    an attestation of this host libm build (``bias_self_attest``).
+    """
+    cdef char reason[512]
+    cdef int code
+    reason[0] = 0
+    with nogil:
+        code = plan7_bias_classify_environment(reason, sizeof(reason))
+    return {
+        "code": code,
+        "name": _BIAS_ENVIRONMENT_NAMES.get(code, "unknown"),
+        "attested": code > 0,
+        "source": {
+            PLAN7_BIAS_ENV_ATTESTED_BUILTIN: "built-in",
+            PLAN7_BIAS_ENV_ATTESTED_SELF: "self-attested",
+        }.get(code),
+        "self_attestation_applicable": code == PLAN7_BIAS_ENV_NOT_ATTESTED,
+        "reason": reason.decode("utf-8", "replace"),
+    }
+
+
+def bias_self_attest(int host_threads):
+    """Run the exhaustive device-versus-host log audit on the current device.
+
+    Every positive finite binary32 input is evaluated by the production device
+    log and by the host libm ``log``. With zero binary32 mismatches the live
+    environment is registered as trusted for this process. Binary64 mismatches
+    are reported for characterization only.
+    """
+    cdef plan7_bias_self_attestation report
+    cdef char reason[512]
+    cdef int status
+    reason[0] = 0
+    with nogil:
+        status = plan7_bias_self_attest(
+            host_threads, &report, reason, sizeof(reason)
+        )
+    if status != 0:
+        raise RuntimeError(reason.decode("utf-8", "replace"))
+    return {
+        "algorithm": BIAS_ATTESTATION_ALGORITHM,
+        "algorithm_version": report.algorithm_version,
+        "attested": bool(report.attested),
+        "reason": reason.decode("utf-8", "replace"),
+        "cuda_target": report.cuda_target,
+        "target": _bias_target_name(report.cuda_target),
+        "host_threads": report.host_threads,
+        "inputs_checked": report.inputs_checked,
+        "float_mismatches": report.float_mismatches,
+        "double_mismatches": report.double_mismatches,
+        "maximum_float_ulp": report.maximum_float_ulp,
+        "maximum_double_ulp": report.maximum_double_ulp,
+        "first_float_mismatch": (
+            {
+                "input": "0x%08x" % report.first_float_mismatch_input,
+                "host": "0x%08x" % report.first_float_mismatch_host,
+                "device": "0x%08x" % report.first_float_mismatch_device,
+            }
+            if report.float_mismatches else None
+        ),
+        "first_double_mismatch_input": (
+            "0x%08x" % report.first_double_mismatch_input
+            if report.double_mismatches else None
+        ),
+        "seconds": report.seconds,
+        "libm_build_id": PyBytes_FromStringAndSize(
+            <char *> &report.libm_build_id[0], PLAN7_BIAS_LIBM_BUILD_ID_SIZE
+        ).hex(),
+        "host": _bias_host_identity_dict(&report.host),
+        "cuda": _bias_cuda_identity_dict(&report.cuda),
+    }
+
+
+def bias_register_attestation(
+    str libm_build_id,
+    dict host,
+    int cuda_target,
+    int algorithm_version,
+    uint64_t inputs_checked,
+    uint64_t float_mismatches,
+):
+    """Re-bind a cached audit record; returns ``(registered, reason)``."""
+    cdef plan7_bias_host_identity identity
+    cdef bytes build_id = bytes.fromhex(libm_build_id)
+    cdef const uint8_t *build_id_pointer = <const uint8_t *> PyBytes_AS_STRING(
+        build_id
+    )
+    cdef size_t build_id_size = len(build_id)
+    cdef char reason[512]
+    cdef int registered
+    vendor_words = host["vendor_words"]
+    if len(vendor_words) != 3:
+        raise ValueError("host identity needs three vendor words")
+    identity.vendor_ebx = vendor_words[0]
+    identity.vendor_edx = vendor_words[1]
+    identity.vendor_ecx = vendor_words[2]
+    identity.family = host["family"]
+    identity.model = host["model"]
+    identity.stepping = host["stepping"]
+    identity.leaf1_ecx = host["leaf1_ecx"]
+    identity.leaf1_edx = host["leaf1_edx"]
+    identity.leaf7_ebx = host["leaf7_ebx"]
+    identity.xcr0_low = host["xcr0_low"]
+    identity.xcr0_high = host["xcr0_high"]
+    reason[0] = 0
+    with nogil:
+        registered = plan7_bias_register_attestation(
+            build_id_pointer,
+            build_id_size,
+            &identity,
+            cuda_target,
+            algorithm_version,
+            inputs_checked,
+            float_mismatches,
+            reason,
+            sizeof(reason),
+        )
+    return bool(registered), reason.decode("utf-8", "replace")
+
+
+def bias_clear_attestation():
+    """Forget this process's self-attestation registration."""
+    with nogil:
+        plan7_bias_clear_attestation()
+
+
+def bias_cuda_devices():
+    """Identity and admitted bias-math target of every visible CUDA device."""
+    cdef int count = 0
+    cdef int ordinal
+    cdef int status
+    cdef int target
+    cdef char reason[512]
+    cdef plan7_bias_cuda_identity identity
+    reason[0] = 0
+    with nogil:
+        status = plan7_bias_cuda_device_count(&count, reason, sizeof(reason))
+    if status != 0:
+        return {"devices": [], "reason": reason.decode("utf-8", "replace")}
+    devices = []
+    for ordinal in range(count):
+        reason[0] = 0
+        with nogil:
+            status = plan7_bias_cuda_identity_for_device(
+                ordinal, &identity, reason, sizeof(reason)
+            )
+        if status != 0:
+            devices.append({
+                "device_ordinal": ordinal,
+                "identity": None,
+                "target_code": PLAN7_BIAS_CUDA_UNATTESTED,
+                "target": "unattested",
+                "reason": reason.decode("utf-8", "replace"),
+            })
+            continue
+        reason[0] = 0
+        with nogil:
+            target = plan7_bias_cuda_identity_target(
+                &identity, reason, sizeof(reason)
+            )
+        devices.append({
+            "device_ordinal": ordinal,
+            "identity": _bias_cuda_identity_dict(&identity),
+            "target_code": target,
+            "target": _bias_target_name(target),
+            "reason": reason.decode("utf-8", "replace"),
+        })
+    return {"devices": devices, "reason": ""}
 
 
 def _bias_cuda_identity_target_raw(

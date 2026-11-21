@@ -12,6 +12,12 @@
 
 #include <dlfcn.h>
 
+#include <algorithm>
+#include <chrono>
+#include <mutex>
+#include <thread>
+#include <vector>
+
 #if defined(__GLIBC__)
 #include <cpuid.h>
 #include <gnu/libc-version.h>
@@ -32,6 +38,8 @@ static_assert(sizeof(plan7_bias_cuda_identity) == 368,
               "plan7_bias_cuda_identity ABI size changed");
 static_assert(sizeof(plan7_bias_host_identity) == 44,
               "plan7_bias_host_identity ABI size changed");
+static_assert(sizeof(plan7_bias_self_attestation) == 520,
+              "plan7_bias_self_attestation ABI size changed");
 
 namespace {
 
@@ -177,15 +185,6 @@ loaded_libm_build_id(uint8_t build_id[PLAN7_BIAS_LIBM_BUILD_ID_SIZE])
   return true;
 }
 
-bool
-loaded_libm_is_attested(int cuda_target)
-{
-  uint8_t build_id[PLAN7_BIAS_LIBM_BUILD_ID_SIZE];
-  return loaded_libm_build_id(build_id) &&
-         plan7_bias_libm_build_id_attested(
-           build_id, sizeof(build_id), cuda_target) == 1;
-}
-
 void
 set_degenerate_odds(const float *background,
                     const float *composition,
@@ -231,6 +230,21 @@ __device__ __forceinline__ float
 device_log_to_float(float value)
 {
   return __double2float_rn(log(static_cast<double>(value)));
+}
+
+/* Self-attestation kernel: the production binary32 log of the bias filter and
+ * the binary64 log used by the Forward/domain kernels, for one input range. */
+__global__ void
+bias_log_attestation_kernel(uint32_t first,
+                            uint32_t count,
+                            float *binary32,
+                            double *binary64)
+{
+  const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= count) return;
+  const float value = __uint_as_float(first + index);
+  binary32[index] = device_log_to_float(value);
+  binary64[index] = log(static_cast<double>(value));
 }
 
 __device__ __forceinline__ bool
@@ -546,10 +560,13 @@ plan7_bias_host_environment_attested(void)
 #endif
 }
 
-extern "C" int
-plan7_bias_current_cuda_identity(plan7_bias_cuda_identity *identity,
-                                 char *reason,
-                                 size_t reason_size)
+namespace {
+
+int
+capture_cuda_identity(int requested_ordinal,
+                      plan7_bias_cuda_identity *identity,
+                      char *reason,
+                      size_t reason_size)
 {
   if (identity == nullptr) {
     set_error(reason, reason_size, "bias CUDA identity output is null");
@@ -575,10 +592,14 @@ plan7_bias_current_cuda_identity(plan7_bias_cuda_identity *identity,
     set_cuda_error(reason, reason_size, "cudaDriverGetVersion", status);
     return -1;
   }
-  status = cudaGetDevice(&identity->device_ordinal);
-  if (status != cudaSuccess) {
-    set_cuda_error(reason, reason_size, "cudaGetDevice", status);
-    return -1;
+  if (requested_ordinal < 0) {
+    status = cudaGetDevice(&identity->device_ordinal);
+    if (status != cudaSuccess) {
+      set_cuda_error(reason, reason_size, "cudaGetDevice", status);
+      return -1;
+    }
+  } else {
+    identity->device_ordinal = requested_ordinal;
   }
 
   cudaDeviceProp properties;
@@ -602,6 +623,47 @@ plan7_bias_current_cuda_identity(plan7_bias_cuda_identity *identity,
     identity->device_ordinal);
   if (status != cudaSuccess) {
     set_cuda_error(reason, reason_size, "cudaDeviceGetPCIBusId", status);
+    return -1;
+  }
+  if (reason != nullptr && reason_size != 0) reason[0] = '\0';
+  return 0;
+}
+
+}  // namespace
+
+extern "C" int
+plan7_bias_current_cuda_identity(plan7_bias_cuda_identity *identity,
+                                 char *reason,
+                                 size_t reason_size)
+{
+  return capture_cuda_identity(-1, identity, reason, reason_size);
+}
+
+extern "C" int
+plan7_bias_cuda_identity_for_device(int device_ordinal,
+                                    plan7_bias_cuda_identity *identity,
+                                    char *reason,
+                                    size_t reason_size)
+{
+  if (device_ordinal < 0) {
+    set_error(reason, reason_size, "CUDA device ordinal must be nonnegative");
+    return -1;
+  }
+  return capture_cuda_identity(device_ordinal, identity, reason, reason_size);
+}
+
+extern "C" int
+plan7_bias_cuda_device_count(int *count, char *reason, size_t reason_size)
+{
+  if (count == nullptr) {
+    set_error(reason, reason_size, "CUDA device count output is null");
+    return -1;
+  }
+  *count = 0;
+  const cudaError_t status = cudaGetDeviceCount(count);
+  if (status != cudaSuccess) {
+    *count = 0;
+    set_cuda_error(reason, reason_size, "cudaGetDeviceCount", status);
     return -1;
   }
   if (reason != nullptr && reason_size != 0) reason[0] = '\0';
@@ -720,6 +782,41 @@ plan7_bias_cuda_identity_target(const plan7_bias_cuda_identity *identity,
   return PLAN7_BIAS_CUDA_UNATTESTED;
 }
 
+namespace {
+
+#if defined(__x86_64__) && defined(__GLIBC__)
+/* Vendor and instruction-set requirements of the attested host reference.
+ * They are independent of the family/model/stepping signature that the
+ * built-in allow-list additionally pins. */
+bool
+host_features_supported(const plan7_bias_host_identity *identity,
+                        char *reason,
+                        size_t reason_size)
+{
+  const uint32_t required_leaf1_ecx =
+    bit_FMA | bit_SSE4_1 | bit_OSXSAVE | bit_AVX;
+  const uint32_t required_leaf7_ebx =
+    bit_AVX2 | bit_AVX512F | bit_AVX512DQ | bit_AVX512CD |
+    bit_AVX512BW | bit_AVX512VL;
+  if (identity->vendor_ebx != UINT32_C(0x756e6547) ||
+      identity->vendor_edx != UINT32_C(0x49656e69) ||
+      identity->vendor_ecx != UINT32_C(0x6c65746e) ||
+      (identity->leaf1_edx & bit_SSE2) == 0 ||
+      (identity->leaf1_ecx & required_leaf1_ecx) != required_leaf1_ecx ||
+      (identity->leaf7_ebx & required_leaf7_ebx) != required_leaf7_ebx ||
+      (identity->xcr0_low & UINT32_C(0x000000e6)) !=
+        UINT32_C(0x000000e6) ||
+      identity->xcr0_high != 0) {
+    set_error(reason, reason_size,
+              "bias math is not attested for this CPU vendor or feature set");
+    return false;
+  }
+  return true;
+}
+#endif
+
+}  // namespace
+
 extern "C" int
 plan7_bias_host_identity_attested(const plan7_bias_host_identity *identity,
                                   int cuda_target,
@@ -737,24 +834,7 @@ plan7_bias_host_identity_attested(const plan7_bias_host_identity *identity,
     set_error(reason, reason_size, "bias host identity is null");
     return 0;
   }
-  const uint32_t required_leaf1_ecx =
-    bit_FMA | bit_SSE4_1 | bit_OSXSAVE | bit_AVX;
-  const uint32_t required_leaf7_ebx =
-    bit_AVX2 | bit_AVX512F | bit_AVX512DQ | bit_AVX512CD |
-    bit_AVX512BW | bit_AVX512VL;
-  if (identity->vendor_ebx != UINT32_C(0x756e6547) ||
-      identity->vendor_edx != UINT32_C(0x49656e69) ||
-      identity->vendor_ecx != UINT32_C(0x6c65746e) ||
-      (identity->leaf1_edx & bit_SSE2) == 0 ||
-      (identity->leaf1_ecx & required_leaf1_ecx) != required_leaf1_ecx ||
-      (identity->leaf7_ebx & required_leaf7_ebx) != required_leaf7_ebx ||
-      (identity->xcr0_low & UINT32_C(0x000000e6)) !=
-        UINT32_C(0x000000e6) ||
-      identity->xcr0_high != 0) {
-    set_error(reason, reason_size,
-              "bias math is not attested for this CPU vendor or feature set");
-    return 0;
-  }
+  if (!host_features_supported(identity, reason, reason_size)) return 0;
   if (cuda_target == PLAN7_BIAS_CUDA_SM75_RTX2080_TI &&
       identity->family == 6 && identity->model == 85 &&
       identity->stepping == 4) {
@@ -806,48 +886,467 @@ plan7_bias_libm_build_id_attested(const uint8_t *build_id,
   return 0;
 }
 
+namespace {
+
+#if defined(__x86_64__) && defined(__GLIBC__)
+bool
+host_identity_equal(const plan7_bias_host_identity &left,
+                    const plan7_bias_host_identity &right)
+{
+  return left.vendor_ebx == right.vendor_ebx &&
+         left.vendor_edx == right.vendor_edx &&
+         left.vendor_ecx == right.vendor_ecx &&
+         left.family == right.family && left.model == right.model &&
+         left.stepping == right.stepping &&
+         left.leaf1_ecx == right.leaf1_ecx &&
+         left.leaf1_edx == right.leaf1_edx &&
+         left.leaf7_ebx == right.leaf7_ebx &&
+         left.xcr0_low == right.xcr0_low &&
+         left.xcr0_high == right.xcr0_high;
+}
+
+/* One process-wide registration: the libm build, CPU identity and device
+ * target for which an exhaustive audit (live or cached) has zero binary32
+ * mismatches. Classification re-checks every field on each call. */
+struct registered_attestation {
+  bool valid;
+  int target;
+  uint8_t build_id[PLAN7_BIAS_LIBM_BUILD_ID_SIZE];
+  plan7_bias_host_identity host;
+};
+
+std::mutex registered_attestation_mutex;
+registered_attestation registered_attestation_state = {};
+
+void
+register_attestation(int target,
+                     const uint8_t build_id[PLAN7_BIAS_LIBM_BUILD_ID_SIZE],
+                     const plan7_bias_host_identity &host)
+{
+  std::lock_guard<std::mutex> lock(registered_attestation_mutex);
+  registered_attestation_state.valid = true;
+  registered_attestation_state.target = target;
+  memcpy(registered_attestation_state.build_id, build_id,
+         PLAN7_BIAS_LIBM_BUILD_ID_SIZE);
+  registered_attestation_state.host = host;
+}
+
+bool
+registered_attestation_matches(
+  int target,
+  const uint8_t build_id[PLAN7_BIAS_LIBM_BUILD_ID_SIZE],
+  const plan7_bias_host_identity &host)
+{
+  std::lock_guard<std::mutex> lock(registered_attestation_mutex);
+  return registered_attestation_state.valid &&
+         registered_attestation_state.target == target &&
+         memcmp(registered_attestation_state.build_id, build_id,
+                PLAN7_BIAS_LIBM_BUILD_ID_SIZE) == 0 &&
+         host_identity_equal(registered_attestation_state.host, host);
+}
+
+/* The live inputs shared by classification, audit and registration. */
+struct live_environment {
+  plan7_bias_cuda_identity cuda;
+  plan7_bias_host_identity host;
+  uint8_t build_id[PLAN7_BIAS_LIBM_BUILD_ID_SIZE];
+  int target;
+};
+
+/* Returns 0 when every platform requirement holds, otherwise the failing
+ * plan7_bias_environment_code. Nothing here depends on the libm build. */
+int
+capture_live_environment(live_environment *live,
+                         char *reason,
+                         size_t reason_size)
+{
+  memset(live, 0, sizeof(*live));
+  if (plan7_bias_host_environment_attested() != 1) {
+    set_error(reason, reason_size,
+              "bias host floating-point environment is not attested "
+              "(it requires round-to-nearest with FTZ and DAZ disabled)");
+    return PLAN7_BIAS_ENV_FLOAT_ENVIRONMENT;
+  }
+  if (plan7_bias_current_cuda_identity(&live->cuda, reason, reason_size) != 0)
+    return PLAN7_BIAS_ENV_CUDA_DEVICE;
+  live->target = plan7_bias_cuda_identity_target(&live->cuda, reason,
+                                                 reason_size);
+  if (live->target == PLAN7_BIAS_CUDA_UNATTESTED)
+    return PLAN7_BIAS_ENV_CUDA_DEVICE;
+  if (plan7_bias_current_host_identity(&live->host, reason, reason_size) != 0)
+    return PLAN7_BIAS_ENV_HOST_FEATURES;
+  if (!host_features_supported(&live->host, reason, reason_size))
+    return PLAN7_BIAS_ENV_HOST_FEATURES;
+  if (!loaded_libm_build_id(live->build_id)) {
+    set_error(reason, reason_size,
+              "the loaded libm GNU build ID is unavailable");
+    return PLAN7_BIAS_ENV_LIBM_UNAVAILABLE;
+  }
+  return 0;
+}
+
+void
+build_id_hex(const uint8_t build_id[PLAN7_BIAS_LIBM_BUILD_ID_SIZE],
+             char text[2 * PLAN7_BIAS_LIBM_BUILD_ID_SIZE + 1])
+{
+  static const char digits[] = "0123456789abcdef";
+  for (size_t index = 0; index < PLAN7_BIAS_LIBM_BUILD_ID_SIZE; ++index) {
+    text[2 * index] = digits[build_id[index] >> 4];
+    text[2 * index + 1] = digits[build_id[index] & 0x0f];
+  }
+  text[2 * PLAN7_BIAS_LIBM_BUILD_ID_SIZE] = '\0';
+}
+
+using host_log_function = double (*)(double);
+
+uint32_t
+float_bits(float value)
+{
+  uint32_t raw;
+  memcpy(&raw, &value, sizeof(raw));
+  return raw;
+}
+
+uint64_t
+double_bits(double value)
+{
+  uint64_t raw;
+  memcpy(&raw, &value, sizeof(raw));
+  return raw;
+}
+
+struct audit_counts {
+  uint64_t float_mismatches;
+  uint64_t double_mismatches;
+  uint32_t maximum_float_ulp;
+  uint64_t maximum_double_ulp;
+  uint32_t first_float_input;
+  uint32_t first_float_host;
+  uint32_t first_float_device;
+  uint32_t first_double_input;
+};
+
+/* Host side of the audit for one slice of a chunk. The host value is the
+ * libm log() that HMMER/Easel call, reached through the same symbol whose
+ * module supplied the build ID; the binary32 value is its round-to-nearest
+ * conversion, exactly as the host reference computes (float)log((double)x). */
+void
+audit_slice(host_log_function host_log,
+            uint32_t first,
+            const float *device_binary32,
+            const double *device_binary64,
+            uint32_t begin,
+            uint32_t end,
+            audit_counts *counts)
+{
+  for (uint32_t index = begin; index < end; ++index) {
+    const uint32_t raw = first + index;
+    float value;
+    memcpy(&value, &raw, sizeof(value));
+    const double host = host_log(static_cast<double>(value));
+    const uint64_t host64 = double_bits(host);
+    const uint64_t device64 = double_bits(device_binary64[index]);
+    if (host64 != device64) {
+      if (counts->double_mismatches == 0) counts->first_double_input = raw;
+      ++counts->double_mismatches;
+      const uint64_t ulp = host64 > device64 ? host64 - device64
+                                             : device64 - host64;
+      counts->maximum_double_ulp = std::max(counts->maximum_double_ulp, ulp);
+    }
+    const uint32_t host32 = float_bits(static_cast<float>(host));
+    const uint32_t device32 = float_bits(device_binary32[index]);
+    if (host32 != device32) {
+      if (counts->float_mismatches == 0) {
+        counts->first_float_input = raw;
+        counts->first_float_host = host32;
+        counts->first_float_device = device32;
+      }
+      ++counts->float_mismatches;
+      const uint32_t ulp = host32 > device32 ? host32 - device32
+                                             : device32 - host32;
+      counts->maximum_float_ulp = std::max(counts->maximum_float_ulp, ulp);
+    }
+  }
+}
+#endif
+
+}  // namespace
+
 extern "C" int
-plan7_bias_environment_attested(char *reason, size_t reason_size)
+plan7_bias_classify_environment(char *reason, size_t reason_size)
 {
 #if !defined(__x86_64__) || !defined(__GLIBC__)
   set_error(reason, reason_size,
             "bias math is not attested for this host architecture");
+  return PLAN7_BIAS_ENV_UNSUPPORTED_PLATFORM;
+#else
+  live_environment live;
+  const int prerequisite = capture_live_environment(&live, reason,
+                                                    reason_size);
+  if (prerequisite != 0) return prerequisite;
+  /* Built-in allow-list: the environments attested offline when each target
+   * was admitted (unchanged). */
+  if (strcmp(gnu_get_libc_version(), "2.35") == 0 &&
+      plan7_bias_libm_build_id_attested(live.build_id, sizeof(live.build_id),
+                                        live.target) == 1 &&
+      plan7_bias_host_identity_attested(&live.host, live.target, nullptr,
+                                        0) == 1) {
+    if (reason != nullptr && reason_size != 0) reason[0] = '\0';
+    return PLAN7_BIAS_ENV_ATTESTED_BUILTIN;
+  }
+  if (registered_attestation_matches(live.target, live.build_id, live.host)) {
+    if (reason != nullptr && reason_size != 0) reason[0] = '\0';
+    return PLAN7_BIAS_ENV_ATTESTED_SELF;
+  }
+  char hex[2 * PLAN7_BIAS_LIBM_BUILD_ID_SIZE + 1];
+  build_id_hex(live.build_id, hex);
+  if (reason != nullptr && reason_size != 0)
+    snprintf(reason, reason_size,
+             "bias math is not attested for this host math library "
+             "(glibc %s, libm GNU build ID %s) on this CPU and device: no "
+             "built-in attestation and no exhaustive self-attestation "
+             "registered in this process",
+             gnu_get_libc_version(), hex);
+  return PLAN7_BIAS_ENV_NOT_ATTESTED;
+#endif
+}
+
+extern "C" int
+plan7_bias_environment_attested(char *reason, size_t reason_size)
+{
+  return plan7_bias_classify_environment(reason, reason_size) > 0 ? 1 : 0;
+}
+
+extern "C" void
+plan7_bias_clear_attestation(void)
+{
+#if defined(__x86_64__) && defined(__GLIBC__)
+  std::lock_guard<std::mutex> lock(registered_attestation_mutex);
+  registered_attestation_state = {};
+#endif
+}
+
+extern "C" int
+plan7_bias_register_attestation(const uint8_t *build_id,
+                                size_t build_id_size,
+                                const plan7_bias_host_identity *host,
+                                int cuda_target,
+                                int algorithm_version,
+                                uint64_t inputs_checked,
+                                uint64_t float_mismatches,
+                                char *reason,
+                                size_t reason_size)
+{
+#if !defined(__x86_64__) || !defined(__GLIBC__)
+  (void) build_id; (void) build_id_size; (void) host; (void) cuda_target;
+  (void) algorithm_version; (void) inputs_checked; (void) float_mismatches;
+  set_error(reason, reason_size,
+            "bias math is not attested for this host architecture");
   return 0;
 #else
-  if (plan7_bias_host_environment_attested() != 1) {
-    set_error(reason, reason_size,
-              "bias host floating-point environment is not attested");
+  if (build_id == nullptr || build_id_size != PLAN7_BIAS_LIBM_BUILD_ID_SIZE ||
+      host == nullptr) {
+    set_error(reason, reason_size, "invalid bias attestation record");
     return 0;
   }
-  if (strcmp(gnu_get_libc_version(), "2.35") != 0) {
+  if (algorithm_version != PLAN7_BIAS_ATTESTATION_ALGORITHM_VERSION) {
     set_error(reason, reason_size,
-              "bias math is not attested for this glibc version");
+              "bias attestation record uses a different audit algorithm");
     return 0;
   }
-
-  plan7_bias_cuda_identity cuda_identity;
-  if (plan7_bias_current_cuda_identity(
-        &cuda_identity, reason, reason_size) != 0)
-    return 0;
-  const int target = plan7_bias_cuda_identity_target(
-    &cuda_identity, reason, reason_size);
-  if (target == PLAN7_BIAS_CUDA_UNATTESTED) return 0;
-  if (!loaded_libm_is_attested(target)) {
+  if (inputs_checked != PLAN7_BIAS_ATTESTATION_INPUT_COUNT ||
+      float_mismatches != 0) {
     set_error(reason, reason_size,
-              "bias math is not attested for this loaded libm build");
+              "bias attestation record is not a complete zero-mismatch audit");
     return 0;
   }
-
-  plan7_bias_host_identity host_identity;
-  if (plan7_bias_current_host_identity(
-        &host_identity, reason, reason_size) != 0)
+  live_environment live;
+  if (capture_live_environment(&live, reason, reason_size) != 0) return 0;
+  if (live.target != cuda_target) {
+    set_error(reason, reason_size,
+              "bias attestation record is for a different CUDA target");
     return 0;
-  if (plan7_bias_host_identity_attested(
-        &host_identity, target, reason, reason_size) != 1)
+  }
+  if (memcmp(live.build_id, build_id, PLAN7_BIAS_LIBM_BUILD_ID_SIZE) != 0) {
+    set_error(reason, reason_size,
+              "bias attestation record is for a different libm build");
     return 0;
-
+  }
+  if (!host_identity_equal(live.host, *host)) {
+    set_error(reason, reason_size,
+              "bias attestation record is for a different CPU identity");
+    return 0;
+  }
+  register_attestation(live.target, live.build_id, live.host);
   if (reason != nullptr && reason_size != 0) reason[0] = '\0';
   return 1;
+#endif
+}
+
+extern "C" int
+plan7_bias_self_attest(int host_threads,
+                       plan7_bias_self_attestation *report,
+                       char *reason,
+                       size_t reason_size)
+{
+  if (report == nullptr) {
+    set_error(reason, reason_size, "bias self-attestation report is null");
+    return -1;
+  }
+  memset(report, 0, sizeof(*report));
+  report->algorithm_version = PLAN7_BIAS_ATTESTATION_ALGORITHM_VERSION;
+#if !defined(__x86_64__) || !defined(__GLIBC__)
+  (void) host_threads;
+  set_error(reason, reason_size,
+            "bias math is not attested for this host architecture");
+  return -1;
+#else
+  if (host_threads < 1 || host_threads > 1024) {
+    set_error(reason, reason_size,
+              "bias self-attestation needs 1 to 1024 host threads");
+    return -1;
+  }
+  live_environment live;
+  if (capture_live_environment(&live, reason, reason_size) != 0) return -1;
+  host_log_function host_log = reinterpret_cast<host_log_function>(
+    dlsym(RTLD_DEFAULT, "log"));
+  if (host_log == nullptr) {
+    set_error(reason, reason_size, "host libm log() is unavailable");
+    return -1;
+  }
+  report->cuda_target = live.target;
+  report->host_threads = host_threads;
+  memcpy(report->libm_build_id, live.build_id, sizeof(report->libm_build_id));
+  report->host = live.host;
+  report->cuda = live.cuda;
+
+  constexpr uint32_t kFirst = UINT32_C(1);
+  constexpr uint32_t kLast = UINT32_C(0x7f7fffff);
+  constexpr uint32_t kChunk = UINT32_C(1) << 24;
+  float *device_binary32 = nullptr;
+  double *device_binary64 = nullptr;
+  float *host_binary32 = nullptr;
+  double *host_binary64 = nullptr;
+  bool pinned = true;
+  int status_code = 0;
+  cudaError_t status = cudaMalloc(&device_binary32, kChunk * sizeof(float));
+  if (status == cudaSuccess)
+    status = cudaMalloc(&device_binary64, kChunk * sizeof(double));
+  if (status != cudaSuccess) {
+    set_cuda_error(reason, reason_size, "bias self-attestation cudaMalloc",
+                   status);
+    status_code = -1;
+  }
+  if (status_code == 0 &&
+      (cudaMallocHost(&host_binary32, kChunk * sizeof(float)) != cudaSuccess ||
+       cudaMallocHost(&host_binary64, kChunk * sizeof(double)) !=
+         cudaSuccess)) {
+    cudaGetLastError();
+    if (host_binary32 != nullptr) cudaFreeHost(host_binary32);
+    if (host_binary64 != nullptr) cudaFreeHost(host_binary64);
+    pinned = false;
+    host_binary32 = new (std::nothrow) float[kChunk];
+    host_binary64 = new (std::nothrow) double[kChunk];
+    if (host_binary32 == nullptr || host_binary64 == nullptr) {
+      set_error(reason, reason_size,
+                "bias self-attestation host buffers are unavailable");
+      status_code = -1;
+    }
+  }
+
+  audit_counts total = {};
+  total.first_float_input = 0;
+  const auto started = std::chrono::steady_clock::now();
+  std::vector<audit_counts> slices(static_cast<size_t>(host_threads));
+  for (uint64_t first64 = kFirst; status_code == 0 && first64 <= kLast;
+       first64 += kChunk) {
+    const uint32_t first = static_cast<uint32_t>(first64);
+    const uint32_t count = static_cast<uint32_t>(
+      std::min<uint64_t>(kChunk, static_cast<uint64_t>(kLast) - first64 + 1));
+    bias_log_attestation_kernel<<<(count + kThreads - 1) / kThreads,
+                                  kThreads>>>(first, count, device_binary32,
+                                              device_binary64);
+    status = cudaGetLastError();
+    if (status == cudaSuccess)
+      status = cudaMemcpy(host_binary32, device_binary32,
+                          static_cast<size_t>(count) * sizeof(float),
+                          cudaMemcpyDeviceToHost);
+    if (status == cudaSuccess)
+      status = cudaMemcpy(host_binary64, device_binary64,
+                          static_cast<size_t>(count) * sizeof(double),
+                          cudaMemcpyDeviceToHost);
+    if (status != cudaSuccess) {
+      set_cuda_error(reason, reason_size, "bias self-attestation chunk",
+                     status);
+      status_code = -1;
+      break;
+    }
+    std::fill(slices.begin(), slices.end(), audit_counts{});
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(host_threads));
+    for (int worker = 0; worker < host_threads; ++worker) {
+      const uint32_t begin = static_cast<uint32_t>(
+        static_cast<uint64_t>(count) * worker / host_threads);
+      const uint32_t end = static_cast<uint32_t>(
+        static_cast<uint64_t>(count) * (worker + 1) / host_threads);
+      workers.emplace_back(audit_slice, host_log, first, host_binary32,
+                           host_binary64, begin, end, &slices[worker]);
+    }
+    for (std::thread &thread : workers) thread.join();
+    /* Slices are ordered, so the first nonzero slice holds the first
+     * mismatch of the chunk; chunks are visited in increasing order. */
+    for (const audit_counts &slice : slices) {
+      if (slice.float_mismatches != 0 && total.float_mismatches == 0) {
+        total.first_float_input = slice.first_float_input;
+        total.first_float_host = slice.first_float_host;
+        total.first_float_device = slice.first_float_device;
+      }
+      if (slice.double_mismatches != 0 && total.double_mismatches == 0)
+        total.first_double_input = slice.first_double_input;
+      total.float_mismatches += slice.float_mismatches;
+      total.double_mismatches += slice.double_mismatches;
+      total.maximum_float_ulp = std::max(total.maximum_float_ulp,
+                                         slice.maximum_float_ulp);
+      total.maximum_double_ulp = std::max(total.maximum_double_ulp,
+                                          slice.maximum_double_ulp);
+    }
+    report->inputs_checked += count;
+  }
+  report->seconds = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - started).count();
+
+  if (device_binary32 != nullptr) cudaFree(device_binary32);
+  if (device_binary64 != nullptr) cudaFree(device_binary64);
+  if (pinned) {
+    if (host_binary32 != nullptr) cudaFreeHost(host_binary32);
+    if (host_binary64 != nullptr) cudaFreeHost(host_binary64);
+  } else {
+    delete[] host_binary32;
+    delete[] host_binary64;
+  }
+  if (status_code != 0) return -1;
+
+  report->float_mismatches = total.float_mismatches;
+  report->double_mismatches = total.double_mismatches;
+  report->maximum_float_ulp = total.maximum_float_ulp;
+  report->maximum_double_ulp = total.maximum_double_ulp;
+  report->first_float_mismatch_input = total.first_float_input;
+  report->first_float_mismatch_host = total.first_float_host;
+  report->first_float_mismatch_device = total.first_float_device;
+  report->first_double_mismatch_input = total.first_double_input;
+  report->attested =
+    report->inputs_checked == PLAN7_BIAS_ATTESTATION_INPUT_COUNT &&
+    total.float_mismatches == 0;
+  if (report->attested) {
+    register_attestation(live.target, live.build_id, live.host);
+    if (reason != nullptr && reason_size != 0) reason[0] = '\0';
+  } else {
+    set_error(reason, reason_size,
+              report->inputs_checked == PLAN7_BIAS_ATTESTATION_INPUT_COUNT
+                ? "device and host log differ on at least one input"
+                : "bias self-attestation did not cover every input");
+  }
+  return 0;
 #endif
 }
 

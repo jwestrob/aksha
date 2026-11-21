@@ -4580,6 +4580,7 @@ sequence_batch_postfilter_candidates_many_impl(
       set_error(error, error_size, "post-filter candidates have no profiles");
       return -1;
     }
+    plan7_postfilter_workspace_invalidate_resident(batch->postfilter_workspace);
     return 0;
   }
   if (candidate_offsets[0] != 0 ||
@@ -4616,10 +4617,18 @@ sequence_batch_postfilter_candidates_many_impl(
         use_cached_device_candidates = false;
     }
   }
-  if (candidate_count == 0) return 0;
+  if (candidate_count == 0) {
+    /* No resident results exist for this generation; a later F2 compaction
+     * must not read an earlier generation's. */
+    plan7_postfilter_workspace_invalidate_resident(batch->postfilter_workspace);
+    return 0;
+  }
   if (batch->alphabet_size != 29 ||
       !batch->host_float_environment_valid ||
       plan7_bias_environment_attested(nullptr, 0) != 1) {
+    /* Contract fallback: every candidate is retained for the exact CPU
+     * pipeline and no resident device results are produced. */
+    plan7_postfilter_workspace_invalidate_resident(batch->postfilter_workspace);
     if (reason_statistics != nullptr) {
       *reason_statistics = {};
       reason_statistics->candidate_count = candidate_count;
@@ -4936,9 +4945,20 @@ extern "C" int plan7_ssv_sequence_batch_compact_postfilter_f2(
     set_error(error, error_size, "invalid sequence-batch F2 compaction");
     return -1;
   }
-  if (batch->postfilter_workspace == nullptr) {
-    set_error(error, error_size, "post-filter workspace is unavailable");
-    return -1;
+  if (plan7_postfilter_workspace_resident_valid(batch->postfilter_workspace) !=
+      1) {
+    /* The post-filter retained every candidate for the exact CPU pipeline
+     * (unattested bias math) or received none, so there are no resident
+     * results to compact. Report an unsupported view: the caller then reads
+     * the host post-filter records, which are authoritative in both cases. */
+    memset(view, 0, sizeof(*view));
+    view->batch_generation = batch->generation_id;
+    view->device_ordinal = batch->device_ordinal;
+    view->supported = 0;
+    view->profile_count = profile_count;
+    view->statistics.unsupported_profile_count = profile_count;
+    if (error != nullptr && error_size != 0) error[0] = '\0';
+    return 0;
   }
   return plan7_postfilter_workspace_compact_f2(
       batch->postfilter_workspace, batch->generation_id, profiles,

@@ -325,6 +325,18 @@ int plan7_postfilter_workspace_get_statistics(
   char *error,
   size_t error_size);
 
+/* Mark the workspace as holding no resident post-filter results for the
+ * current batch generation. Used when a post-filter call retains every
+ * candidate for the CPU pipeline (for example in an unattested bias-math
+ * environment) or receives no candidates, so no later F2 compaction can read
+ * results from an earlier generation. */
+void plan7_postfilter_workspace_invalidate_resident(
+  plan7_postfilter_workspace *workspace);
+
+/* Returns 1 when resident post-filter results are available for compaction. */
+int plan7_postfilter_workspace_resident_valid(
+  const plan7_postfilter_workspace *workspace);
+
 int plan7_postfilter_workspace_compact_f2(
   plan7_postfilter_workspace *workspace,
   uint64_t batch_generation,
