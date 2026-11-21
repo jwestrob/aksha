@@ -1,4 +1,6 @@
 import argparse
+import sys
+
 from aksha import search, initialize, nucsearch, phmmer, jackhmmer, scan
 
 def _installed_version():
@@ -93,6 +95,33 @@ def main():
         help="Write per-HMM hmmsearch-format output files for MacSyFinder --previous-run compatibility. "
              "Files are written to {outdir}/macsyfinder_compat/hmmer_results/")
 
+    #############
+    # GPU-CHECK #
+    #############
+
+    parser_gpu_check = subparsers.add_parser(
+        'gpu-check',
+        help='Report whether a GPU search would run on the GPU or fall back, and why.',
+        description=('Report, for each --gpu-manifest database and each visible CUDA device, '
+                     'whether `aksha search` would use the exact GPU path or fall back to the '
+                     'CPU for bias-dependent stages, and why. A GPU search runs the same check '
+                     'at start. Exit status: 0 ready, 2 pending one-time self-attestation, '
+                     '1 fallback or refusal.'),
+    )
+    parser_gpu_check.add_argument(
+        '--gpu-manifest', action='append', default=[], metavar='DB=PATH',
+        help='Installed protein database and the manifest that authenticates its pressed files. Repeat for several databases.',
+    )
+    parser_gpu_check.add_argument(
+        '--attest', action='store_true', default=False,
+        help=('Run the one-time exhaustive bias-math self-attestation now when this environment '
+              'has no valid cached record (needs a GPU). Without it the check only reports.'),
+    )
+    parser_gpu_check.add_argument('--threads', type=int, default=None,
+                                  help='Host threads for the self-attestation (default: all allocated CPUs).')
+    parser_gpu_check.add_argument('--json', action='store_true', default=False,
+                                  help='Print the report as JSON.')
+
     ##########
     #  SCAN  #
     ##########
@@ -165,6 +194,9 @@ def main():
 
     if args.command == 'search':
         search.main(args)
+    elif args.command == 'gpu-check':
+        from aksha import gpu_check
+        sys.exit(gpu_check.main(args))
     elif args.command == 'scan':
         scan.main(args)
     elif args.command == 'initialize':

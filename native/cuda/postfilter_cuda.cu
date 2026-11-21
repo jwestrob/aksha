@@ -2776,6 +2776,18 @@ extern "C" int plan7_postfilter_workspace_destroy(
   return status;
 }
 
+extern "C" void plan7_postfilter_workspace_invalidate_resident(
+    plan7_postfilter_workspace *workspace) {
+  if (workspace == nullptr) return;
+  workspace->resident_results_valid = false;
+  workspace->f2_view_valid = false;
+}
+
+extern "C" int plan7_postfilter_workspace_resident_valid(
+    const plan7_postfilter_workspace *workspace) {
+  return workspace != nullptr && workspace->resident_results_valid ? 1 : 0;
+}
+
 extern "C" int plan7_postfilter_workspace_get_statistics(
     const plan7_postfilter_workspace *workspace,
     plan7_postfilter_workspace_statistics *statistics,

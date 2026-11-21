@@ -18,6 +18,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FutureTimeoutError,
 )
+from aksha import gpu_attestation
 from aksha import initialize
 from aksha import rp16 as rp16_module
 
@@ -27,6 +28,10 @@ HMM_CHUNK_SIZE = 2000
 CPU_STREAM_PRESSED_ENV = "ASTRA_CPU_STREAM_PRESSED"
 CPU_STREAM_PRESSED_AUTO = "auto"
 GPU_CELL_CAP = 100_000_000
+# Audit control: in an environment whose GPU bias math is untrusted, keep the
+# GPU post-filter/session route and rely on the native per-stage CPU fallback
+# instead of the default SSV-only route. Results are exact either way.
+GPU_UNTRUSTED_NATIVE_FALLBACK_ENV = 'ASTRA_GPU_UNTRUSTED_NATIVE_FALLBACK'
 GPU_PROFILE_CELL_CAP_ENV = 'ASTRA_GPU_PROFILE_CELL_CAP'
 GPU_PROFILE_CELL_CAPS = (100_000_000, 200_000_000, 300_000_000, 400_000_000)
 GPU_CHUNK_LOCAL_PROFILE_PACK_ENV = 'ASTRA_GPU_CHUNK_LOCAL_PROFILE_PACK'
@@ -1282,8 +1287,15 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
                             all_sequences, threads, gpu_metrics=None,
                             profile_session_cache=None, search_options=None,
                             request_tuning_by_db=None,
-                            filter_tail_simd_by_db=None):
-    """Load every attested mapped database and initialize one target batch."""
+                            filter_tail_simd_by_db=None,
+                            bias_trusted=None):
+    """Load every attested mapped database and initialize one target batch.
+
+    ``bias_trusted`` is the bias-math trust of the current device (see
+    :mod:`aksha.gpu_attestation`). ``False`` keeps only the exact GPU SSV
+    filter: every bias-dependent stage runs on the CPU pipeline. ``None``
+    (not evaluated) leaves the route unchanged.
+    """
     if not mappings:
         return {}, None, False
 
@@ -1421,6 +1433,11 @@ def preflight_gpu_databases(mappings, installed_hmm_names, parsed_json,
             databases[db_name] = (pressed_base, (), None)
 
     postfilter = gpu_postfilter_available()
+    if (
+        bias_trusted is False
+        and os.environ.get(GPU_UNTRUSTED_NATIVE_FALLBACK_ENV) != '1'
+    ):
+        postfilter = False
     batch = None
     cache_reservation = None
     try:
@@ -4694,6 +4711,7 @@ def main(args, *, gpu_profile_session_cache=None):
         raise ValueError('--cpu-parallel cannot be combined with --gpu-manifest')
     gpu_parsed_json = None
     gpu_installed_hmm_names = None
+    gpu_bias_trust = None
     log_file_path = os.path.join(outdir, 'astra_search_log.txt')
 
     # --- Ribosomal-protein marker mode ---------------------------------
@@ -4746,6 +4764,13 @@ def main(args, *, gpu_profile_session_cache=None):
             args.threads,
             getattr(args, 'write_macsyfinder', False),
         )
+        # The readiness check (`aksha gpu-check`) runs this same evaluation.
+        gpu_bias_trust = gpu_attestation.evaluate_bias_trust(
+            attest=gpu_attestation.self_attest_mode(),
+            threads=args.threads,
+        )
+        if gpu_bias_trust.search_line():
+            print(gpu_bias_trust.search_line())
 
     hmmsearch_options = {
         "cpu_parallel": getattr(args, "cpu_parallel", "auto"),
@@ -4818,6 +4843,9 @@ def main(args, *, gpu_profile_session_cache=None):
             search_options=hmmsearch_options,
             request_tuning_by_db=gpu_request_tuning_by_db,
             filter_tail_simd_by_db=gpu_filter_tail_simd_by_db,
+            bias_trusted=(
+                None if gpu_bias_trust is None else gpu_bias_trust.trusted
+            ),
         )
 
     try:
@@ -4834,6 +4862,11 @@ def main(args, *, gpu_profile_session_cache=None):
         logging.basicConfig(filename=log_file_path, level=logging.INFO,
                             format='%(asctime)s %(levelname)s: %(message)s',
                             datefmt='%Y-%m-%d %H:%M:%S')
+        if gpu_bias_trust is not None and gpu_bias_trust.search_line():
+            if gpu_bias_trust.state == 'untrusted':
+                logging.warning(gpu_bias_trust.search_line())
+            else:
+                logging.info(gpu_bias_trust.search_line())
     except BaseException:
         batch_close_failed = False
         if gpu_sequence_batch is not None:

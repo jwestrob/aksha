@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased (0.2.4.dev0)
+
+Needs a new `aksha-cuda12` build for the native parts; the application changes also
+work with `aksha-cuda12==0.1.1`, which then falls back as described below instead of
+aborting.
+
+- GPU bias math survives operating-system updates. The CUDA backend trusted only the
+  glibc 2.35 / libm build and CPU signature audited when each GPU was admitted, so the
+  Ubuntu 24.04 upgrade (glibc 2.39) disabled it and every GPU search aborted. The CUDA
+  extension now runs that same exhaustive audit itself: every positive finite binary32
+  input, device `log` versus host libm `log`, zero mismatches required. A GPU search
+  runs it once per environment (about 2 s on an H200 with 28 threads) and caches the
+  result under a key of the CUDA extension, libm build ID, glibc, CPU identity, device
+  product, CUDA runtime and driver; any change selects a fresh audit. The built-in
+  environments stay trusted without an audit.
+- A GPU search in an untrusted environment completes on the exact path: the GPU runs
+  only the SSV filter, the bias filter and every later stage run on the CPU, and one
+  warning line names what is untrusted and how to restore GPU use. The native
+  post-filter no longer raises "post-filter workspace is unavailable" when it retains
+  every candidate for the CPU (or receives none): the resident F2 compaction reports an
+  unsupported view and the host records are used.
+- `aksha gpu-check --gpu-manifest DB=PATH ...` reports, per database manifest and CUDA
+  device, whether a search would run on the GPU, run the one-time self-attestation
+  first, fall back to SSV-only, or refuse (manifest or device), and why. `--attest`
+  runs the self-attestation now; `--json` prints the report. Exit status 0 ready,
+  2 pending, 1 fallback. GPU searches run the same evaluation at start.
+- `AKSHA_GPU_SELF_ATTEST=auto|never|force` controls the search-time audit;
+  `AKSHA_GPU_ATTESTATION_DIR` moves the record cache (default
+  `$XDG_CACHE_HOME/aksha/gpu-attestation`, else `~/.cache/aksha/gpu-attestation`).
+  `ASTRA_GPU_UNTRUSTED_NATIVE_FALLBACK=1` (audit control) keeps the GPU session route
+  in an untrusted environment and relies on the native per-stage CPU fallback.
+
 ## 0.2.3 (2026-11-20)
 
 Application-only release; it uses the published `aksha-runtime==0.1.1` and
