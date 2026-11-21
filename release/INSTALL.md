@@ -43,6 +43,30 @@ Use the pressed prefix without `.h3m`. Manifest generation authenticates the
 database, not an HMM search. Regenerate after database/native-runtime changes.
 Choose cutoff options appropriate to the database.
 
+### GPU readiness and bias-math trust
+
+GPU results equal CPU results only where the device `log` agrees with the host
+libm `log`, so the CUDA backend uses its bias-filter, Forward and domain kernels
+only in an attested environment. The environments audited when each GPU target
+was admitted are built in. Elsewhere (for example after an operating-system
+update) a GPU search first runs the same exhaustive audit itself -- every
+positive finite binary32 input, zero mismatches required, a few seconds -- and
+caches the result for that exact environment. Check before submitting a job:
+
+```bash
+aksha gpu-check --gpu-manifest PFAM=PFAM.manifest.json --gpu-manifest KOFAM=KOFAM.manifest.json
+aksha gpu-check --gpu-manifest PFAM=PFAM.manifest.json --attest   # inside a GPU allocation
+```
+
+Each database and device is reported as `GPU`, `GPU after self-attestation`,
+`SSV only` (the GPU runs the SSV filter; every bias-dependent stage runs on the
+exact CPU path) or `refused` (manifest or device), with the reason. Exit status
+is 0 when ready, 2 when the one-time audit is pending and 1 otherwise. An
+untrusted environment never stops a search: it completes on the exact path with
+one warning line. `AKSHA_GPU_SELF_ATTEST=never` disables the search-time audit,
+`force` repeats it, and `AKSHA_GPU_ATTESTATION_DIR` moves the record cache
+(default `~/.cache/aksha/gpu-attestation`).
+
 ## Compatibility
 
 Use a fresh environment when moving from old Astra packages. Aksha has its own
