@@ -454,6 +454,15 @@ class ReadinessCheckTests(AttestationTestCase):
         self.assertEqual(len(native.audit_calls), 1)
         self.assertEqual(document["bias_math"]["audit"]["float_mismatches"], 0)
 
+    def test_disabled_self_attestation_is_reported_as_fallback(self):
+        with mock.patch.dict(os.environ, {gpu_attestation.SELF_ATTEST_ENV: "never"}):
+            document, native = self.readiness({})
+        self.assertEqual(document["overall"], gpu_check.FALLBACK)
+        verdict = document["verdicts"][0]
+        self.assertEqual(verdict["route"], "SSV only")
+        self.assertIn("AKSHA_GPU_SELF_ATTEST=never", verdict["why"])
+        self.assertEqual(native.audit_calls, [])
+
     def test_fallback_reports_reason_and_restore_hint(self):
         with mock.patch.dict(os.environ, {gpu_attestation.SELF_ATTEST_ENV: "never"}):
             document, _ = self.readiness({"audit_mismatches": 2}, attest=True)

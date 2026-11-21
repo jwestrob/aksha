@@ -78,8 +78,15 @@ def readiness(manifests, *, attest=False, threads=None, announce=print):
 
     threads = threads or _default_threads()
     parsed_json = initialize.load_config()
+    mode = gpu_attestation.self_attest_mode()
+    if attest:
+        attest_mode = "force" if mode == "force" else "auto"
+    else:
+        # Report exactly what a search would do: with self-attestation
+        # disabled a search falls back instead of attesting.
+        attest_mode = "never" if mode == "never" else "report"
     trust = gpu_attestation.evaluate_bias_trust(
-        attest="auto" if attest else "report",
+        attest=attest_mode,
         threads=threads,
         announce=announce,
     )
